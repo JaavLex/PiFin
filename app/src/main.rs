@@ -238,29 +238,40 @@ fn fetch_home(client: &Client) -> Vec<(String, Vec<Item>)> {
     push("Continue Watching".into(), client.resume());
     push("Next Up".into(), client.next_up());
     if let Ok(views) = client.views() {
-        for v in views.iter().filter(|v| matches!(v.collection_type.as_deref(), Some("movies" | "tvshows"))) {
-            push(format!("Latest {}", v.name), client.latest(&v.id));
+        for v in views.iter() {
+            match v.collection_type.as_deref() {
+                Some("movies") => push(format!("Latest {}", v.name), client.latest(&v.id)),
+                Some("tvshows") => push(v.name.clone(), client.shows(&v.id)),
+                _ => {}
+            }
         }
     }
     rows
 }
 
-/// Rows for a series: one per season, episodes in order.
-fn fetch_series(client: &Client, series_id: &str) -> Vec<(String, Vec<Item>)> {
-    let mut rows = vec![];
+/// A show's page: one row of seasons.
+fn fetch_seasons(client: &Client, series_id: &str) -> Vec<(String, Vec<Item>)> {
     match client.seasons(series_id) {
-        Ok(seasons) => {
-            for s in seasons {
-                match client.episodes(series_id, &s.id) {
-                    Ok(eps) if !eps.is_empty() => rows.push((s.name.clone(), eps)),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("{e}"),
-                }
-            }
+        Ok(v) if !v.is_empty() => vec![("Seasons".to_string(), v)],
+        Ok(_) => vec![],
+        Err(e) => {
+            eprintln!("{e}");
+            vec![]
         }
-        Err(e) => eprintln!("{e}"),
     }
-    rows
+}
+
+/// A season's page: its episodes in order.
+fn fetch_season(client: &Client, season: &Item) -> Vec<(String, Vec<Item>)> {
+    let series_id = season.series_id.clone().unwrap_or_default();
+    match client.episodes(&series_id, &season.id) {
+        Ok(v) if !v.is_empty() => vec![(format!("{} · {}", season.series_name.clone().unwrap_or_default(), season.name), v)],
+        Ok(_) => vec![],
+        Err(e) => {
+            eprintln!("{e}");
+            vec![]
+        }
+    }
 }
 
 /// Rows for a movie page: Play/Resume actions, then the cast.
@@ -872,25 +883,31 @@ fn main() {
             if it.kind == "Person" {
                 return;
             }
-            let series_page = match it.kind.as_str() {
-                "Series" => Some(it.id.clone()),
-                "Season" => it.series_id.clone(),
-                "Episode" if !play => it.series_id.clone(),
+            // shows → seasons → episodes
+            let page: Option<(Item, bool)> = match it.kind.as_str() {
+                "Series" => Some((it.clone(), false)),
+                "Season" => Some((it.clone(), true)),
+                // "open" on an episode (phone): its season's episode list
+                "Episode" if !play => it.season_id.clone().map(|sid| (Item {
+                    id: sid, kind: "Season".into(), name: it.season_name.clone().unwrap_or_else(|| "Season".into()),
+                    series_id: it.series_id.clone(), series_name: it.series_name.clone(), ..Default::default()
+                }, true)),
                 _ => None,
             };
-            if let Some(series_id) = series_page {
+            if let Some((target, is_season)) = page {
                 let client = client.clone();
                 let weak = weak.clone();
                 if let Some(a) = weak.upgrade() {
                     a.set_status("Loading…".into());
                 }
                 std::thread::spawn(move || {
-                    let rows = fetch_series(&client, &series_id);
+                    let rows = if is_season { fetch_season(&client, &target) } else { fetch_seasons(&client, &target.id) };
                     let _ = slint::invoke_from_event_loop(move || {
                         let Some(app) = weak.upgrade() else { return };
-                        app.set_status(if rows.is_empty() { "No episodes".into() } else { "".into() });
+                        app.set_status(if rows.is_empty() { "Nothing here".into() } else { "".into() });
                         if !rows.is_empty() {
-                            with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, true, None));
+                            // episode lists use the episodes' own stills and names
+                            with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, is_season, None));
                         }
                     });
                 });

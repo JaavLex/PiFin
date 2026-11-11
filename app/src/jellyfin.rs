@@ -39,6 +39,8 @@ pub struct Item {
     pub kind: String,
     pub series_name: Option<String>,
     pub series_id: Option<String>,
+    pub season_id: Option<String>,
+    pub season_name: Option<String>,
     pub parent_index_number: Option<i32>,
     pub index_number: Option<i32>,
     pub production_year: Option<i32>,
@@ -153,6 +155,14 @@ impl Client {
 
     pub fn item(&self, id: &str) -> Result<Item, String> {
         self.get(&format!("/Users/{}/Items/{id}", self.auth.user_id), &[])
+    }
+
+    /// A TV library's shows, most recently updated first.
+    pub fn shows(&self, parent_id: &str) -> Result<Vec<Item>, String> {
+        let p = format!("/Users/{}/Items", self.auth.user_id);
+        let r: Items = self.get(&p, &[("ParentId", parent_id), ("Recursive", "true"), ("IncludeItemTypes", "Series"),
+            ("SortBy", "DateLastContentAdded,SortName"), ("SortOrder", "Descending"), ("Limit", "40"), ("Fields", CARD_FIELDS)])?;
+        Ok(r.items)
     }
 
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>, String> {
