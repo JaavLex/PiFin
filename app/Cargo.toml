@@ -1,0 +1,25 @@
+[package]
+name = "pifin"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Jellyfin browser for Raspberry Pi; playback is handed to mpv"
+license = "MIT"
+
+# Runs as a Wayland client under cage. Video is never rendered here: Play spawns
+# the native mpv (hardware decoding, pifin-osd.lua overlay) and the UI idles.
+[dependencies]
+slint = { version = "1", default-features = false, features = ["std", "compat-1-2", "backend-winit-wayland", "renderer-femtovg"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[build-dependencies]
+slint-build = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+lto = "thin"
+panic = "abort"
