@@ -1,0 +1,23 @@
+# local config with real credentials — never commit
+pifin.env
+secrets.env
+
+# local-only project notes: agent workflow, plans and briefs carry LAN details
+CLAUDE.md
+CLAUDE.local.md
+plans/
+.harness/
+
+# tooling / build leftovers
+.codescout/
+img/
+*.img*
+*.raw
+*.xz
+__pycache__/
+*.py[cod]
+.venv/
+.codescout/private-memories/
+
+# personal words for tools/check-leaks.sh
+.leakwords

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Called by comitup with the new state: HOTSPOT | CONNECTING | CONNECTED
+# While the Pi is really stuck in hotspot mode, the TV shows the Wi-Fi setup
+# instructions (comitup passes through HOTSPOT briefly at every boot before
+# joining a known network, hence the delay). Once connected, Jellyfin is
+# restarted so it comes back on screen.
+source /etc/pifin/secrets.env
+STATE=/run/pifin-wifi-state
+SHOWN=/run/pifin-setup-shown
+echo "$1" > "$STATE"
+
+case "$1" in
+  HOTSPOT)
+    (
+      sleep 45   # give comitup time to join a known network first
+      while [ "$(cat $STATE 2>/dev/null)" = HOTSPOT ]; do
+        # Jellyfin may still be starting, or may have navigated away: retry
+        /usr/local/bin/pifin-setup-screen.py "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" && touch "$SHOWN"
+        sleep 20
+      done
+    ) & ;;
+  CONNECTED)
+    if [ -e "$SHOWN" ]; then
+      rm -f "$SHOWN"
+      sleep 5   # let Tailscale reconnect before Jellyfin reloads
+      systemctl restart jellyfin-kiosk
+    fi ;;
+esac

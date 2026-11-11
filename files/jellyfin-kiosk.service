@@ -1,0 +1,26 @@
+[Unit]
+Description=Jellyfin Desktop kiosk (PiFin)
+After=network-online.target systemd-user-sessions.service tailscaled.service
+Wants=network-online.target
+Conflicts=getty@tty1.service
+
+[Service]
+User=@@PIFIN_USER@@
+Group=@@PIFIN_USER@@
+SupplementaryGroups=input video render audio tty
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty-force
+StandardOutput=journal
+StandardError=journal
+Environment=XDG_SESSION_TYPE=wayland
+# flatpak's bwrap refuses to run with any capability; logind sessions get CAP_WAKE_ALARM
+CapabilityBoundingSet=~CAP_WAKE_ALARM
+AmbientCapabilities=
+ExecStart=/bin/sh -c "exec /usr/bin/cage -s -- /usr/local/bin/pifin-jellyfin-session >/tmp/jellyfin-kiosk.log 2>&1"
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

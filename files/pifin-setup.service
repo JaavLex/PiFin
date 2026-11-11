@@ -1,0 +1,14 @@
+[Unit]
+Description=PiFin first-boot setup (resumes until done)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=!/etc/pifin/setup-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pifin-setup.sh
+TimeoutStartSec=0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
