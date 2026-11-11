@@ -21,7 +21,8 @@ done
 EXCL=(":!tools/check-leaks.sh")
 if git grep --cached -q -I -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" \
    ; then
-  hits=$(git grep --cached -I -l -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" | grep -v 'pifin-setup-screen.py' || true)
+  hits=$(git grep --cached -I -l -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" | while read -r f; do git grep --cached -h -oE '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- "$f" | grep -qvx '10\.41\.0\.1' && echo "$f"; done || true)
+  # 10.41.0.1 is comitup's standard hotspot address, not a private one
   if [ -n "$hits" ]; then echo "LEAK: a private IP address in:"; echo "$hits"; fail=1; fi
 fi
 if [ -r .leakwords ]; then
