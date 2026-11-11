@@ -21,3 +21,6 @@ __pycache__/
 
 # personal words for tools/check-leaks.sh
 .leakwords
+
+# Rust build output
+target/

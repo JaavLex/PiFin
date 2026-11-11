@@ -1,28 +1,53 @@
 #!/bin/bash
 # Called by comitup with the new state: HOTSPOT | CONNECTING | CONNECTED
-# While the Pi is really stuck in hotspot mode, the TV shows the Wi-Fi setup
-# instructions (comitup passes through HOTSPOT briefly at every boot before
-# joining a known network, hence the delay). Once connected, Jellyfin is
-# restarted so it comes back on screen.
+# (comitup runs it only on entering a state, output to /dev/null, and waits for
+# it: everything that sleeps is backgrounded. gdbus and systemctl are read or
+# run by backgrounded subshells too, so they can never delay comitup either.)
+# HOTSPOT    -> after a grace period the TV shows the QR setup page (again, with
+#               an error line, when we get here because a connection attempt failed).
+# CONNECTING -> after 8 s of still trying, the TV shows "Connecting to <ssid>…".
+# CONNECTED  -> if the TV is showing a PiFin page, restart the kiosk to get back.
 source /etc/pifin/secrets.env
 STATE=/run/pifin-wifi-state
-SHOWN=/run/pifin-setup-shown
+TRIED=/run/pifin-wifi-tried
+SCREEN=/usr/local/bin/pifin-setup-screen.py
 echo "$1" > "$STATE"
 
+# the ssid comitup is aiming at, empty if comitup is not reachable
+target_ssid() {
+  gdbus call --system --dest com.github.davesteele.comitup \
+    --object-path /com/github/davesteele/comitup \
+    --method com.github.davesteele.comitup.state 2>/dev/null \
+    | sed -n "s/^('[A-Z]*', '\(.*\)')$/\1/p"
+}
+
 case "$1" in
-  HOTSPOT)
+  CONNECTING)
     (
-      sleep 45   # give comitup time to join a known network first
+      SSID=$(target_ssid)
+      [ -n "$SSID" ] && printf '%s' "$SSID" > "$TRIED"
+      sleep 8   # a normal connect takes ~5 s: don't flash the screen on the fast path
+      [ "$(cat $STATE 2>/dev/null)" = CONNECTING ] && "$SCREEN" connecting "$SSID"
+    ) & ;;
+  HOTSPOT)
+    FAILED=""
+    if [ -e "$TRIED" ]; then FAILED=$(cat "$TRIED"); rm -f "$TRIED"; fi
+    (
+      # we just failed: bring the QR back quickly. At boot: wait, comitup usually
+      # joins a known network within a few seconds.
+      if [ -n "$FAILED" ]; then sleep 5; else sleep 45; fi
       while [ "$(cat $STATE 2>/dev/null)" = HOTSPOT ]; do
-        # Jellyfin may still be starting, or may have navigated away: retry
-        /usr/local/bin/pifin-setup-screen.py "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" && touch "$SHOWN"
+        "$SCREEN" hotspot "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" "$FAILED"
         sleep 20
       done
     ) & ;;
   CONNECTED)
-    if [ -e "$SHOWN" ]; then
-      rm -f "$SHOWN"
-      sleep 5   # let Tailscale reconnect before Jellyfin reloads
-      systemctl restart jellyfin-kiosk
-    fi ;;
+    rm -f "$TRIED"
+    (
+      sleep 2   # let the state file settle before asking the TV what it shows
+      if "$SCREEN" shown; then
+        sleep 5   # let Tailscale reconnect before Jellyfin reloads
+        systemctl restart jellyfin-kiosk
+      fi
+    ) & ;;
 esac

@@ -22,7 +22,9 @@ into Jellyfin on your TV — with hardware-decoded playback and your phone as th
   volume, search with posters, audio/subtitle pickers, and typing to the TV.
 - **TV remote** — HDMI-CEC buttons become keys, so a plain TV remote drives the whole UI.
 - **Wi-Fi setup hotspot** — with no known network the Pi opens a hotspot and shows a QR code
-  on the TV; pick your network on the phone and it carries on by itself.
+  on the TV; pick your network on the phone and it carries on by itself. The TV says what the Pi
+  is doing ("Connecting to …", then back to Jellyfin), and Wi-Fi power save is turned off
+  because the Pi 4's radio (brcmfmac) drops and scans slowly with it on.
 - **Optional Tailscale** — one auth key and the Pi joins your tailnet; leave it empty and it
   is not even installed.
 
@@ -82,6 +84,10 @@ one-time Tailscale key and the Wi-Fi password are wiped from the card after setu
 per step, idempotent), the kiosk/CEC/remote systemd units, and `pifin-remote/` (one Python
 file, one HTML file). `tools/` are development helpers and never run on the Pi.
 
+`pifin-setup.sh` also rewrites comitup's hard-coded `FAIL_TIMEOUT` to 60 s in
+`/usr/share/comitup/comitup/states.py`, so a lost network is retried about a minute after a
+failed attempt instead of six (the edit is guarded and skipped if upstream changed the line).
+
 ## Screenshots
 
 | Phone remote, idle | Phone remote, playing |
@@ -99,7 +105,8 @@ The TV shots were taken on a Pi 4 playing *Big Buck Bunny* (© Blender Foundatio
 
 Issues and pull requests welcome — say which Pi and which OS you are on, and paste
 `journalctl -u pifin-setup -e` (or the unit that misbehaved) for anything boot- or
-playback-related.
+playback-related. The journal is persistent (capped at 50 MB), so logs survive a reboot.
+Wi-Fi complaints should come with `journalctl -u comitup -u NetworkManager`.
 
 - The one rule: **lightweight and fast**. A Pi 4 with 2 GB has to keep up, so prefer fewer
   processes, fewer pixels and less memory over new features.

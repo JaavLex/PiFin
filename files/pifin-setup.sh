@@ -22,6 +22,16 @@ export DEBIAN_FRONTEND=noninteractive
 step() { echo; echo ">>> $*"; }
 retry() { local n=0; until "$@"; do n=$((n+1)); [ $n -ge 5 ] && return 1; echo "retry $n: $*"; sleep 15; done; }
 
+step "Persistent logs (capped)"
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/90-pifin-persistent.conf <<'EOF'
+# PiFin: keep journalctl -u comitup / -u NetworkManager after a reboot.
+[Journal]
+Storage=persistent
+SystemMaxUse=50M
+EOF
+systemctl restart systemd-journald   # flushes the current runtime journal into /var/log/journal
+
 step "Wi-Fi country + unblock"
 if [ -n "${WIFI_COUNTRY:-}" ]; then
   raspi-config nonint do_wifi_country "$WIFI_COUNTRY" || true
@@ -64,7 +74,8 @@ step "Packages"
 # evdev + cec-utils: TV remote bridge. pipewire: HDMI audio for the Flatpak.
 # websocket + qrcode: Wi-Fi setup screen. mpv: playback with the Pi's hardware
 # decoders (Jellyfin Desktop hands videos over to it, see pifin-remote).
-retry apt-get install -y flatpak cage xwayland matchbox-window-manager wlr-randr jq \
+# iw: check Wi-Fi power save from the field.
+retry apt-get install -y flatpak cage xwayland matchbox-window-manager wlr-randr jq iw \
   python3-evdev cec-utils pipewire pipewire-pulse wireplumber \
   python3-websocket python3-qrcode unattended-upgrades curl mpv
 if ! dpkg -s comitup >/dev/null 2>&1 && ! retry apt-get install -y comitup; then
@@ -124,6 +135,36 @@ EOF
 systemctl disable --now dnsmasq 2>/dev/null || true
 systemctl mask dnsmasq 2>/dev/null || true
 systemctl enable comitup || true
+
+step "Wi-Fi power save off (brcmfmac drops and slow scans)"
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/90-pifin-wifi.conf <<'EOF'
+# PiFin: brcmfmac power save makes scans slow and links drop on the Pi 4.
+# 2 = "disable"; NM applies it to every profile that leaves it unspecified,
+# which includes the ones comitup creates from the phone's setup page.
+[connection]
+wifi.powersave = 2
+EOF
+systemctl reload NetworkManager || true        # reloads conf.d, does not touch the link
+iw dev wlan0 set power_save off 2>/dev/null || true   # best effort for the current association
+
+step "Comitup: retry the known networks 1 min after a failed attempt"
+# comitup's FAIL_TIMEOUT is hard-coded: it is how long comitup waits in HOTSPOT
+# after a failed CONNECTING sweep before it tries the known networks again.
+CS=/usr/share/comitup/comitup/states.py
+if [ -f "$CS" ] && ! grep -q "^FAIL_TIMEOUT = 60" "$CS"; then
+  if sed -i "s/^FAIL_TIMEOUT = 360.*/FAIL_TIMEOUT = 60  # PiFin: retry a minute after a failed sweep/" "$CS" \
+     && python3 -m py_compile "$CS"; then
+    if grep -q "PiFin" "$CS"; then
+      rm -rf /usr/share/comitup/comitup/__pycache__
+      systemctl try-restart comitup || true
+    else
+      echo "comitup tweak not applied: states.py does not match the expected line, leaving it untouched"
+    fi
+  else
+    echo "comitup's states.py does not match the expected line: leaving it untouched"
+  fi
+fi
 
 step "Kiosk, TV remote (CEC) and phone remote services"
 usermod -aG video,render,input,audio,tty,netdev "$USER_NAME"
