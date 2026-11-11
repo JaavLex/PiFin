@@ -1,0 +1,11 @@
+[Unit]
+Description=PiFin Wi-Fi watchdog (reloads a stuck Wi-Fi driver)
+After=network-online.target comitup.service
+
+[Service]
+ExecStart=/usr/local/bin/pifin-wifi-watchdog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

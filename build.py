@@ -40,6 +40,8 @@ INSTALL = [
     ("pifin-remote.service", "/etc/systemd/system/pifin-remote.service", "0644"),
     ("pifin-app-session", "/usr/local/bin/pifin-app-session", "0755"),
     ("pifin-app.service", "/etc/systemd/system/pifin-app.service", "0644"),
+    ("pifin-wifi-watchdog", "/usr/local/bin/pifin-wifi-watchdog", "0755"),
+    ("pifin-wifi-watchdog.service", "/etc/systemd/system/pifin-wifi-watchdog.service", "0644"),
 ]
 # Config the Pi needs at run time -> /etc/pifin/secrets.env (0600, sourced by root only)
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",

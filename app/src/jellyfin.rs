@@ -13,6 +13,28 @@ pub struct Auth {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
+pub struct MediaStream {
+    pub index: i32,
+    #[serde(rename = "Type")]
+    pub kind: String,
+    pub codec: Option<String>,
+    pub display_title: Option<String>,
+    pub is_external: bool,
+    pub is_default: bool,
+    pub is_text_subtitle_stream: bool,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MediaSource {
+    pub id: String,
+    pub bitrate: Option<i64>,
+    pub media_streams: Vec<MediaStream>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct Person {
     pub id: String,
     pub name: String,
@@ -51,6 +73,7 @@ pub struct Item {
     pub backdrop_image_tags: Vec<String>,
     pub user_data: Option<UserData>,
     pub people: Vec<Person>,
+    pub media_sources: Vec<MediaSource>,
     pub genres: Vec<String>,
     pub community_rating: Option<f64>,
     pub official_rating: Option<String>,
@@ -130,7 +153,7 @@ impl Client {
     }
 
     /// Playback reporting (keeps Continue Watching and "now playing" right).
-    pub fn report(&self, kind: &str, item_id: &str, pos_ticks: i64, paused: bool) -> Result<(), String> {
+    pub fn report(&self, kind: &str, item_id: &str, pos_ticks: i64, paused: bool, session: Option<&str>) -> Result<(), String> {
         let path = match kind {
             "start" => "/Sessions/Playing",
             "stop" => "/Sessions/Playing/Stopped",
@@ -138,8 +161,17 @@ impl Client {
         };
         self.post(path, &serde_json::json!({
             "ItemId": item_id, "MediaSourceId": item_id, "PositionTicks": pos_ticks,
-            "IsPaused": paused, "CanSeek": true, "PlayMethod": "DirectPlay",
+            "IsPaused": paused, "CanSeek": true,
+            "PlayMethod": if session.is_some() { "Transcode" } else { "DirectPlay" },
+            "PlaySessionId": session,
         }))
+    }
+
+    /// Stop the server-side conversion of a transcoded playback.
+    pub fn stop_transcode(&self, session: &str) {
+        let url = format!("{}/Videos/ActiveEncodings?DeviceId={}&PlaySessionId={session}",
+            self.auth.server.trim_end_matches('/'), self.auth.device_id);
+        let _ = self.agent.delete(&url).header("Authorization", &self.header()).call();
     }
 
     /// Store the resume position, or mark watched past 90 %.

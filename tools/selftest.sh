@@ -59,7 +59,7 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 17)  # 14 installed + secrets.env + display.conf + app.conf
+eq("file count", len(wf), 19)  # 16 installed + secrets.env + display.conf + app.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 eq("app.conf", wf["/etc/pifin/app.conf"]["content"], "JELLYFIN_URL=http://jellyfin.example:8096\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")

@@ -136,7 +136,7 @@ fi
 step "App, TV remote (CEC) and phone remote services"
 usermod -aG video,render,input,audio,tty,netdev "$USER_NAME"
 systemctl daemon-reload
-systemctl enable pifin-app.service pifin-cec-remote.service pifin-remote.service
+systemctl enable pifin-app.service pifin-cec-remote.service pifin-remote.service pifin-wifi-watchdog.service
 systemctl set-default multi-user.target
 
 step "Updates: security only, at night (never while watching)"

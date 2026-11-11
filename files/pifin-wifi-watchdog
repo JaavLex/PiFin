@@ -1,0 +1,38 @@
+#!/bin/sh
+# PiFin Wi-Fi watchdog.
+#
+# The Pi 4's built-in Wi-Fi (brcmfmac) can get stuck with some routers: the link
+# stays up and small packets pass, but the router's rate to the Pi collapses to
+# 1 Mbit/s and anything larger stalls (endless "Loading…", freezes, a dead phone
+# remote). Reloading the driver fixes it. Every 30 s, while connected, this
+# fetches the Jellyfin web page; after two failures in a row it reloads the
+# driver with comitup paused (so it doesn't detour through the setup hotspot).
+# At most one reload every 5 minutes.
+
+URL=$(sed -n 's/^JELLYFIN_URL=//p' /etc/pifin/app.conf 2>/dev/null | tr -d "'\"")
+[ -n "$URL" ] || { echo "no JELLYFIN_URL in /etc/pifin/app.conf"; exit 0; }
+fails=0
+last=0
+while sleep 30; do
+  # only judge the link while comitup says we are on a network
+  [ "$(cat /run/pifin-wifi-state 2>/dev/null)" = CONNECTED ] || { fails=0; continue; }
+  if curl -fs -o /dev/null --max-time 12 "$URL/web/index.html"; then
+    fails=0
+    continue
+  fi
+  fails=$((fails + 1))
+  echo "Jellyfin unreachable ($fails)"
+  now=$(date +%s)
+  if [ "$fails" -ge 2 ] && [ $((now - last)) -ge 300 ]; then
+    echo "reloading the Wi-Fi driver"
+    last=$now
+    fails=0
+    systemctl stop comitup
+    modprobe -r brcmfmac_cyw brcmfmac_wcc brcmfmac 2>/dev/null
+    sleep 2
+    modprobe brcmfmac
+    sleep 3
+    systemctl start comitup
+    /usr/sbin/iw dev wlan0 set power_save off 2>/dev/null || true
+  fi
+done

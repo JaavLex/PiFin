@@ -71,7 +71,16 @@ def now_playing():
     except (OSError, ValueError):
         info = {}
     player.info = info
-    return player.status()
+    st = player.status()
+    # Jellyfin's own track names ("English - DTS-HD MA - 5.1"), listed by the app
+    # in mpv's order; mpv's guesses are kept if the counts don't match
+    names = info.get("names") or {}
+    for kind in ("audio", "sub"):
+        tracks, labels = st.get("tracks", {}).get(kind, []), names.get(kind) or []
+        if tracks and len(tracks) == len(labels):
+            for t, label in zip(tracks, labels):
+                t["label"] = label
+    return st
 
 
 # ------------------------------------------------------------ Jellyfin ------

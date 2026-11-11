@@ -33,6 +33,9 @@ fn mpv_command(url: &str, start_s: f64, title: &str) -> Command {
     c.args([
         "--fs", "--vo=gpu", "--gpu-context=wayland", "--profile=fast",
         "--hwdec=drm,v4l2m2m-copy,no", "--cache=yes", "--demuxer-max-bytes=150MiB",
+        // weak Wi-Fi: read ahead, and after an underrun wait for a few seconds of
+        // buffer instead of stuttering every couple of seconds
+        "--demuxer-readahead-secs=20", "--cache-pause-wait=4",
         "--osc=no", "--osd-level=0", "--really-quiet",
     ]);
     c.arg(format!("--script={MPV_DATA}/pifin-osd.lua"));
@@ -401,15 +404,100 @@ fn mpv_get(prop: &str) -> Option<serde_json::Value> {
     None
 }
 
+/// Files above this bitrate are converted by the server instead of played directly:
+/// the Pi's Wi-Fi can't keep up with Blu-ray remuxes (30+ Mbit/s).
+const MAX_DIRECT_BITRATE: i64 = 16_000_000;
+
+/// How to play an item: the URL, extra subtitle files, and the track names the
+/// phone remote shows (in mpv's order).
+struct Plan {
+    url: String,
+    subs: Vec<String>,
+    session: Option<String>,
+    audio_names: Vec<String>,
+    sub_names: Vec<String>,
+}
+
+fn plan(auth: &Auth, it: &Item) -> Plan {
+    let server = auth.server.trim_end_matches('/');
+    let token = &auth.token;
+    let ms = it.media_sources.first();
+    let msid = ms.map(|m| m.id.clone()).unwrap_or_else(|| it.id.clone());
+    let streams: Vec<&jellyfin::MediaStream> = ms.map(|m| m.media_streams.iter().collect()).unwrap_or_default();
+    let name = |s: &jellyfin::MediaStream| s.display_title.clone().or(s.title.clone()).unwrap_or_else(|| format!("Track {}", s.index));
+    let sub_url = |s: &jellyfin::MediaStream| format!("{server}/Videos/{}/{msid}/Subtitles/{}/0/Stream.srt?ApiKey={token}", it.id, s.index);
+    let bitrate = ms.and_then(|m| m.bitrate).unwrap_or(0);
+    if bitrate <= MAX_DIRECT_BITRATE {
+        // direct play: internal tracks in file order, then external text subs
+        let audio_names = streams.iter().filter(|s| s.kind == "Audio" && !s.is_external).map(|s| name(s)).collect();
+        let mut sub_names: Vec<String> = streams.iter().filter(|s| s.kind == "Subtitle" && !s.is_external).map(|s| name(s)).collect();
+        let ext: Vec<&&jellyfin::MediaStream> = streams.iter().filter(|s| s.kind == "Subtitle" && s.is_external && s.is_text_subtitle_stream).collect();
+        sub_names.extend(ext.iter().map(|s| name(s)));
+        return Plan {
+            url: format!("{server}/Videos/{}/stream?static=true&mediaSourceId={msid}&api_key={token}", it.id),
+            subs: ext.iter().map(|s| sub_url(s)).collect(),
+            session: None,
+            audio_names,
+            sub_names,
+        };
+    }
+    // converted by the server (hardware encoder on the server side), HLS so seeking works
+    let session = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
+    let audio = streams.iter().find(|s| s.kind == "Audio" && s.is_default).or(streams.iter().find(|s| s.kind == "Audio"));
+    let text_subs: Vec<&&jellyfin::MediaStream> = streams.iter().filter(|s| s.kind == "Subtitle" && s.is_text_subtitle_stream).collect();
+    eprintln!("TRANSCODE id={} source_bitrate={}", it.id, bitrate);
+    Plan {
+        url: format!(
+            "{server}/Videos/{}/master.m3u8?MediaSourceId={msid}&DeviceId={}&PlaySessionId={session}&ApiKey={token}\
+             &VideoCodec=h264&AudioCodec=aac&VideoBitrate=10000000&AudioBitrate=384000&MaxAudioChannels=6\
+             &TranscodingMaxAudioChannels=6&MaxWidth=1920&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
+            it.id, auth.device_id,
+            audio.map(|a| format!("&AudioStreamIndex={}", a.index)).unwrap_or_default()
+        ),
+        subs: text_subs.iter().map(|s| sub_url(s)).collect(),
+        session: Some(session),
+        audio_names: audio.map(|a| vec![format!("{} (converted)", name(a))]).unwrap_or_default(),
+        sub_names: text_subs.iter().map(|s| name(s)).collect(),
+    }
+}
+
+/// Send a command to the running mpv (blocking; used off the UI thread).
+fn mpv_send(args: &[&str]) -> bool {
+    use std::io::Write;
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect("/tmp/pifin-mpv.sock") else { return false };
+    let cmd = serde_json::json!({ "command": args });
+    s.write_all(format!("{cmd}\n").as_bytes()).is_ok()
+}
+
+/// External/extracted subtitles are added once playback runs: the server may take
+/// a while to extract them from a big file, and that must not delay the picture.
+fn spawn_sub_loader(subs: Vec<(String, String)>) {
+    if subs.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..60 {
+            if mpv_get("time-pos").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        for (url, title) in subs {
+            mpv_send(&["sub-add", &url, "auto", &title]);
+        }
+    });
+}
+
 /// Background reporter for one playback: Start, Progress every 10 s, then Stopped +
 /// resume position once mpv is gone. Then asks the UI to refresh the home screen.
-fn spawn_reporter(client: Arc<Client>, item: Item, exited: Arc<std::sync::atomic::AtomicBool>, weak: slint::Weak<App>) {
+fn spawn_reporter(client: Arc<Client>, item: Item, session: Option<String>, exited: Arc<std::sync::atomic::AtomicBool>, weak: slint::Weak<App>) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         let start = item.user_data.as_ref().map(|u| u.playback_position_ticks).unwrap_or(0);
         let run = item.run_time_ticks.unwrap_or(0);
         let mut pos = start;
-        let _ = client.report("start", &item.id, pos, false);
+        let ses = session.as_deref();
+        let _ = client.report("start", &item.id, pos, false, ses);
         let mut last = Instant::now();
         while !exited.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
@@ -419,12 +507,15 @@ fn spawn_reporter(client: Arc<Client>, item: Item, exited: Arc<std::sync::atomic
             if last.elapsed() >= Duration::from_secs(10) {
                 last = Instant::now();
                 let paused = mpv_get("pause").and_then(|v| v.as_bool()).unwrap_or(false);
-                if let Err(e) = client.report("progress", &item.id, pos, paused) {
+                if let Err(e) = client.report("progress", &item.id, pos, paused, ses) {
                     eprintln!("{e}");
                 }
             }
         }
-        let _ = client.report("stop", &item.id, pos, false);
+        let _ = client.report("stop", &item.id, pos, false, ses);
+        if let Some(s) = ses {
+            client.stop_transcode(s);
+        }
         if let Err(e) = client.save_position(&item.id, pos, run) {
             eprintln!("{e}");
         }
@@ -916,10 +1007,25 @@ fn main() {
             if !matches!(it.kind.as_str(), "Movie" | "Episode") {
                 return;
             }
-            let url = format!(
-                "{}/Videos/{}/stream?static=true&mediaSourceId={}&api_key={}",
-                auth.server.trim_end_matches('/'), it.id, it.id, auth.token
-            );
+            // list items carry no media info: fetch the full item first, then come back here
+            if it.media_sources.is_empty() {
+                let client = client.clone();
+                let weak = weak.clone();
+                let id = it.id.clone();
+                std::thread::spawn(move || {
+                    let Ok(full) = client.item(&id) else { return };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(app) = weak.upgrade() else { return };
+                        REMOTE.with(|r| {
+                            if let Some(f) = r.borrow().as_ref() {
+                                f(&app, "play", Some(full));
+                            }
+                        });
+                    });
+                });
+                return;
+            }
+            let plan = plan(&auth, &it);
             let start = it.user_data.as_ref().map(|u| u.playback_position_ticks as f64 / 1e7).unwrap_or(0.0);
             let title = match (&it.series_name, it.parent_index_number, it.index_number) {
                 (Some(s), Some(se), Some(ep)) => format!("{s} - S{se}E{ep} - {}", it.name),
@@ -930,14 +1036,17 @@ fn main() {
                 "id": it.id, "name": it.name, "series": it.series_name, "season": it.parent_index_number,
                 "episode": it.index_number, "year": it.production_year, "runTicks": it.run_time_ticks.unwrap_or(0),
                 "imageId": poster_id(&it, false),
+                "names": { "audio": plan.audio_names, "sub": plan.sub_names },
             });
             let _ = std::fs::write(NOW_FILE, now.to_string());
-            match mpv_command(&url, start, &title).spawn() {
+            match mpv_command(&plan.url, start, &title).spawn() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
                     *player.borrow_mut() = Some(child);
                     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    spawn_reporter(client.clone(), it.clone(), exited.clone(), weak.clone());
+                    spawn_reporter(client.clone(), it.clone(), plan.session.clone(), exited.clone(), weak.clone());
+                    let sub_titles = plan.sub_names.iter().skip(plan.sub_names.len() - plan.subs.len()).cloned();
+                    spawn_sub_loader(plan.subs.iter().cloned().zip(sub_titles).collect());
                     let weak = weak.clone();
                     let player = player.clone();
                     let poll_w = Rc::downgrade(&poll);
