@@ -117,6 +117,7 @@ struct Screen {
     cards: Vec<Rc<VecModel<Card>>>,
     focus: Vec<i32>,
     cur_row: i32,
+    search: Option<String>, // Some(query) for the search screen
 }
 
 /// UI-thread state.
@@ -147,7 +148,13 @@ fn card_of(it: &Item, in_series: bool) -> Card {
         }
         _ => 0.0,
     };
-    let title = if in_series || (it.kind == "Episode" && it.series_name.is_none()) {
+    let title = if let Some(a) = it.action {
+        match (a, &it.user_data) {
+            ("resume", Some(u)) => format!("▶  Resume from {}", fmt_ticks(u.playback_position_ticks)),
+            ("resume", None) => "▶  Play".into(),
+            _ => "↺  Play from start".into(),
+        }
+    } else if in_series || it.kind == "Person" || (it.kind == "Episode" && it.series_name.is_none()) {
         it.name.clone()
     } else {
         it.title().to_string()
@@ -155,7 +162,11 @@ fn card_of(it: &Item, in_series: bool) -> Card {
     Card {
         id: it.id.clone().into(),
         title: title.into(),
-        subtitle: if in_series {
+        subtitle: if it.kind == "Person" {
+            it.overview.clone().unwrap_or_default().into()
+        } else if it.action.is_some() {
+            "".into()
+        } else if in_series {
             let mut v = vec![];
             if let Some(e) = it.index_number { v.push(format!("Episode {e}")); }
             if let Some(t) = it.run_time_ticks.filter(|t| *t >= 600_000_000) { v.push(format!("{} min", t / 600_000_000)); }
@@ -252,11 +263,43 @@ fn fetch_series(client: &Client, series_id: &str) -> Vec<(String, Vec<Item>)> {
     rows
 }
 
+/// Rows for a movie page: Play/Resume actions, then the cast.
+fn fetch_movie(client: &Client, id: &str) -> Vec<(String, Vec<Item>)> {
+    let Ok(movie) = client.item(id) else { return vec![] };
+    let resume = movie.user_data.as_ref().map(|u| u.playback_position_ticks > 0).unwrap_or(false);
+    let mut actions = vec![];
+    let mut a = movie.clone();
+    a.action = Some("resume");
+    if !resume {
+        a.user_data = None;
+    }
+    actions.push(a);
+    if resume {
+        let mut b = movie.clone();
+        b.action = Some("start");
+        b.user_data = None;
+        actions.push(b);
+    }
+    let mut rows = vec![("Watch".to_string(), actions)];
+    let cast: Vec<Item> = movie.people.iter().filter(|p| p.kind == "Actor" || p.kind == "Director").take(20).map(|p| Item {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        kind: "Person".into(),
+        overview: p.role.clone().filter(|r| !r.is_empty()).or_else(|| (p.kind == "Director").then(|| "Director".into())),
+        image_tags: p.primary_image_tag.iter().map(|t| ("Primary".to_string(), t.clone())).collect(),
+        ..Default::default()
+    }).collect();
+    if !cast.is_empty() {
+        rows.push(("Cast & crew".to_string(), cast));
+    }
+    rows
+}
+
 /// Push (or, with `replace`, swap in place) a screen built from rows, queue its images.
 fn install_screen(app: &App, st: &mut State, rows: Vec<(String, Vec<Item>)>, own_images: bool, replace: Option<usize>) {
     let id = st.next_id;
     st.next_id += 1;
-    let mut screen = Screen { id, titles: vec![], items: vec![], cards: vec![], focus: vec![], cur_row: 0, };
+    let mut screen = Screen { id, titles: vec![], items: vec![], cards: vec![], focus: vec![], cur_row: 0, search: None };
     for (title, items) in rows {
         screen.cards.push(Rc::new(VecModel::from(items.iter().map(|i| card_of(i, own_images)).collect::<Vec<_>>())));
         screen.titles.push(title);
@@ -289,6 +332,7 @@ fn install_screen(app: &App, st: &mut State, rows: Vec<(String, Vec<Item>)>, own
                     *f = (*of).min(screen.items[r].len() as i32 - 1).max(0);
                 }
             }
+            screen.search = old.search.clone();
             st.screens[i] = screen;
             if i == st.screens.len() - 1 {
                 show_top(app, st);
@@ -312,6 +356,13 @@ fn show_top(app: &App, st: &mut State) {
         .map(|((t, c), f)| Row { title: t.clone().into(), cards: ModelRc::from(c.clone()), focus: *f })
         .collect();
     st.rows.set_vec(rows);
+    app.set_search_mode(sc.search.is_some());
+    if let Some(q) = &sc.search {
+        app.set_query(q.clone().into());
+        if sc.items.is_empty() {
+            app.set_kb_active(true);
+        }
+    }
     let (r, c) = (sc.cur_row, sc.focus.get(sc.cur_row as usize).copied().unwrap_or(0));
     app.set_cur_row(r);
     let app_weak = app.as_weak();
@@ -763,10 +814,15 @@ fn main() {
             }
             app.set_cur_row(r as i32);
             let it = sc.items[r][col as usize].clone();
-            app.set_heading(it.title().into());
-            app.set_info(info_line(&it).into());
-            app.set_overview(it.overview.clone().unwrap_or_default().into());
+            if it.kind != "Person" {
+                app.set_heading(it.title().into());
+                app.set_info(info_line(&it).into());
+                app.set_overview(it.overview.clone().unwrap_or_default().into());
+            }
             // backdrop once the focus settles for 250 ms (no fetch storm while scrolling)
+            if it.kind == "Person" {
+                return;
+            }
             st.backdrop_gen += 1;
             let gen = st.backdrop_gen;
             let id = backdrop_id(&it);
@@ -793,6 +849,23 @@ fn main() {
             }
             if let Some(a) = weak.upgrade() {
                 a.set_remote_show(false);
+            }
+            if it.kind == "Movie" && !play && it.action.is_none() {
+                let client = client.clone();
+                let weak = weak.clone();
+                std::thread::spawn(move || {
+                    let rows = fetch_movie(&client, &it.id);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(app) = weak.upgrade() else { return };
+                        if !rows.is_empty() {
+                            with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, false, None));
+                        }
+                    });
+                });
+                return;
+            }
+            if it.kind == "Person" {
+                return;
             }
             let series_page = match it.kind.as_str() {
                 "Series" => Some(it.id.clone()),
@@ -881,7 +954,95 @@ fn main() {
                 let Some(it) = st.screens.last().and_then(|s| s.items.get(r as usize)).and_then(|v| v.get(c as usize)) else { return };
                 it.clone()
             };
-            open_item(it, true);
+            // movies open their page; episodes and the page's Play cards play
+            let play = it.kind != "Movie" || it.action.is_some();
+            open_item(it, play);
+        });
+    }
+
+    // ---- search: on-screen keyboard, results 0.4 s after the last key -------------------
+    let kb: Vec<slint::SharedString> = ('a'..='z').chain('0'..='9').map(|c| c.to_string().into())
+        .chain(["space", "delete", "clear"].iter().map(|k| (*k).into())).collect();
+    app.set_kb_keys(ModelRc::new(VecModel::from(kb)));
+    let search_timer = Rc::new(slint::Timer::default());
+    let run_search: Rc<dyn Fn(String)> = {
+        let weak = app.as_weak();
+        let client = client.clone();
+        let search_timer = search_timer.clone();
+        Rc::new(move |q: String| {
+            let weak = weak.clone();
+            let client = client.clone();
+            search_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(400), move || {
+                let q = q.clone();
+                let weak = weak.clone();
+                let client = client.clone();
+                if q.trim().len() < 2 {
+                    return;
+                }
+                std::thread::spawn(move || {
+                    let items = client.search(&q).unwrap_or_default();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(app) = weak.upgrade() else { return };
+                        with_state(|state| {
+                            let mut st = state.borrow_mut();
+                            // only if the search screen is still on top with this query
+                            let top = st.screens.len().wrapping_sub(1);
+                            if st.screens.last().and_then(|s| s.search.as_deref()) != Some(q.as_str()) {
+                                return;
+                            }
+                            let rows = if items.is_empty() { vec![] } else { vec![(format!("Results for \"{q}\""), items)] };
+                            install_screen(&app, &mut st, rows, false, Some(top));
+                        });
+                    });
+                });
+            });
+        })
+    };
+    let open_search: Rc<dyn Fn(String)> = {
+        let weak = app.as_weak();
+        let state = state.clone();
+        let run_search = run_search.clone();
+        Rc::new(move |q: String| {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_remote_show(false);
+            let mut st = state.borrow_mut();
+            let is_search = st.screens.last().map(|s| s.search.is_some()).unwrap_or(false);
+            if !is_search {
+                install_screen(&app, &mut st, vec![], false, None);
+                app.set_kb_focus(0);
+                app.set_kb_active(true);
+            }
+            if let Some(sc) = st.screens.last_mut() {
+                sc.search = Some(q.clone());
+            }
+            show_top(&app, &mut st);
+            drop(st);
+            run_search(q);
+        })
+    };
+    {
+        let open_search = open_search.clone();
+        app.on_open_search(move || open_search(String::new()));
+    }
+    {
+        let state = state.clone();
+        let weak = app.as_weak();
+        let run_search = run_search.clone();
+        app.on_kb_press(move |key| {
+            let Some(app) = weak.upgrade() else { return };
+            let mut st = state.borrow_mut();
+            let Some(sc) = st.screens.last_mut() else { return };
+            let Some(q) = sc.search.as_mut() else { return };
+            match key.as_str() {
+                "space" => q.push(' '),
+                "delete" => { q.pop(); }
+                "clear" => q.clear(),
+                k => q.push_str(k),
+            }
+            let q = q.clone();
+            app.set_query(q.clone().into());
+            drop(st);
+            run_search(q);
         });
     }
 
@@ -900,8 +1061,12 @@ fn main() {
                         if std::io::BufReader::new(conn).read_line(&mut line).is_err() {
                             continue;
                         }
-                        let mut parts = line.trim().splitn(2, ' ');
-                        let (cmd, arg) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
+                        let line = line.trim_end_matches(['\r', '\n']).to_string();
+                        let mut parts = line.splitn(2, ' ');
+                        let (mut cmd, arg) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
+                        if cmd == "text" {
+                            cmd = line.clone();
+                        }
                         // items are fetched here, off the UI thread
                         let item = if matches!(cmd.as_str(), "play" | "open") { client.item(&arg).ok() } else { None };
                         let weak = weak.clone();
@@ -920,6 +1085,7 @@ fn main() {
         }
         let state = state.clone();
         let open_item = open_item.clone();
+        let open_search = open_search.clone();
         REMOTE.with(|r| {
             *r.borrow_mut() = Some(Box::new(move |app: &App, cmd: &str, item: Option<Item>| match cmd {
                 "seen" => app.set_remote_show(false),
@@ -935,6 +1101,7 @@ fn main() {
                         open_item(it, cmd == "play");
                     }
                 }
+                c if c.starts_with("text ") => open_search(c[5..].to_string()),
                 _ => eprintln!("unknown remote command {cmd}"),
             }));
         });

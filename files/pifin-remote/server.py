@@ -179,6 +179,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"ok": True})
             if action == "home":
                 return self.json({"ok": True, "result": app_cmd("home")})
+            if action == "text":
+                text = str(data.get("text", "")).replace("\n", " ")[:200]
+                return self.json({"ok": True, "result": app_cmd("text " + text)})
             if action == "search":
                 return self.json({"ok": True, "result": "ok", "items": search(str(data.get("text", "")))})
             if action in ("open", "playitem"):

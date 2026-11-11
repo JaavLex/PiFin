@@ -106,6 +106,16 @@ export component App inherits Window {
     callback back();
     callback unknown-key(string);
 
+    // search screen: on-screen keyboard over the header, results in the rows
+    in property <bool> search-mode: false;
+    in property <string> query;
+    in property <[string]> kb-keys;
+    in-out property <int> kb-focus: 0;
+    in-out property <bool> kb-active: true;
+    property <int> kb-cols: 10;
+    callback open-search();
+    callback kb-press(string);
+
     // Wi-Fi screen (shown over everything while the Pi has no network)
     in property <bool> wifi-show: false;
     in property <string> wifi-title;
@@ -134,6 +144,7 @@ export component App inherits Window {
     Text {
         x: 64px; y: 36px;
         width: 760px;
+        visible: !root.search-mode;
         text: root.heading;
         font-size: 36px; font-weight: 700;
         color: #f2f2f7;
@@ -141,6 +152,7 @@ export component App inherits Window {
     }
     Text {
         x: 64px; y: 86px;
+        visible: !root.search-mode;
         text: root.info;
         color: #b4b4c8;
         font-size: 17px;
@@ -148,6 +160,7 @@ export component App inherits Window {
     Text {
         x: 64px; y: 116px;
         width: 700px; height: 72px;
+        visible: !root.search-mode;
         text: root.overview;
         color: #9a9ab0;
         font-size: 15px;
@@ -159,6 +172,40 @@ export component App inherits Window {
         text: root.status;
         color: #6e6e86;
         font-size: 15px;
+    }
+
+    if root.search-mode: Rectangle {
+        x: 64px; y: 22px;
+        width: parent.width - 128px; height: 180px;
+        Rectangle {
+            x: 0; y: 0; width: 420px; height: 44px;
+            border-radius: 10px;
+            background: #1a1c2b;
+            Text {
+                x: 16px;
+                text: root.query == "" ? "Search movies and shows" : root.query;
+                color: root.query == "" ? #6e6e86 : #f2f2f7;
+                font-size: 22px;
+                vertical-alignment: center;
+                height: parent.height;
+            }
+        }
+        Text { x: 440px; y: 12px; text: root.kb-active ? "↓ results" : "↑ keyboard"; color: #6e6e86; font-size: 15px; }
+        for key[i] in root.kb-keys: Rectangle {
+            property <bool> focused: root.kb-active && i == root.kb-focus;
+            x: mod(i, root.kb-cols) * 50px;
+            y: 56px + floor(i / root.kb-cols) * 30px;
+            width: key == "space" || key == "delete" || key == "clear" ? 46px : 46px;
+            height: 27px;
+            border-radius: 6px;
+            background: focused ? #00a4dc : #1a1c2b;
+            Text {
+                text: key == "space" ? "␣" : key == "delete" ? "⌫" : key == "clear" ? "✕" : key;
+                color: focused ? #0b0b12 : #c8c8d8;
+                font-size: 16px;
+                font-weight: focused ? 700 : 400;
+            }
+        }
     }
 
     // rows: the focused row sits at the top of the list area
@@ -243,7 +290,26 @@ export component App inherits Window {
     forward-focus: keys;
     keys := FocusScope {
         key-pressed(event) => {
+            if (root.search-mode && (root.kb-active || root.rows.length == 0)) {
+                if (event.text == Key.RightArrow) { root.kb-focus = min(root.kb-keys.length - 1, root.kb-focus + 1); return accept; }
+                if (event.text == Key.LeftArrow) { root.kb-focus = max(0, root.kb-focus - 1); return accept; }
+                if (event.text == Key.UpArrow) { root.kb-focus = max(0, root.kb-focus - root.kb-cols); return accept; }
+                if (event.text == Key.DownArrow) {
+                    if (root.kb-focus + root.kb-cols < root.kb-keys.length) { root.kb-focus += root.kb-cols; }
+                    else if (root.rows.length > 0) { root.kb-active = false; }
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == " ") { root.kb-press(root.kb-keys[root.kb-focus]); return accept; }
+                if (event.text == Key.Escape) { root.back(); return accept; }
+                if (event.text == Key.Backspace) { root.kb-press("delete"); return accept; }
+                if (event.text.character-count == 1) { root.kb-press(event.text); return accept; }
+                return reject;
+            }
             if (root.rows.length == 0) { return reject; }
+            if (event.text == Key.UpArrow && root.cur-row == 0) {
+                if (root.search-mode) { root.kb-active = true; } else { root.open-search(); }
+                return accept;
+            }
             if (event.text == Key.RightArrow) { root.moved(root.cur-row, root.rows[root.cur-row].focus + 1); return accept; }
             if (event.text == Key.LeftArrow) { root.moved(root.cur-row, root.rows[root.cur-row].focus - 1); return accept; }
             if (event.text == Key.DownArrow) { root.moved(root.cur-row + 1, -1); return accept; }

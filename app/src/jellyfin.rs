@@ -52,6 +52,9 @@ pub struct Item {
     pub genres: Vec<String>,
     pub community_rating: Option<f64>,
     pub official_rating: Option<String>,
+    /// Set by the app for the action cards on a movie page ("resume" / "start").
+    #[serde(skip)]
+    pub action: Option<&'static str>,
 }
 
 impl Item {
