@@ -133,6 +133,10 @@ impl Client {
         }
     }
 
+    pub fn item(&self, id: &str) -> Result<Item, String> {
+        self.get(&format!("/Users/{}/Items/{id}", self.auth.user_id), &[])
+    }
+
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>, String> {
         let r: Items = self.get(&format!("/Shows/{series_id}/Seasons"), &[("UserId", &self.auth.user_id)])?;
         Ok(r.items)

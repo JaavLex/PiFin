@@ -114,6 +114,11 @@ export component App inherits Window {
     in property <image> wifi-qr;
     in property <bool> wifi-has-qr: false;
 
+    // phone remote hint (bottom right) shown at boot
+    in-out property <bool> remote-show: false;
+    in property <image> remote-qr;
+    in property <string> remote-url;
+
     property <length> row-h: 330px;
     property <length> card-step: 166px;
 
@@ -180,6 +185,21 @@ export component App inherits Window {
                 visible: self.x > -self.width && self.x < root.width;
             }
         }
+    }
+
+    if root.remote-show && !root.wifi-show: Rectangle {
+        x: parent.width - self.width - 40px; y: parent.height - self.height - 32px;
+        width: 360px; height: 160px;
+        border-radius: 16px;
+        background: #161826f0;
+        Rectangle {
+            x: 16px; y: 20px; width: 120px; height: 120px;
+            background: white; border-radius: 8px;
+            Image { x: 8px; y: 8px; width: 104px; height: 104px; source: root.remote-qr; image-rendering: pixelated; }
+        }
+        Text { x: 152px; y: 28px; text: "Phone remote"; font-size: 20px; font-weight: 700; color: #f2f2f7; }
+        Text { x: 152px; y: 60px; width: 196px; text: "Scan, or open " + root.remote-url + " on a phone on this Wi-Fi."; font-size: 14px; color: #9a9ab0; wrap: word-wrap; }
+        Text { x: 152px; y: 128px; text: "Back to hide"; font-size: 13px; color: #6e6e86; }
     }
 
     if root.wifi-show: Rectangle {

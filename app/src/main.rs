@@ -393,6 +393,32 @@ struct WifiState {
 }
 
 const WIFI_FILE: &str = "/run/pifin/wifi.json";
+const NOW_FILE: &str = "/tmp/pifin-now.json";
+const APP_SOCK: &str = "/tmp/pifin-app.sock";
+
+type RemoteFn = Box<dyn Fn(&App, &str, Option<Item>)>;
+thread_local! {
+    static REMOTE: RefCell<Option<RemoteFn>> = const { RefCell::new(None) };
+}
+
+/// The address phones on the same network use to reach us.
+fn local_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?; // documentation address: no packet is sent
+    Some(s.local_addr().ok()?.ip())
+}
+
+/// A QR code as a 1-pixel-per-module image (scaled up by the UI, pixelated).
+fn qr_image(text: &str) -> Option<slint::Image> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let n = code.width() as u32;
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(n, n);
+    for (px, c) in buf.make_mut_slice().iter_mut().zip(code.to_colors()) {
+        let v = if c == qrcode::Color::Dark { 0 } else { 255 };
+        *px = Rgba8Pixel { r: v, g: v, b: v, a: 255 };
+    }
+    Some(slint::Image::from_rgba8(buf))
+}
 
 fn now_s() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -404,16 +430,7 @@ fn wifi_qr(ssid: &str, pass: &str) -> Option<slint::Image> {
         '\\' | ';' | ',' | ':' | '"' => vec!['\\', c],
         _ => vec![c],
     }).collect::<String>();
-    let payload = format!("WIFI:T:WPA;S:{};P:{};;", esc(ssid), esc(pass));
-    let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
-    let n = code.width() as u32;
-    let colors = code.to_colors();
-    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(n, n);
-    for (px, c) in buf.make_mut_slice().iter_mut().zip(colors) {
-        let v = if c == qrcode::Color::Dark { 0 } else { 255 };
-        *px = Rgba8Pixel { r: v, g: v, b: v, a: 255 };
-    }
-    Some(slint::Image::from_rgba8(buf))
+    qr_image(&format!("WIFI:T:WPA;S:{};P:{};;", esc(ssid), esc(pass)))
 }
 
 /// Decide what the TV shows for a Wi-Fi state. Grace periods avoid flashing a
@@ -642,6 +659,9 @@ fn main() {
         let backdrop_timer = backdrop_timer.clone();
         app.on_moved(move |r, c| {
             let Some(app) = weak.upgrade() else { return };
+            if app.get_remote_show() && app.get_cur_row() != r {
+                app.set_remote_show(false);
+            }
             let mut st = state.borrow_mut();
             let st = &mut *st;
             let Some(sc) = st.screens.last_mut() else { return };
@@ -674,27 +694,30 @@ fn main() {
         });
     }
 
-    // ---- OK: open a series, or hand playback off to mpv ----------------------------
+    // ---- open an item: series pages, or hand playback off to mpv -------------------
+    // `play` = true plays episodes directly; false opens an episode's series page.
     let player: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
     let poll = Rc::new(slint::Timer::default());
-    {
+    let open_item: Rc<dyn Fn(Item, bool)> = {
         let weak = app.as_weak();
-        let state = state.clone();
         let player = player.clone();
         let poll = poll.clone();
         let auth = auth.clone();
         let client = client.clone();
-        app.on_activate(move |r, c| {
+        Rc::new(move |it: Item, play: bool| {
             if player.borrow().is_some() {
                 return;
             }
-            let it = {
-                let st = state.borrow();
-                let Some(it) = st.screens.last().and_then(|s| s.items.get(r as usize)).and_then(|v| v.get(c as usize)) else { return };
-                it.clone()
+            if let Some(a) = weak.upgrade() {
+                a.set_remote_show(false);
+            }
+            let series_page = match it.kind.as_str() {
+                "Series" => Some(it.id.clone()),
+                "Season" => it.series_id.clone(),
+                "Episode" if !play => it.series_id.clone(),
+                _ => None,
             };
-            if it.kind == "Series" || it.kind == "Season" {
-                let series_id = if it.kind == "Season" { it.series_id.clone().unwrap_or_default() } else { it.id.clone() };
+            if let Some(series_id) = series_page {
                 let client = client.clone();
                 let weak = weak.clone();
                 if let Some(a) = weak.upgrade() {
@@ -704,12 +727,10 @@ fn main() {
                     let rows = fetch_series(&client, &series_id);
                     let _ = slint::invoke_from_event_loop(move || {
                         let Some(app) = weak.upgrade() else { return };
-                        app.set_status("".into());
-                        if rows.is_empty() {
-                            app.set_status("No episodes".into());
-                            return;
+                        app.set_status(if rows.is_empty() { "No episodes".into() } else { "".into() });
+                        if !rows.is_empty() {
+                            with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, true, None));
                         }
-                        with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, true, None));
                     });
                 });
                 return;
@@ -721,15 +742,18 @@ fn main() {
                 "{}/Videos/{}/stream?static=true&mediaSourceId={}&api_key={}",
                 auth.server.trim_end_matches('/'), it.id, it.id, auth.token
             );
-            let start = it
-                .user_data
-                .as_ref()
-                .map(|u| u.playback_position_ticks as f64 / 1e7)
-                .unwrap_or(0.0);
+            let start = it.user_data.as_ref().map(|u| u.playback_position_ticks as f64 / 1e7).unwrap_or(0.0);
             let title = match (&it.series_name, it.parent_index_number, it.index_number) {
                 (Some(s), Some(se), Some(ep)) => format!("{s} - S{se}E{ep} - {}", it.name),
                 _ => it.name.clone(),
             };
+            // what the phone remote shows as "now playing"
+            let now = serde_json::json!({
+                "id": it.id, "name": it.name, "series": it.series_name, "season": it.parent_index_number,
+                "episode": it.index_number, "year": it.production_year, "runTicks": it.run_time_ticks.unwrap_or(0),
+                "imageId": poster_id(&it, false),
+            });
+            let _ = std::fs::write(NOW_FILE, now.to_string());
             match mpv_command(&url, start, &title).spawn() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
@@ -750,6 +774,7 @@ fn main() {
                             }
                             *player.borrow_mut() = None;
                             exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = std::fs::remove_file(NOW_FILE);
                             eprintln!("MPV_EXIT t={}ms", t0.elapsed().as_millis());
                             if let Some(a) = weak.upgrade() {
                                 a.window().request_redraw();
@@ -757,9 +782,89 @@ fn main() {
                         }
                     });
                 }
-                Err(e) => eprintln!("mpv spawn failed: {e}"),
+                Err(e) => {
+                    let _ = std::fs::remove_file(NOW_FILE);
+                    eprintln!("mpv spawn failed: {e}");
+                }
             }
+        })
+    };
+    {
+        let state = state.clone();
+        let open_item = open_item.clone();
+        app.on_activate(move |r, c| {
+            let it = {
+                let st = state.borrow();
+                let Some(it) = st.screens.last().and_then(|s| s.items.get(r as usize)).and_then(|v| v.get(c as usize)) else { return };
+                it.clone()
+            };
+            open_item(it, true);
         });
+    }
+
+    // ---- commands from the phone remote: /tmp/pifin-app.sock, one line each ----------
+    {
+        let _ = std::fs::remove_file(APP_SOCK);
+        match std::os::unix::net::UnixListener::bind(APP_SOCK) {
+            Ok(listener) => {
+                let weak = app.as_weak();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for conn in listener.incoming().flatten() {
+                        let mut line = String::new();
+                        let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                        if std::io::BufReader::new(conn).read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let mut parts = line.trim().splitn(2, ' ');
+                        let (cmd, arg) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
+                        // items are fetched here, off the UI thread
+                        let item = if matches!(cmd.as_str(), "play" | "open") { client.item(&arg).ok() } else { None };
+                        let weak = weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(app) = weak.upgrade() else { return };
+                            REMOTE.with(|r| {
+                                if let Some(f) = r.borrow().as_ref() {
+                                    f(&app, &cmd, item);
+                                }
+                            });
+                        });
+                    }
+                });
+            }
+            Err(e) => eprintln!("command socket {APP_SOCK}: {e}"),
+        }
+        let state = state.clone();
+        let open_item = open_item.clone();
+        REMOTE.with(|r| {
+            *r.borrow_mut() = Some(Box::new(move |app: &App, cmd: &str, item: Option<Item>| match cmd {
+                "seen" => app.set_remote_show(false),
+                "home" => {
+                    let mut st = state.borrow_mut();
+                    if st.screens.len() > 1 {
+                        st.screens.truncate(1);
+                        show_top(app, &mut st);
+                    }
+                }
+                "play" | "open" => {
+                    if let Some(it) = item {
+                        open_item(it, cmd == "play");
+                    }
+                }
+                _ => eprintln!("unknown remote command {cmd}"),
+            }));
+        });
+    }
+
+    // ---- boot hint: QR code for the phone remote until a key press or a phone connects
+    if let Some(ip) = local_ip() {
+        let url = format!("http://{ip}:8080");
+        if let Some(img) = qr_image(&url) {
+            app.set_remote_qr(img);
+            app.set_remote_url(url.into());
+            app.set_remote_show(true);
+        }
     }
 
     // ---- Back: pop a screen; at home it does nothing (unless PIFIN_EXIT for probes)
@@ -768,6 +873,10 @@ fn main() {
         let state = state.clone();
         app.on_back(move || {
             let Some(app) = weak.upgrade() else { return };
+            if app.get_remote_show() {
+                app.set_remote_show(false);
+                return;
+            }
             let mut st = state.borrow_mut();
             if st.screens.len() > 1 {
                 st.screens.pop();
