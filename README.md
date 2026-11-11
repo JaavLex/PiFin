@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="340" alt="PiFin"></p>
+
 # PiFin
 
 A lightweight Jellyfin hub for Raspberry Pis: flash a card, run one script, and the Pi boots
@@ -20,8 +22,8 @@ the remote.
   from the Pi 4's decoders; progress, resume position and watched state go back to Jellyfin.
 - **Playback overlay** — a light mpv overlay with title, clock, progress bar, end time and
   audio/subtitle menus on the TV remote's arrows (it costs nothing while hidden).
-- **Phone remote** — a web app on port 8080 with no install and no account: d-pad, now
-  playing, pause/seek/volume, audio/subtitle pickers, and search with posters (play or open on
+- **Phone remote** — a one-screen web app on port 8080 with no install and no account: d-pad,
+  now playing, ±10/30 s skips, pause/seek/volume, audio/subtitle pickers, and search with posters (play or open on
   the TV). The TV shows a QR code for it at boot.
 - **TV remote** — HDMI-CEC buttons become keys, so a plain TV remote drives the whole UI.
 - **Wi-Fi setup hotspot** — with no known network the Pi opens a hotspot and shows a QR code

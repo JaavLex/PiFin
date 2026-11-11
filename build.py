@@ -33,6 +33,7 @@ INSTALL = [
     ("pifin-comitup-callback", "/usr/local/bin/pifin-comitup-callback", "0755"),
     ("pifin-remote/server.py", "/opt/pifin-remote/server.py", "0755"),
     ("pifin-remote/index.html", "/opt/pifin-remote/index.html", "0644"),
+    ("pifin-remote/icon.svg", "/opt/pifin-remote/icon.svg", "0644"),
     ("pifin-remote/mpvplayer.py", "/opt/pifin-remote/mpvplayer.py", "0644"),
     ("pifin-remote/mpv-input.conf", "/opt/pifin-remote/mpv-input.conf", "0644"),
     ("pifin-remote/pifin-osd.lua", "/opt/pifin-remote/pifin-osd.lua", "0644"),

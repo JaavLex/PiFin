@@ -26,6 +26,7 @@ from mpvplayer import Player
 PORT = 8080
 HERE = pathlib.Path(__file__).parent
 INDEX = (HERE / "index.html").read_bytes()
+ICON = (HERE / "icon.svg").read_bytes()
 AUTH = os.environ.get("PIFIN_AUTH", "/home/pifin/.config/pifin/auth.json")
 NOW = "/tmp/pifin-now.json"
 APP_SOCK = "/tmp/pifin-app.sock"
@@ -136,16 +137,12 @@ class Handler(BaseHTTPRequestHandler):
             self.seen()
             return self.reply(200, INDEX, "text/html; charset=utf-8")
         if path.path == "/manifest.webmanifest":
-            m = {"name": "PiFin Remote", "short_name": "Remote", "start_url": "/", "display": "standalone",
+            m = {"name": "PiFin Remote", "short_name": "PiFin", "start_url": "/", "display": "standalone",
                  "background_color": "#0b0b12", "theme_color": "#0b0b12",
                  "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]}
             return self.reply(200, json.dumps(m).encode(), "application/manifest+json", cache=True)
         if path.path == "/icon.svg":
-            svg = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1">'
-                   b'<stop offset="0" stop-color="#aa5cc3"/><stop offset="1" stop-color="#00a4dc"/></linearGradient></defs>'
-                   b'<rect width="64" height="64" rx="14" fill="#0b0b12"/><circle cx="32" cy="32" r="20" fill="none" stroke="url(#g)" stroke-width="6"/>'
-                   b'<circle cx="32" cy="32" r="7" fill="url(#g)"/></svg>')
-            return self.reply(200, svg, "image/svg+xml", cache=True)
+            return self.reply(200, ICON, "image/svg+xml", cache=True)
         if path.path == "/api/status":
             self.seen()
             try:

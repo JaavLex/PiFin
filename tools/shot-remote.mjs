@@ -14,6 +14,7 @@ const ROOT = path.join(HERE, "..");
 const REMOTE = path.join(ROOT, "files", "pifin-remote");
 const OUT = path.join(ROOT, "docs", "screenshots");
 const INDEX = fs.readFileSync(path.join(REMOTE, "index.html"));
+const ICON = fs.readFileSync(path.join(REMOTE, "icon.svg"));
 
 const SHOW = "The Last Lighthouse";   // invented show
 const EPISODE = "Fog and Glass";
@@ -42,7 +43,6 @@ const PLAYING = {
   },
 };
 
-const icon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0b0b12"/><circle cx="32" cy="32" r="20" fill="none" stroke="#aa5cc3" stroke-width="6"/></svg>`;
 let mode = "idle";
 
 const server = http.createServer((req, res) => {
@@ -61,7 +61,7 @@ const server = http.createServer((req, res) => {
     return send(JSON.stringify({ name: "PiFin Remote", short_name: "Remote", start_url: "/",
       display: "standalone", background_color: "#0b0b12", theme_color: "#0b0b12" }));
   }
-  if (url === "/icon.svg") return send(icon, "image/svg+xml");
+  if (url === "/icon.svg") return send(ICON, "image/svg+xml");
   send("{}", "application/json", 404);
 });
 
@@ -90,7 +90,6 @@ for (const shot of ["idle", "playing"]) {
   await page.waitForSelector("#dot.on");     // first /api/status came back
   if (shot === "playing") {
     await page.waitForSelector("#np.show");
-    await page.waitForSelector("#tracks.show");
     await page.waitForFunction(() => {
       const img = document.getElementById("art");
       return img && img.complete && img.naturalWidth > 0;
@@ -98,7 +97,7 @@ for (const shot of ["idle", "playing"]) {
   }
   await page.waitForTimeout(250);            // let the last paint settle
   const file = path.join(OUT, `remote-${shot}.png`);
-  await page.screenshot({ path: file, fullPage: true });
+  await page.screenshot({ path: file, fullPage: false });
   console.log("wrote", path.relative(ROOT, file));
   await ctx.close();
 }
