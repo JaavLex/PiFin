@@ -6,12 +6,9 @@
 # It publishes the state in /run/pifin/wifi.json; the PiFin app watches that
 # file and shows the Wi-Fi screens itself (QR code to join the setup hotspot,
 # "Connecting to <ssid>…", errors) and reloads once the network is back.
-# With the old Jellyfin Desktop kiosk running instead, the DevTools-based
-# setup screen is used as before.
 source /etc/pifin/secrets.env
 STATE=/run/pifin-wifi-state
 TRIED=/run/pifin-wifi-tried
-SCREEN=/usr/local/bin/pifin-setup-screen.py
 OUT=/run/pifin/wifi.json
 echo "$1" > "$STATE"
 
@@ -40,42 +37,22 @@ PY
   chgrp "${PIFIN_USER:-pifin}" "$OUT" 2>/dev/null
 }
 
-legacy() { systemctl is-active --quiet jellyfin-kiosk; }
-
 case "$1" in
   CONNECTING)
     (
       SSID=$(target_ssid)
       [ -n "$SSID" ] && printf '%s' "$SSID" > "$TRIED"
       publish CONNECTING "$SSID" ""
-      if legacy; then
-        sleep 8   # a normal connect takes ~5 s: don't flash the screen on the fast path
-        [ "$(cat $STATE 2>/dev/null)" = CONNECTING ] && "$SCREEN" connecting "$SSID"
-      fi
     ) & ;;
   HOTSPOT)
     FAILED=""
     if [ -e "$TRIED" ]; then FAILED=$(cat "$TRIED"); rm -f "$TRIED"; fi
     (
       publish HOTSPOT "" "$FAILED"
-      if legacy; then
-        if [ -n "$FAILED" ]; then sleep 5; else sleep 45; fi
-        while [ "$(cat $STATE 2>/dev/null)" = HOTSPOT ]; do
-          "$SCREEN" hotspot "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" "$FAILED"
-          sleep 20
-        done
-      fi
     ) & ;;
   CONNECTED)
     rm -f "$TRIED"
     (
       publish CONNECTED "$(target_ssid)" ""
-      if legacy; then
-        sleep 2
-        if "$SCREEN" shown; then
-          sleep 5   # let Tailscale reconnect before Jellyfin reloads
-          systemctl restart jellyfin-kiosk
-        fi
-      fi
     ) & ;;
 esac

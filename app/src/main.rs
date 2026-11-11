@@ -47,9 +47,7 @@ fn mpv_command(url: &str, start_s: f64, title: &str) -> Command {
 }
 
 fn load_auth() -> Result<Auth, String> {
-    let path = std::env::var("PIFIN_AUTH").unwrap_or_else(|_| {
-        format!("{}/.config/pifin/auth.json", std::env::var("HOME").unwrap_or_default())
-    });
+    let path = auth_path();
     let s = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
     serde_json::from_str(&s).map_err(|e| format!("{path}: {e}"))
 }
@@ -480,15 +478,100 @@ fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Im
 }
 
 
+fn auth_path() -> String {
+    std::env::var("PIFIN_AUTH").unwrap_or_else(|_| {
+        format!("{}/.config/pifin/auth.json", std::env::var("HOME").unwrap_or_default())
+    })
+}
+
+/// JELLYFIN_URL from /etc/pifin/app.conf (world-readable, written by build.py).
+fn server_url() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/pifin/app.conf").ok()?;
+    text.lines().find_map(|l| {
+        let v = l.strip_prefix("JELLYFIN_URL=")?.trim().trim_matches(|c| c == '\'' || c == '"');
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// No saved login: show a Quick Connect code full screen, wait for approval,
+/// save the login (0600) and restart into the home screen.
+fn sign_in(app: &App) {
+    app.set_wifi_title("Sign in to Jellyfin".into());
+    app.set_wifi_has_qr(false);
+    app.set_wifi_show(true);
+    let Some(server) = server_url() else {
+        app.set_wifi_text("No server configured. Set JELLYFIN_URL in /etc/pifin/app.conf.".into());
+        return;
+    };
+    app.set_wifi_text(format!("Connecting to {server}…").into());
+    let device_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
+    let weak = app.as_weak();
+    std::thread::spawn(move || loop {
+        let set = |title: String, text: String, err: String| {
+            let w = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(a) = w.upgrade() {
+                    if !title.is_empty() { a.set_wifi_title(title.into()); }
+                    a.set_wifi_text(text.into());
+                    a.set_wifi_error(err.into());
+                }
+            });
+        };
+        let qc = match jellyfin::QuickConnect::start(&server, &device_id) {
+            Ok(q) => q,
+            Err(e) => {
+                set(String::new(), format!("Server: {server}"), format!("{e}. Retrying…"));
+                std::thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        };
+        eprintln!("QUICKCONNECT_CODE={}", qc.code);
+        set(
+            format!("Sign in code:  {}", qc.code),
+            format!("On a phone or computer signed in to Jellyfin, open Settings → Quick Connect and enter the code above.\n\nServer: {server}"),
+            String::new(),
+        );
+        // codes expire after a few minutes: ask for a new one then
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_secs(3));
+            match qc.poll() {
+                Ok(Some(auth)) => {
+                    let path = auth_path();
+                    if let Some(dir) = std::path::Path::new(&path).parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let saved = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, serde_json::to_string(&auth).unwrap_or_default().as_bytes()));
+                    if let Err(e) = saved {
+                        set(String::new(), String::new(), format!("Can't save the login: {e}"));
+                        return;
+                    }
+                    eprintln!("signed in; restarting");
+                    use std::os::unix::process::CommandExt;
+                    let err = Command::new(std::env::current_exe().unwrap_or_default()).exec();
+                    eprintln!("restart failed: {err}");
+                    std::process::exit(1);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--version") {
+        println!("pifin {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let t0 = Instant::now();
     let app = App::new().expect("create window");
     let auth = match load_auth() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("auth: {e}");
-            app.set_heading("Not signed in".into());
-            app.set_info(e.into());
+            eprintln!("auth: {e}; starting Quick Connect sign-in");
+            sign_in(&app);
             app.run().ok();
             return;
         }

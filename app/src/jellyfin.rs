@@ -13,6 +13,17 @@ pub struct Auth {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
+pub struct Person {
+    pub id: String,
+    pub name: String,
+    pub role: Option<String>,
+    #[serde(rename = "Type")]
+    pub kind: String,
+    pub primary_image_tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct UserData {
     pub playback_position_ticks: i64,
     pub played: bool,
@@ -37,6 +48,10 @@ pub struct Item {
     pub image_tags: std::collections::HashMap<String, String>,
     pub backdrop_image_tags: Vec<String>,
     pub user_data: Option<UserData>,
+    pub people: Vec<Person>,
+    pub genres: Vec<String>,
+    pub community_rating: Option<f64>,
+    pub official_rating: Option<String>,
 }
 
 impl Item {
@@ -202,5 +217,81 @@ impl Client {
         let (s, l) = (start.to_string(), limit.to_string());
         let r: Items = self.get(&p, &[("ParentId", parent_id), ("Recursive", "true"), ("IncludeItemTypes", "Movie,Series"), ("SortBy", "SortName"), ("StartIndex", &s), ("Limit", &l), ("Fields", CARD_FIELDS)])?;
         Ok((r.items, r.total_record_count))
+    }
+}
+
+
+/// Jellyfin Quick Connect: the TV shows a code, the user approves it from any
+/// signed-in Jellyfin app (Settings → Quick Connect). No password typing on a TV.
+pub struct QuickConnect {
+    agent: ureq::Agent,
+    server: String,
+    device_id: String,
+    pub code: String,
+    secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QcState {
+    secret: String,
+    code: String,
+    #[serde(default)]
+    authenticated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AuthResult {
+    access_token: String,
+    user: AuthUser,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AuthUser {
+    id: String,
+}
+
+impl QuickConnect {
+    fn header(device_id: &str) -> String {
+        format!(
+            "MediaBrowser Client=\"PiFin\", Device=\"Raspberry Pi\", DeviceId=\"{device_id}\", Version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    pub fn start(server: &str, device_id: &str) -> Result<Self, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+        let server = server.trim_end_matches('/').to_string();
+        let mut r = agent
+            .post(&format!("{server}/QuickConnect/Initiate"))
+            .header("Authorization", &Self::header(device_id))
+            .send_empty()
+            .map_err(|e| format!("Quick Connect: {e} (is it enabled on the server?)"))?;
+        let st: QcState = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
+        Ok(QuickConnect { agent, server, device_id: device_id.into(), code: st.code, secret: st.secret })
+    }
+
+    /// Ok(Some(auth)) once approved, Ok(None) while waiting.
+    pub fn poll(&self) -> Result<Option<Auth>, String> {
+        let mut r = self
+            .agent
+            .get(&format!("{}/QuickConnect/Connect", self.server))
+            .query("Secret", &self.secret)
+            .call()
+            .map_err(|e| format!("Quick Connect: {e}"))?;
+        let st: QcState = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
+        if !st.authenticated {
+            return Ok(None);
+        }
+        let mut r = self
+            .agent
+            .post(&format!("{}/Users/AuthenticateWithQuickConnect", self.server))
+            .header("Authorization", &Self::header(&self.device_id))
+            .send_json(serde_json::json!({ "Secret": self.secret }))
+            .map_err(|e| format!("Quick Connect: {e}"))?;
+        let a: AuthResult = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
+        Ok(Some(Auth { server: self.server.clone(), user_id: a.user.id, token: a.access_token, device_id: self.device_id.clone() }))
     }
 }

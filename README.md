@@ -1,7 +1,8 @@
 # PiFin
 
 A lightweight Jellyfin hub for Raspberry Pis: flash a card, run one script, and the Pi boots
-into Jellyfin on your TV — with hardware-decoded playback and your phone as the remote.
+into a fast native Jellyfin browser on your TV, with hardware-decoded playback and your phone as
+the remote.
 
 <p align="center">
   <img src="docs/screenshots/remote-playing.png" width="250" alt="Phone remote, now playing">
@@ -11,19 +12,21 @@ into Jellyfin on your TV — with hardware-decoded playback and your phone as th
 
 ## What you get
 
-- **Boots to the Jellyfin TV UI** on a kiosk compositor (cage + Xwayland), fitted to whatever
-  screen is plugged in, at a render height you control.
-- **Hardware-decoded playback** — Jellyfin's software player is handed over to mpv, so HEVC,
-  10-bit, AV1 and 4K play from the Pi 4's decoders; progress and resume position are reported
-  back to Jellyfin.
+- **A native TV app** (Rust + Slint under cage, `app/`): home rows (Continue Watching, Next Up,
+  Latest), series pages, posters and backdrops. About 0.7 s from start to home, ~110 MB of
+  memory, and frames well under 16 ms at 1080p60. Sign in once with Jellyfin **Quick Connect**:
+  the TV shows a code, you approve it from any signed-in Jellyfin app.
+- **Hardware-decoded playback** — Play hands the file to mpv, so HEVC, 10-bit and H.264 play
+  from the Pi 4's decoders; progress, resume position and watched state go back to Jellyfin.
 - **Playback overlay** — a light mpv overlay with title, clock, progress bar, end time and
   audio/subtitle menus on the TV remote's arrows (it costs nothing while hidden).
-- **Phone remote** — a web app on port 8080 with no install and no account: d-pad, playback,
-  volume, search with posters, audio/subtitle pickers, and typing to the TV.
+- **Phone remote** — a web app on port 8080 with no install and no account: d-pad, now
+  playing, pause/seek/volume, audio/subtitle pickers, and search with posters (play or open on
+  the TV). The TV shows a QR code for it at boot.
 - **TV remote** — HDMI-CEC buttons become keys, so a plain TV remote drives the whole UI.
 - **Wi-Fi setup hotspot** — with no known network the Pi opens a hotspot and shows a QR code
   on the TV; pick your network on the phone and it carries on by itself. The TV says what the Pi
-  is doing ("Connecting to …", then back to Jellyfin), and Wi-Fi power save is turned off
+  is doing ("Connecting to …", then back to the app), and Wi-Fi power save is turned off
   because the Pi 4's radio (brcmfmac) drops and scans slowly with it on.
 - **Optional Tailscale** — one auth key and the Pi joins your tailnet; leave it empty and it
   is not even installed.
@@ -49,8 +52,9 @@ into Jellyfin on your TV — with hardware-decoded playback and your phone as th
    ./build.py /run/media/you/bootfs
    ```
 
-First boot does the installs (Jellyfin Desktop from Flathub, mpv, comitup, optional
-Tailscale), so give it 10-20 minutes on a wired or good Wi-Fi link. It resumes after a power
+First boot does the installs (the PiFin app from the latest GitHub release, mpv, comitup,
+optional Tailscale), so give it 10-15 minutes on a wired or good Wi-Fi link. Then sign in with
+the Quick Connect code shown on the TV. It resumes after a power
 cut, and it deletes its own setup files and one-time keys when it is done.
 
 ## Configuration
@@ -81,8 +85,10 @@ one-time Tailscale key and the Wi-Fi password are wiped from the card after setu
 
 `build.py` is the whole installer: it writes cloud-init `user-data` + `network-config` and a
 `config.txt` block. `files/` is what gets installed — `pifin-setup.sh` (first boot, one shot
-per step, idempotent), the kiosk/CEC/remote systemd units, and `pifin-remote/` (one Python
-file, one HTML file). `tools/` are development helpers and never run on the Pi.
+per step, idempotent), the app/CEC/remote systemd units, and `pifin-remote/` (the phone
+remote server, its page, and the mpv overlay script). `app/` is the TV app (build it on a Pi
+with `cargo build --release`; releases ship a prebuilt aarch64 binary). `tools/` are
+development helpers and never run on the Pi.
 
 `pifin-setup.sh` also rewrites comitup's hard-coded `FAIL_TIMEOUT` to 60 s in
 `/usr/share/comitup/comitup/states.py`, so a lost network is retried about a minute after a
@@ -119,9 +125,8 @@ Wi-Fi complaints should come with `journalctl -u comitup -u NetworkManager`.
 
 ## Roadmap
 
-A native **Rust UI** (Slint, own mpv overlay) is planned: it replaces Jellyfin Desktop +
-cage + Xwayland, cuts startup time and memory, and keeps the phone remote and CEC bridge.
-The Python services are meant to stay small either way.
+Search on the TV with an on-screen keyboard, movie pages with cast, track choice before Play,
+and a Pi 5 test.
 
 ## License
 

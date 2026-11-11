@@ -59,8 +59,9 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 18)  # 14 installed + secrets.env + display.conf
+eq("file count", len(wf), 16)  # 13 installed + secrets.env + display.conf + app.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
+eq("app.conf", wf["/etc/pifin/app.conf"]["content"], "JELLYFIN_URL=http://jellyfin.example:8096\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")
 dev = wf["/etc/pifin/secrets.env"]["content"]
 env = {}
@@ -77,8 +78,8 @@ for f in u["write_files"]:
     if "@@" in f["content"]:
         bad += 1
         print(f"  FAIL unsubstituted token in {f['path']}")
-kiosk = wf["/etc/systemd/system/jellyfin-kiosk.service"]["content"]
-eq("kiosk runs as the configured user", "User=testuser\n" in kiosk, True)
+kiosk = wf["/etc/systemd/system/pifin-app.service"]["content"]
+eq("app runs as the configured user", "User=testuser\n" in kiosk, True)
 wlan = n["network"]["wifis"]["wlan0"]
 eq("regulatory domain", wlan["regulatory-domain"], "DE")
 eq("home wifi", wlan["access-points"], {"Example-Cafe": {"password": "psk with space"}})
@@ -128,7 +129,7 @@ eq("eth0 still there", n["network"]["ethernets"]["eth0"]["dhcp4"], True)
 env = {l.partition("=")[0]: l for l in wf["/etc/pifin/secrets.env"]["content"].splitlines()}
 eq("no tailscale line at all", "TS_AUTHKEY=" in "".join(env.values()), False)
 eq("hotspot ssid default", shlex.split(env["HOTSPOT_SSID"].partition("=")[2])[0], "PiFin-setup")
-eq("display.conf default", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=720\n")
+eq("display.conf default", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 sys.exit(1 if bad else 0)
 PY
 if D="$D" python3 "$D/check_b.py"; then ok "defaults, no wifi/tailscale/ssh"; else bad "defaults, no wifi/tailscale/ssh"; fi
@@ -144,7 +145,7 @@ import yaml,sys
 u=yaml.safe_load(open('$D/oldcard/user-data'))
 wf={f['path']:f for f in u['write_files']}
 d=wf['/etc/pifin/secrets.env']['content']
-sys.exit(0 if u['hostname']=='pifin' and 'tskey-old-abc' in d and 'MAX_HEIGHT=720' in wf['/etc/pifin/display.conf']['content'] else 1)"
+sys.exit(0 if u['hostname']=='pifin' and 'tskey-old-abc' in d and 'MAX_HEIGHT=1080' in wf['/etc/pifin/display.conf']['content'] else 1)"
   then ok "legacy secrets.env + defaults"; else bad "legacy secrets.env result wrong"; fi
 else bad "build.py failed with only a secrets.env"; fi
 

@@ -34,7 +34,7 @@ wlr-randr --output HDMI-A-1 --mode $MODE >/dev/null 2>&1 || wlr-randr --output H
 sleep 1
 ( sleep 7; grim $D/$LABEL.png; sleep 20; grim $D/$LABEL-moved.png ) &
 [ -n "$VIDEO" ] && ( sleep 50; grim $D/$LABEL-mpv.png; sleep 25; grim $D/$LABEL-after.png ) &
-SLINT_SCALE_FACTOR=1.5 PIFIN_FRAMELOG=1 PIFIN_EXIT=1 PIFIN_PROBE_VIDEO="$VIDEO" exec $BIN
+${PROBE_ENV:-} SLINT_SCALE_FACTOR=1.5 PIFIN_FRAMELOG=1 PIFIN_EXIT=1 PIFIN_PROBE_VIDEO="$VIDEO" exec $BIN
 EOF
 chmod +x $D/session.sh; chown pifin:pifin $D/session.sh
 

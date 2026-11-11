@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write PiFin first-boot setup to a freshly flashed Raspberry Pi OS Lite (64-bit) card.
 
-Target: Raspberry Pi 4 (Jellyfin Desktop needs its GPU and RAM; a Pi 3 is too weak).
+Target: Raspberry Pi 4 (2 GB+). The first boot installs the PiFin app, mpv and comitup.
 
 Usage:
   build.py <bootfs-mountpoint>   write the first-boot setup onto the card
@@ -28,12 +28,9 @@ FILES = HERE / "files"
 INSTALL = [
     ("pifin-setup.sh", "/usr/local/sbin/pifin-setup.sh", "0755"),
     ("pifin-setup.service", "/etc/systemd/system/pifin-setup.service", "0644"),
-    ("jellyfin-kiosk.service", "/etc/systemd/system/jellyfin-kiosk.service", "0644"),
-    ("pifin-jellyfin-session", "/usr/local/bin/pifin-jellyfin-session", "0755"),
     ("pifin-cec-remote.py", "/usr/local/bin/pifin-cec-remote.py", "0755"),
     ("pifin-cec-remote.service", "/etc/systemd/system/pifin-cec-remote.service", "0644"),
     ("pifin-comitup-callback", "/usr/local/bin/pifin-comitup-callback", "0755"),
-    ("pifin-setup-screen.py", "/usr/local/bin/pifin-setup-screen.py", "0755"),
     ("pifin-remote/server.py", "/opt/pifin-remote/server.py", "0755"),
     ("pifin-remote/index.html", "/opt/pifin-remote/index.html", "0644"),
     ("pifin-remote/mpvplayer.py", "/opt/pifin-remote/mpvplayer.py", "0644"),
@@ -47,7 +44,7 @@ INSTALL = [
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",
                "HOTSPOT_PASS", "JELLYFIN_URL", "WIFI_SSID", "WIFI_PSK", "TS_AUTHKEY"]
 DEFAULTS = {"PIFIN_HOSTNAME": "pifin", "PIFIN_USER": "pifin", "HOTSPOT_SSID": "PiFin-setup",
-            "TIMEZONE": "Etc/UTC", "LOCALE": "en_US.UTF-8", "MAX_HEIGHT": "720"}
+            "TIMEZONE": "Etc/UTC", "LOCALE": "en_US.UTF-8", "MAX_HEIGHT": "1080"}
 # host and user names end up in YAML, shell, systemd and Tailscale: keep them plain
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 HASH_PREFIXES = ("$6$", "$y$", "$2a$", "$2b$")
@@ -158,6 +155,9 @@ def main(args):
         # read by pifin-jellyfin-session as the kiosk user, so world readable and no secrets
         {"path": "/etc/pifin/display.conf", "permissions": "0644", "owner": "root:root",
          "content": f"MAX_HEIGHT={cfg['MAX_HEIGHT']}\n"},
+        # read by the app (as the kiosk user) to find the server for Quick Connect sign-in
+        {"path": "/etc/pifin/app.conf", "permissions": "0644", "owner": "root:root",
+         "content": f"JELLYFIN_URL={cfg['JELLYFIN_URL']}\n"},
     ]
     write_files += [{"path": dst, "permissions": mode,
                      "content": render((FILES / src).read_text(), cfg)}
