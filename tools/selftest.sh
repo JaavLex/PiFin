@@ -59,7 +59,7 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 16)  # 14 installed + secrets.env + display.conf
+eq("file count", len(wf), 18)  # 14 installed + secrets.env + display.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")
 dev = wf["/etc/pifin/secrets.env"]["content"]

@@ -95,10 +95,11 @@ fn decode(bytes: &[u8], slot: Slot, w: u32, h: u32) -> Option<SharedPixelBuffer<
     Some(SharedPixelBuffer::clone_from_slice(rgba.as_raw(), iw, ih))
 }
 
-/// What an image result is for.
+/// What an image result is for. Cards are addressed by screen id so results
+/// still land correctly after the user moved to another screen and back.
 #[derive(Clone, Copy)]
 enum Slot {
-    Card { row: usize, col: usize },
+    Card { screen: u64, row: usize, col: usize },
     Backdrop { gen: u64 },
 }
 
@@ -110,12 +111,23 @@ struct ImgJob {
     h: u32,
 }
 
-/// UI-thread state.
-struct State {
+/// One browsable screen: rows of items (home, or a series' seasons).
+struct Screen {
+    id: u64,
+    titles: Vec<String>,
     items: Vec<Vec<Item>>,
     cards: Vec<Rc<VecModel<Card>>>,
+    focus: Vec<i32>,
+    cur_row: i32,
+}
+
+/// UI-thread state.
+struct State {
+    screens: Vec<Screen>,
     rows: Rc<VecModel<Row>>,
+    next_id: u64,
     backdrop_gen: u64,
+    img_tx: mpsc::Sender<ImgJob>,
 }
 
 thread_local! {
@@ -130,26 +142,38 @@ fn with_state(f: impl FnOnce(&Rc<RefCell<State>>)) {
     })
 }
 
-fn card_of(it: &Item) -> Card {
+fn card_of(it: &Item, in_series: bool) -> Card {
     let progress = match (&it.user_data, it.run_time_ticks) {
         (Some(u), Some(run)) if run > 0 && u.playback_position_ticks > 0 => {
             (u.playback_position_ticks as f64 / run as f64).clamp(0.0, 1.0) as f32
         }
         _ => 0.0,
     };
+    let title = if in_series || (it.kind == "Episode" && it.series_name.is_none()) {
+        it.name.clone()
+    } else {
+        it.title().to_string()
+    };
     Card {
         id: it.id.clone().into(),
-        title: it.title().into(),
-        subtitle: it.subtitle().into(),
+        title: title.into(),
+        subtitle: if in_series {
+            let mut v = vec![];
+            if let Some(e) = it.index_number { v.push(format!("Episode {e}")); }
+            if let Some(t) = it.run_time_ticks.filter(|t| *t >= 600_000_000) { v.push(format!("{} min", t / 600_000_000)); }
+            v.join(" · ").into()
+        } else {
+            it.subtitle().into()
+        },
         image: Default::default(),
         has_image: false,
         progress,
     }
 }
 
-/// Poster for a card: the item's own, else the series poster (episodes).
-fn poster_id(it: &Item) -> String {
-    if it.kind != "Episode" && it.image_tags.contains_key("Primary") {
+/// Poster for a card: the item's own, else the series poster (episodes on home).
+fn poster_id(it: &Item, own: bool) -> String {
+    if (own || it.kind != "Episode") && it.image_tags.contains_key("Primary") {
         it.id.clone()
     } else {
         it.series_id.clone().unwrap_or_else(|| it.id.clone())
@@ -180,16 +204,180 @@ fn info_line(it: &Item) -> String {
     } else if let Some(y) = it.production_year {
         parts.push(y.to_string());
     }
-    if let Some(t) = it.run_time_ticks {
+    if let Some(t) = it.run_time_ticks.filter(|t| *t >= 600_000_000) {
         let m = t / 600_000_000;
         parts.push(if m >= 60 { format!("{}h {:02}m", m / 60, m % 60) } else { format!("{m} min") });
     }
     if let Some(u) = &it.user_data {
         if u.playback_position_ticks > 0 {
             parts.push(format!("resume at {}", fmt_ticks(u.playback_position_ticks)));
+        } else if u.played {
+            parts.push("watched".into());
         }
     }
     parts.join("  ·  ")
+}
+
+/// Rows for the home screen.
+fn fetch_home(client: &Client) -> Vec<(String, Vec<Item>)> {
+    let mut rows = vec![];
+    let mut push = |title: String, r: Result<Vec<Item>, String>| match r {
+        Ok(v) if !v.is_empty() => rows.push((title, v)),
+        Ok(_) => {}
+        Err(e) => eprintln!("{e}"),
+    };
+    push("Continue Watching".into(), client.resume());
+    push("Next Up".into(), client.next_up());
+    if let Ok(views) = client.views() {
+        for v in views.iter().filter(|v| matches!(v.collection_type.as_deref(), Some("movies" | "tvshows"))) {
+            push(format!("Latest {}", v.name), client.latest(&v.id));
+        }
+    }
+    rows
+}
+
+/// Rows for a series: one per season, episodes in order.
+fn fetch_series(client: &Client, series_id: &str) -> Vec<(String, Vec<Item>)> {
+    let mut rows = vec![];
+    match client.seasons(series_id) {
+        Ok(seasons) => {
+            for s in seasons {
+                match client.episodes(series_id, &s.id) {
+                    Ok(eps) if !eps.is_empty() => rows.push((s.name.clone(), eps)),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{e}"),
+                }
+            }
+        }
+        Err(e) => eprintln!("{e}"),
+    }
+    rows
+}
+
+/// Push (or, with `replace`, swap in place) a screen built from rows, queue its images.
+fn install_screen(app: &App, st: &mut State, rows: Vec<(String, Vec<Item>)>, own_images: bool, replace: Option<usize>) {
+    let id = st.next_id;
+    st.next_id += 1;
+    let mut screen = Screen { id, titles: vec![], items: vec![], cards: vec![], focus: vec![], cur_row: 0, };
+    for (title, items) in rows {
+        screen.cards.push(Rc::new(VecModel::from(items.iter().map(|i| card_of(i, own_images)).collect::<Vec<_>>())));
+        screen.titles.push(title);
+        screen.focus.push(0);
+        screen.items.push(items);
+    }
+    // images: first 8 of every row first (what is on screen), then the rest
+    for pass in 0..2 {
+        for (ri, items) in screen.items.iter().enumerate() {
+            for (ci, it) in items.iter().enumerate() {
+                if (pass == 0) == (ci < 8) {
+                    let _ = st.img_tx.send(ImgJob {
+                        slot: Slot::Card { screen: id, row: ri, col: ci },
+                        item_id: poster_id(it, own_images),
+                        kind: "Primary",
+                        w: CARD_W,
+                        h: CARD_H,
+                    });
+                }
+            }
+        }
+    }
+    match replace {
+        Some(i) if i < st.screens.len() => {
+            // keep the user's place when refreshing
+            let old = &st.screens[i];
+            screen.cur_row = old.cur_row.min(screen.items.len() as i32 - 1).max(0);
+            for (r, f) in screen.focus.iter_mut().enumerate() {
+                if let Some(of) = old.focus.get(r) {
+                    *f = (*of).min(screen.items[r].len() as i32 - 1).max(0);
+                }
+            }
+            st.screens[i] = screen;
+            if i == st.screens.len() - 1 {
+                show_top(app, st);
+            }
+        }
+        _ => {
+            st.screens.push(screen);
+            show_top(app, st);
+        }
+    }
+}
+
+/// Point the UI's rows at the top screen and restore its focus.
+fn show_top(app: &App, st: &mut State) {
+    let Some(sc) = st.screens.last() else { return };
+    let rows: Vec<Row> = sc
+        .titles
+        .iter()
+        .zip(&sc.cards)
+        .zip(&sc.focus)
+        .map(|((t, c), f)| Row { title: t.clone().into(), cards: ModelRc::from(c.clone()), focus: *f })
+        .collect();
+    st.rows.set_vec(rows);
+    let (r, c) = (sc.cur_row, sc.focus.get(sc.cur_row as usize).copied().unwrap_or(0));
+    app.set_cur_row(r);
+    let app_weak = app.as_weak();
+    // run the focus update after this borrow ends
+    slint::Timer::single_shot(Duration::from_millis(0), move || {
+        if let Some(a) = app_weak.upgrade() {
+            a.invoke_moved(r, c);
+        }
+    });
+}
+
+/// Talk to the running mpv over its JSON IPC socket (blocking; used off the UI thread).
+fn mpv_get(prop: &str) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect("/tmp/pifin-mpv.sock").ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    s.write_all(format!("{{\"command\":[\"get_property\",\"{prop}\"]}}\n").as_bytes()).ok()?;
+    let mut lines = BufReader::new(s).lines();
+    while let Some(Ok(line)) = lines.next() {
+        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if v.get("event").is_none() {
+            return v.get("data").cloned();
+        }
+    }
+    None
+}
+
+/// Background reporter for one playback: Start, Progress every 10 s, then Stopped +
+/// resume position once mpv is gone. Then asks the UI to refresh the home screen.
+fn spawn_reporter(client: Arc<Client>, item: Item, exited: Arc<std::sync::atomic::AtomicBool>, weak: slint::Weak<App>) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let start = item.user_data.as_ref().map(|u| u.playback_position_ticks).unwrap_or(0);
+        let run = item.run_time_ticks.unwrap_or(0);
+        let mut pos = start;
+        let _ = client.report("start", &item.id, pos, false);
+        let mut last = Instant::now();
+        while !exited.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+            if let Some(p) = mpv_get("time-pos").and_then(|v| v.as_f64()) {
+                pos = (p * 1e7) as i64;
+            }
+            if last.elapsed() >= Duration::from_secs(10) {
+                last = Instant::now();
+                let paused = mpv_get("pause").and_then(|v| v.as_bool()).unwrap_or(false);
+                if let Err(e) = client.report("progress", &item.id, pos, paused) {
+                    eprintln!("{e}");
+                }
+            }
+        }
+        let _ = client.report("stop", &item.id, pos, false);
+        if let Err(e) = client.save_position(&item.id, pos, run) {
+            eprintln!("{e}");
+        }
+        eprintln!("SAVED id={} pos={}", item.id, fmt_ticks(pos));
+        let rows = fetch_home(&client);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = weak.upgrade() else { return };
+            with_state(|state| {
+                let mut st = state.borrow_mut();
+                install_screen(&app, &mut st, rows, false, Some(0));
+            });
+        });
+    });
 }
 
 fn main() {
@@ -206,12 +394,14 @@ fn main() {
         }
     };
     let client = Arc::new(Client::new(auth.clone()));
+    let (img_tx, img_rx) = mpsc::channel::<ImgJob>();
 
     let state = Rc::new(RefCell::new(State {
-        items: vec![],
-        cards: vec![],
+        screens: vec![],
         rows: Rc::new(VecModel::default()),
+        next_id: 1,
         backdrop_gen: 0,
+        img_tx: img_tx.clone(),
     }));
     app.set_rows(ModelRc::from(state.borrow().rows.clone()));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -255,7 +445,6 @@ fn main() {
     }
 
     // ---- image workers -----------------------------------------------------
-    let (img_tx, img_rx) = mpsc::channel::<ImgJob>();
     let img_rx = Arc::new(Mutex::new(img_rx));
     for _ in 0..2 {
         let rx = img_rx.clone();
@@ -266,10 +455,7 @@ fn main() {
                 Ok(j) => j,
                 Err(_) => return,
             };
-            let bytes = match client.image(&job.item_id, job.kind, job.w) {
-                Ok(b) => b,
-                Err(_) => continue, // no image of that kind: the card keeps its title
-            };
+            let Ok(bytes) = client.image(&job.item_id, job.kind, job.w) else { continue };
             let Some(buf) = decode(&bytes, job.slot, job.w, job.h) else { continue };
             let slot = job.slot;
             let weak = weak.clone();
@@ -279,8 +465,9 @@ fn main() {
                 with_state(|state| {
                     let st = state.borrow();
                     match slot {
-                        Slot::Card { row, col } => {
-                            if let Some(m) = st.cards.get(row) {
+                        Slot::Card { screen, row, col } => {
+                            let Some(sc) = st.screens.iter().find(|s| s.id == screen) else { return };
+                            if let Some(m) = sc.cards.get(row) {
                                 if let Some(mut c) = m.row_data(col) {
                                     c.image = img;
                                     c.has_image = true;
@@ -300,56 +487,18 @@ fn main() {
         });
     }
 
-    // ---- home rows (API thread) ---------------------------------------------
+    // ---- home (API thread) -----------------------------------------------------
     {
         let client = client.clone();
         let weak = app.as_weak();
-        let img_tx = img_tx.clone();
         app.set_status("Loading…".into());
         std::thread::spawn(move || {
-            let mut rows: Vec<(String, Vec<Item>)> = vec![];
-            let mut push = |title: String, r: Result<Vec<Item>, String>| match r {
-                Ok(v) if !v.is_empty() => rows.push((title, v)),
-                Ok(_) => {}
-                Err(e) => eprintln!("{e}"),
-            };
-            push("Continue Watching".into(), client.resume());
-            push("Next Up".into(), client.next_up());
-            if let Ok(views) = client.views() {
-                for v in views.iter().filter(|v| matches!(v.collection_type.as_deref(), Some("movies" | "tvshows"))) {
-                    push(format!("Latest {}", v.name), client.latest(&v.id));
-                }
-            }
+            let rows = fetch_home(&client);
             eprintln!("HOME_DATA_MS={} rows={}", t0.elapsed().as_millis(), rows.len());
-            // posters: first 8 of every row first (what is on screen), then the rest
-            for pass in 0..2 {
-                for (ri, (_, items)) in rows.iter().enumerate() {
-                    for (ci, it) in items.iter().enumerate() {
-                        if (pass == 0) == (ci < 8) {
-                            let _ = img_tx.send(ImgJob {
-                                slot: Slot::Card { row: ri, col: ci },
-                                item_id: poster_id(it),
-                                kind: "Primary",
-                                w: CARD_W,
-                                h: CARD_H,
-                            });
-                        }
-                    }
-                }
-            }
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(app) = weak.upgrade() else { return };
-                with_state(|state| {
-                    let mut st = state.borrow_mut();
-                    for (title, items) in rows {
-                        let cards = Rc::new(VecModel::from(items.iter().map(card_of).collect::<Vec<_>>()));
-                        st.rows.push(Row { title: title.into(), cards: ModelRc::from(cards.clone()), focus: 0 });
-                        st.cards.push(cards);
-                        st.items.push(items);
-                    }
-                });
+                with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, false, None));
                 app.set_status("".into());
-                app.invoke_moved(0, 0);
                 eprintln!("HOME_SHOWN_MS={}", t0.elapsed().as_millis());
             });
         });
@@ -360,39 +509,42 @@ fn main() {
     {
         let weak = app.as_weak();
         let state = state.clone();
-        let img_tx = img_tx.clone();
         let backdrop_timer = backdrop_timer.clone();
         app.on_moved(move |r, c| {
             let Some(app) = weak.upgrade() else { return };
             let mut st = state.borrow_mut();
-            if st.items.is_empty() {
+            let st = &mut *st;
+            let Some(sc) = st.screens.last_mut() else { return };
+            if sc.items.is_empty() {
                 return;
             }
-            let r = r.clamp(0, st.items.len() as i32 - 1) as usize;
-            let mut row = st.rows.row_data(r).unwrap();
-            let col = if c < 0 { row.focus } else { c.clamp(0, st.items[r].len() as i32 - 1) } as usize;
-            if row.focus != col as i32 {
-                row.focus = col as i32;
-                st.rows.set_row_data(r, row);
+            let r = r.clamp(0, sc.items.len() as i32 - 1) as usize;
+            let col = if c < 0 { sc.focus[r] } else { c.clamp(0, sc.items[r].len() as i32 - 1) };
+            sc.focus[r] = col;
+            sc.cur_row = r as i32;
+            if let Some(mut row) = st.rows.row_data(r) {
+                if row.focus != col {
+                    row.focus = col;
+                    st.rows.set_row_data(r, row);
+                }
             }
             app.set_cur_row(r as i32);
-            let it = st.items[r][col].clone();
-            let it = &it;
+            let it = sc.items[r][col as usize].clone();
             app.set_heading(it.title().into());
-            app.set_info(info_line(it).into());
+            app.set_info(info_line(&it).into());
             app.set_overview(it.overview.clone().unwrap_or_default().into());
             // backdrop once the focus settles for 250 ms (no fetch storm while scrolling)
             st.backdrop_gen += 1;
             let gen = st.backdrop_gen;
-            let id = backdrop_id(it);
-            let tx = img_tx.clone();
+            let id = backdrop_id(&it);
+            let tx = st.img_tx.clone();
             backdrop_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(250), move || {
                 let _ = tx.send(ImgJob { slot: Slot::Backdrop { gen }, item_id: id.clone(), kind: "Backdrop", w: BACKDROP_W, h: 720 });
             });
         });
     }
 
-    // ---- play: hand off to mpv, poll for its exit at 2 Hz --------------------
+    // ---- OK: open a series, or hand playback off to mpv ----------------------------
     let player: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
     let poll = Rc::new(slint::Timer::default());
     {
@@ -401,23 +553,49 @@ fn main() {
         let player = player.clone();
         let poll = poll.clone();
         let auth = auth.clone();
+        let client = client.clone();
         app.on_activate(move |r, c| {
             if player.borrow().is_some() {
                 return;
             }
-            let st = state.borrow();
-            let Some(it) = st.items.get(r as usize).and_then(|v| v.get(c as usize)) else { return };
-            if !matches!(it.kind.as_str(), "Movie" | "Episode") {
+            let it = {
+                let st = state.borrow();
+                let Some(it) = st.screens.last().and_then(|s| s.items.get(r as usize)).and_then(|v| v.get(c as usize)) else { return };
+                it.clone()
+            };
+            if it.kind == "Series" || it.kind == "Season" {
+                let series_id = if it.kind == "Season" { it.series_id.clone().unwrap_or_default() } else { it.id.clone() };
+                let client = client.clone();
+                let weak = weak.clone();
                 if let Some(a) = weak.upgrade() {
-                    a.set_status("Series pages come next".into());
+                    a.set_status("Loading…".into());
                 }
+                std::thread::spawn(move || {
+                    let rows = fetch_series(&client, &series_id);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(app) = weak.upgrade() else { return };
+                        app.set_status("".into());
+                        if rows.is_empty() {
+                            app.set_status("No episodes".into());
+                            return;
+                        }
+                        with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, true, None));
+                    });
+                });
+                return;
+            }
+            if !matches!(it.kind.as_str(), "Movie" | "Episode") {
                 return;
             }
             let url = format!(
                 "{}/Videos/{}/stream?static=true&mediaSourceId={}&api_key={}",
                 auth.server.trim_end_matches('/'), it.id, it.id, auth.token
             );
-            let start = it.user_data.as_ref().map(|u| u.playback_position_ticks as f64 / 1e7).unwrap_or(0.0);
+            let start = it
+                .user_data
+                .as_ref()
+                .map(|u| u.playback_position_ticks as f64 / 1e7)
+                .unwrap_or(0.0);
             let title = match (&it.series_name, it.parent_index_number, it.index_number) {
                 (Some(s), Some(se), Some(ep)) => format!("{s} - S{se}E{ep} - {}", it.name),
                 _ => it.name.clone(),
@@ -426,6 +604,8 @@ fn main() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
                     *player.borrow_mut() = Some(child);
+                    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    spawn_reporter(client.clone(), it.clone(), exited.clone(), weak.clone());
                     let weak = weak.clone();
                     let player = player.clone();
                     let poll_w = Rc::downgrade(&poll);
@@ -439,6 +619,7 @@ fn main() {
                                 t.stop();
                             }
                             *player.borrow_mut() = None;
+                            exited.store(true, std::sync::atomic::Ordering::Relaxed);
                             eprintln!("MPV_EXIT t={}ms", t0.elapsed().as_millis());
                             if let Some(a) = weak.upgrade() {
                                 a.window().request_redraw();
@@ -450,10 +631,26 @@ fn main() {
             }
         });
     }
-    app.on_back(move || {
-        if std::env::var_os("PIFIN_EXIT").is_some() {
-            let _ = slint::quit_event_loop();
-        }
+
+    // ---- Back: pop a screen; at home it does nothing (unless PIFIN_EXIT for probes)
+    {
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_back(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let mut st = state.borrow_mut();
+            if st.screens.len() > 1 {
+                st.screens.pop();
+                show_top(&app, &mut st);
+            } else if std::env::var_os("PIFIN_EXIT").is_some() {
+                let _ = slint::quit_event_loop();
+            }
+        });
+    }
+
+    app.on_unknown_key(|t| {
+        let cps: Vec<String> = t.chars().map(|c| format!("U+{:04X}", c as u32)).collect();
+        eprintln!("UNKNOWN_KEY {}", cps.join(" "));
     });
 
     app.run().expect("event loop");

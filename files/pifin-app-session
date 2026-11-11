@@ -1,0 +1,33 @@
+#!/bin/sh
+# Runs inside cage: pick a display mode, then start the PiFin app.
+#
+# Mode: the screen's preferred mode capped at MAX_HEIGHT (default 1080, from
+# /etc/pifin/display.conf), at the refresh closest to 60 Hz. Many 4K TVs prefer
+# 4K@24Hz, which would make the UI choppy and cost the GPU 4x the pixels.
+# The UI is designed at 1280x720 logical px and scaled to the chosen height.
+
+log() { echo "pifin-app-session: $*" >&2; }
+
+MAX_HEIGHT=1080
+[ -r /etc/pifin/display.conf ] && . /etc/pifin/display.conf
+[ "$MAX_HEIGHT" -lt 720 ] 2>/dev/null && MAX_HEIGHT=720
+
+OUTPUTS=$(wlr-randr --json 2>/dev/null)
+OUT=$(echo "$OUTPUTS" | jq -r '[.[] | select(.enabled)][0].name // empty')
+H=720
+if [ -n "$OUT" ]; then
+  MODE=$(echo "$OUTPUTS" | jq -r --arg o "$OUT" --argjson mh "$MAX_HEIGHT" '
+    (.[] | select(.name == $o) | .modes) as $m
+    | [$m[] | select(.height <= $mh)]
+    | max_by(.height * 100000 + .width * 10 - ((.refresh - 60) | fabs))
+    | "\(.width)x\(.height)@\(.refresh)Hz"')
+  log "output $OUT: using $MODE"
+  wlr-randr --output "$OUT" --mode "$MODE" || log "mode switch failed"
+  sleep 1
+  H=$(wlr-randr --json | jq -r --arg o "$OUT" '.[] | select(.name == $o) | .modes[] | select(.current) | .height')
+fi
+SCALE=$(awk -v h="${H:-720}" 'BEGIN { printf "%.3f", h / 720 }')
+log "height ${H:-?}, scale $SCALE"
+
+export SLINT_SCALE_FACTOR="$SCALE"
+exec /usr/local/bin/pifin

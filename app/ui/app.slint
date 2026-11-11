@@ -104,6 +104,7 @@ export component App inherits Window {
     callback moved(int, int);      // row, column after a move
     callback activate(int, int);   // row, column
     callback back();
+    callback unknown-key(string);
 
     property <length> row-h: 330px;
     property <length> card-step: 166px;
@@ -183,6 +184,7 @@ export component App inherits Window {
             if (event.text == Key.UpArrow) { root.moved(root.cur-row - 1, -1); return accept; }
             if (event.text == Key.Return || event.text == " ") { root.activate(root.cur-row, root.rows[root.cur-row].focus); return accept; }
             if (event.text == Key.Escape || event.text == Key.Backspace) { root.back(); return accept; }
+            root.unknown-key(event.text);
             return reject;
         }
     }

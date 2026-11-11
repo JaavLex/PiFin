@@ -1,0 +1,23 @@
+[Unit]
+Description=PiFin app (native Jellyfin browser) on the TV
+After=network-online.target systemd-user-sessions.service tailscaled.service
+Wants=network-online.target
+Conflicts=getty@tty1.service jellyfin-kiosk.service
+
+[Service]
+User=@@PIFIN_USER@@
+Group=@@PIFIN_USER@@
+SupplementaryGroups=input video render audio tty
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty-force
+StandardOutput=journal
+StandardError=journal
+Environment=XDG_SESSION_TYPE=wayland
+ExecStart=/bin/sh -c "exec /usr/bin/cage -s -- /usr/local/bin/pifin-app-session >/tmp/pifin-app.log 2>&1"
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -99,6 +99,50 @@ impl Client {
             .map_err(|e| format!("GET {path}: bad JSON: {e}"))
     }
 
+    fn post(&self, path: &str, body: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{}{}", self.auth.server.trim_end_matches('/'), path);
+        self.agent
+            .post(&url)
+            .header("Authorization", &self.header())
+            .send_json(body)
+            .map(|_| ())
+            .map_err(|e| format!("POST {path}: {e}"))
+    }
+
+    /// Playback reporting (keeps Continue Watching and "now playing" right).
+    pub fn report(&self, kind: &str, item_id: &str, pos_ticks: i64, paused: bool) -> Result<(), String> {
+        let path = match kind {
+            "start" => "/Sessions/Playing",
+            "stop" => "/Sessions/Playing/Stopped",
+            _ => "/Sessions/Playing/Progress",
+        };
+        self.post(path, &serde_json::json!({
+            "ItemId": item_id, "MediaSourceId": item_id, "PositionTicks": pos_ticks,
+            "IsPaused": paused, "CanSeek": true, "PlayMethod": "DirectPlay",
+        }))
+    }
+
+    /// Store the resume position, or mark watched past 90 %.
+    pub fn save_position(&self, item_id: &str, pos_ticks: i64, run_ticks: i64) -> Result<(), String> {
+        let uid = &self.auth.user_id;
+        if run_ticks > 0 && pos_ticks > run_ticks * 9 / 10 {
+            self.post(&format!("/UserPlayedItems/{item_id}?userId={uid}"), &serde_json::json!({}))?;
+            self.post(&format!("/UserItems/{item_id}/UserData?userId={uid}"), &serde_json::json!({"PlaybackPositionTicks": 0}))
+        } else {
+            self.post(&format!("/UserItems/{item_id}/UserData?userId={uid}"), &serde_json::json!({"PlaybackPositionTicks": pos_ticks}))
+        }
+    }
+
+    pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>, String> {
+        let r: Items = self.get(&format!("/Shows/{series_id}/Seasons"), &[("UserId", &self.auth.user_id)])?;
+        Ok(r.items)
+    }
+
+    pub fn episodes(&self, series_id: &str, season_id: &str) -> Result<Vec<Item>, String> {
+        let r: Items = self.get(&format!("/Shows/{series_id}/Episodes"), &[("UserId", &self.auth.user_id), ("SeasonId", season_id), ("Fields", "Overview,PrimaryImageAspectRatio")])?;
+        Ok(r.items)
+    }
+
     pub fn image_url(&self, item_id: &str, kind: &str, max_w: u32) -> String {
         format!(
             "{}/Items/{item_id}/Images/{kind}?maxWidth={max_w}&quality=85",

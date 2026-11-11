@@ -37,7 +37,7 @@ INDEX = (HERE / "index.html").read_bytes()
 
 KEYS = {
     "up": e.KEY_UP, "down": e.KEY_DOWN, "left": e.KEY_LEFT, "right": e.KEY_RIGHT,
-    "ok": e.KEY_ENTER, "back": e.KEY_BACK, "backspace": e.KEY_BACKSPACE,
+    "ok": e.KEY_ENTER, "back": e.KEY_ESC, "backspace": e.KEY_BACKSPACE,
 }
 ui = UInput({e.EV_KEY: sorted(set(KEYS.values()))}, name="pifin-phone-remote")
 ui_lock = threading.Lock()

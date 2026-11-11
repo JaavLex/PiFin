@@ -40,6 +40,8 @@ INSTALL = [
     ("pifin-remote/mpv-input.conf", "/opt/pifin-remote/mpv-input.conf", "0644"),
     ("pifin-remote/pifin-osd.lua", "/opt/pifin-remote/pifin-osd.lua", "0644"),
     ("pifin-remote.service", "/etc/systemd/system/pifin-remote.service", "0644"),
+    ("pifin-app-session", "/usr/local/bin/pifin-app-session", "0755"),
+    ("pifin-app.service", "/etc/systemd/system/pifin-app.service", "0644"),
 ]
 # Config the Pi needs at run time -> /etc/pifin/secrets.env (0600, sourced by root only)
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",
