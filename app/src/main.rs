@@ -380,6 +380,89 @@ fn spawn_reporter(client: Arc<Client>, item: Item, exited: Arc<std::sync::atomic
     });
 }
 
+/// Wi-Fi state published by the comitup callback (/run/pifin/wifi.json).
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct WifiState {
+    state: String,
+    ap_ssid: String,
+    ap_pass: String,
+    ssid: String,
+    failed: String,
+    time: u64,
+}
+
+const WIFI_FILE: &str = "/run/pifin/wifi.json";
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Standard Wi-Fi QR payload; phones join the network when they scan it.
+fn wifi_qr(ssid: &str, pass: &str) -> Option<slint::Image> {
+    let esc = |v: &str| v.chars().flat_map(|c| match c {
+        '\\' | ';' | ',' | ':' | '"' => vec!['\\', c],
+        _ => vec![c],
+    }).collect::<String>();
+    let payload = format!("WIFI:T:WPA;S:{};P:{};;", esc(ssid), esc(pass));
+    let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
+    let n = code.width() as u32;
+    let colors = code.to_colors();
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(n, n);
+    for (px, c) in buf.make_mut_slice().iter_mut().zip(colors) {
+        let v = if c == qrcode::Color::Dark { 0 } else { 255 };
+        *px = Rgba8Pixel { r: v, g: v, b: v, a: 255 };
+    }
+    Some(slint::Image::from_rgba8(buf))
+}
+
+/// Decide what the TV shows for a Wi-Fi state. Grace periods avoid flashing a
+/// screen on the normal path (comitup passes through HOTSPOT at every boot and
+/// a good connection takes ~5 s).
+fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Image)>) -> bool {
+    let age = now_s().saturating_sub(w.time);
+    let showing = app.get_wifi_show();
+    match w.state.as_str() {
+        "HOTSPOT" if !w.failed.is_empty() || age >= 30 || showing => {
+            let key = format!("{}\n{}", w.ap_ssid, w.ap_pass);
+            if qr_cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                *qr_cache = wifi_qr(&w.ap_ssid, &w.ap_pass).map(|i| (key, i));
+            }
+            app.set_wifi_title("Connect PiFin to Wi-Fi".into());
+            app.set_wifi_text(format!(
+                "1.  Scan the code with your phone to join the network \"{}\" (password: {}).\n\n\
+                 2.  A page opens: pick your Wi-Fi and enter its password. If it doesn't open, go to http://10.41.0.1\n\n\
+                 3.  PiFin connects and comes back here by itself.",
+                w.ap_ssid, w.ap_pass
+            ).into());
+            app.set_wifi_error(if w.failed.is_empty() { "".into() } else {
+                format!("Couldn't connect to \"{}\". Check the password and try again.", w.failed).into()
+            });
+            if let Some((_, img)) = qr_cache {
+                app.set_wifi_qr(img.clone());
+                app.set_wifi_has_qr(true);
+            }
+            app.set_wifi_show(true);
+            false
+        }
+        "CONNECTING" if age >= 8 || showing => {
+            app.set_wifi_title(if w.ssid.is_empty() { "Connecting…".into() } else { format!("Connecting to \"{}\"…", w.ssid).into() });
+            app.set_wifi_text("This takes a few seconds. If the setup screen comes back, the password was probably wrong.".into());
+            app.set_wifi_error("".into());
+            app.set_wifi_has_qr(false);
+            app.set_wifi_show(true);
+            false
+        }
+        "CONNECTED" => {
+            let was = showing;
+            app.set_wifi_show(false);
+            was
+        }
+        _ => false,
+    }
+}
+
+
 fn main() {
     let t0 = Instant::now();
     let app = App::new().expect("create window");
@@ -487,20 +570,67 @@ fn main() {
         });
     }
 
-    // ---- home (API thread) -----------------------------------------------------
-    {
+    // ---- home (API thread): retries every 15 s while the server is unreachable ----
+    let load_home: Rc<dyn Fn()> = {
         let client = client.clone();
         let weak = app.as_weak();
-        app.set_status("Loading…".into());
-        std::thread::spawn(move || {
-            let rows = fetch_home(&client);
-            eprintln!("HOME_DATA_MS={} rows={}", t0.elapsed().as_millis(), rows.len());
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some(app) = weak.upgrade() else { return };
-                with_state(|state| install_screen(&app, &mut state.borrow_mut(), rows, false, None));
-                app.set_status("".into());
-                eprintln!("HOME_SHOWN_MS={}", t0.elapsed().as_millis());
+        let loading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Rc::new(move || {
+            if loading.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let client = client.clone();
+            let weak = weak.clone();
+            let loading = loading.clone();
+            if let Some(a) = weak.upgrade() {
+                a.set_status("Loading…".into());
+            }
+            let weak2 = weak.clone();
+            std::thread::spawn(move || {
+                let rows = loop {
+                    let rows = fetch_home(&client);
+                    if !rows.is_empty() {
+                        break rows;
+                    }
+                    let w = weak2.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(a) = w.upgrade() {
+                            a.set_status("Can't reach the server, retrying…".into());
+                        }
+                    });
+                    std::thread::sleep(Duration::from_secs(15));
+                };
+                eprintln!("HOME_DATA_MS={} rows={}", t0.elapsed().as_millis(), rows.len());
+                loading.store(false, std::sync::atomic::Ordering::SeqCst);
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = weak2.upgrade() else { return };
+                    with_state(|state| {
+                        let mut st = state.borrow_mut();
+                        let replace = if st.screens.is_empty() { None } else { Some(0) };
+                        install_screen(&app, &mut st, rows, false, replace);
+                    });
+                    app.set_status("".into());
+                    eprintln!("HOME_SHOWN_MS={}", t0.elapsed().as_millis());
+                });
             });
+        })
+    };
+    load_home();
+
+    // ---- Wi-Fi screen: watch the callback's state file once per second ----------
+    let wifi_timer = slint::Timer::default();
+    {
+        let weak = app.as_weak();
+        let load_home = load_home.clone();
+        let mut qr_cache: Option<(String, slint::Image)> = None;
+        wifi_timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
+            let Some(app) = weak.upgrade() else { return };
+            let Ok(text) = std::fs::read_to_string(WIFI_FILE) else { return };
+            let Ok(w) = serde_json::from_str::<WifiState>(&text) else { return };
+            if apply_wifi(&app, &w, &mut qr_cache) {
+                eprintln!("WIFI back: reloading home");
+                load_home();
+            }
         });
     }
 

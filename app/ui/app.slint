@@ -106,6 +106,14 @@ export component App inherits Window {
     callback back();
     callback unknown-key(string);
 
+    // Wi-Fi screen (shown over everything while the Pi has no network)
+    in property <bool> wifi-show: false;
+    in property <string> wifi-title;
+    in property <string> wifi-text;
+    in property <string> wifi-error;
+    in property <image> wifi-qr;
+    in property <bool> wifi-has-qr: false;
+
     property <length> row-h: 330px;
     property <length> card-step: 166px;
 
@@ -170,6 +178,44 @@ export component App inherits Window {
                 card: c;
                 focused: ri == root.cur-row && ci == r.focus;
                 visible: self.x > -self.width && self.x < root.width;
+            }
+        }
+    }
+
+    if root.wifi-show: Rectangle {
+        background: #0b0b12;
+        Text {
+            x: 96px; y: 120px;
+            text: root.wifi-title;
+            font-size: 40px; font-weight: 700;
+            color: #f2f2f7;
+        }
+        Text {
+            x: 96px; y: 190px;
+            width: root.wifi-has-qr ? 640px : parent.width - 192px;
+            text: root.wifi-text;
+            font-size: 22px;
+            color: #b4b4c8;
+            wrap: word-wrap;
+        }
+        Text {
+            x: 96px; y: parent.height - 140px;
+            width: 640px;
+            text: root.wifi-error;
+            font-size: 22px;
+            color: #ff9f9f;
+            wrap: word-wrap;
+        }
+        if root.wifi-has-qr: Rectangle {
+            x: parent.width - 96px - 380px; y: (parent.height - 380px) / 2;
+            width: 380px; height: 380px;
+            background: white;
+            border-radius: 16px;
+            Image {
+                x: 20px; y: 20px;
+                width: 340px; height: 340px;
+                source: root.wifi-qr;
+                image-rendering: pixelated;
             }
         }
     }

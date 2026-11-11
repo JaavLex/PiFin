@@ -1,53 +1,81 @@
 #!/bin/bash
 # Called by comitup with the new state: HOTSPOT | CONNECTING | CONNECTED
 # (comitup runs it only on entering a state, output to /dev/null, and waits for
-# it: everything that sleeps is backgrounded. gdbus and systemctl are read or
-# run by backgrounded subshells too, so they can never delay comitup either.)
-# HOTSPOT    -> after a grace period the TV shows the QR setup page (again, with
-#               an error line, when we get here because a connection attempt failed).
-# CONNECTING -> after 8 s of still trying, the TV shows "Connecting to <ssid>…".
-# CONNECTED  -> if the TV is showing a PiFin page, restart the kiosk to get back.
+# it: everything that sleeps is backgrounded, so it can never delay comitup.)
+#
+# It publishes the state in /run/pifin/wifi.json; the PiFin app watches that
+# file and shows the Wi-Fi screens itself (QR code to join the setup hotspot,
+# "Connecting to <ssid>…", errors) and reloads once the network is back.
+# With the old Jellyfin Desktop kiosk running instead, the DevTools-based
+# setup screen is used as before.
 source /etc/pifin/secrets.env
 STATE=/run/pifin-wifi-state
 TRIED=/run/pifin-wifi-tried
 SCREEN=/usr/local/bin/pifin-setup-screen.py
+OUT=/run/pifin/wifi.json
 echo "$1" > "$STATE"
 
 # the ssid comitup is aiming at, empty if comitup is not reachable
 target_ssid() {
-  gdbus call --system --dest com.github.davesteele.comitup \
+  timeout 5 gdbus call --system --dest com.github.davesteele.comitup \
     --object-path /com/github/davesteele/comitup \
     --method com.github.davesteele.comitup.state 2>/dev/null \
     | sed -n "s/^('[A-Z]*', '\(.*\)')$/\1/p"
 }
+
+# atomically write the state file for the app (readable by the app user only)
+publish() {  # state ssid failed
+  mkdir -p /run/pifin
+  chgrp "${PIFIN_USER:-pifin}" /run/pifin 2>/dev/null; chmod 0750 /run/pifin
+  python3 - "$1" "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" "$2" "$3" <<'PY'
+import json, os, sys, time
+state, ap, pw, ssid, failed = sys.argv[1:6]
+tmp = "/run/pifin/wifi.json.tmp"
+with open(tmp, "w") as f:
+    json.dump({"state": state, "ap_ssid": ap, "ap_pass": pw, "ssid": ssid,
+               "failed": failed, "time": int(time.time())}, f)
+os.chmod(tmp, 0o640)
+os.replace(tmp, "/run/pifin/wifi.json")
+PY
+  chgrp "${PIFIN_USER:-pifin}" "$OUT" 2>/dev/null
+}
+
+legacy() { systemctl is-active --quiet jellyfin-kiosk; }
 
 case "$1" in
   CONNECTING)
     (
       SSID=$(target_ssid)
       [ -n "$SSID" ] && printf '%s' "$SSID" > "$TRIED"
-      sleep 8   # a normal connect takes ~5 s: don't flash the screen on the fast path
-      [ "$(cat $STATE 2>/dev/null)" = CONNECTING ] && "$SCREEN" connecting "$SSID"
+      publish CONNECTING "$SSID" ""
+      if legacy; then
+        sleep 8   # a normal connect takes ~5 s: don't flash the screen on the fast path
+        [ "$(cat $STATE 2>/dev/null)" = CONNECTING ] && "$SCREEN" connecting "$SSID"
+      fi
     ) & ;;
   HOTSPOT)
     FAILED=""
     if [ -e "$TRIED" ]; then FAILED=$(cat "$TRIED"); rm -f "$TRIED"; fi
     (
-      # we just failed: bring the QR back quickly. At boot: wait, comitup usually
-      # joins a known network within a few seconds.
-      if [ -n "$FAILED" ]; then sleep 5; else sleep 45; fi
-      while [ "$(cat $STATE 2>/dev/null)" = HOTSPOT ]; do
-        "$SCREEN" hotspot "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" "$FAILED"
-        sleep 20
-      done
+      publish HOTSPOT "" "$FAILED"
+      if legacy; then
+        if [ -n "$FAILED" ]; then sleep 5; else sleep 45; fi
+        while [ "$(cat $STATE 2>/dev/null)" = HOTSPOT ]; do
+          "$SCREEN" hotspot "${HOTSPOT_SSID:-PiFin-setup}" "$HOTSPOT_PASS" "$FAILED"
+          sleep 20
+        done
+      fi
     ) & ;;
   CONNECTED)
     rm -f "$TRIED"
     (
-      sleep 2   # let the state file settle before asking the TV what it shows
-      if "$SCREEN" shown; then
-        sleep 5   # let Tailscale reconnect before Jellyfin reloads
-        systemctl restart jellyfin-kiosk
+      publish CONNECTED "$(target_ssid)" ""
+      if legacy; then
+        sleep 2
+        if "$SCREEN" shown; then
+          sleep 5   # let Tailscale reconnect before Jellyfin reloads
+          systemctl restart jellyfin-kiosk
+        fi
       fi
     ) & ;;
 esac
