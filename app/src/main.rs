@@ -618,6 +618,11 @@ fn main() {
     }
     let t0 = Instant::now();
     let app = App::new().expect("create window");
+    // logo, embedded in the binary
+    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
+        let rgba = img.to_rgba8();
+        app.set_logo(slint::Image::from_rgba8(SharedPixelBuffer::clone_from_slice(rgba.as_raw(), rgba.width(), rgba.height())));
+    }
     let auth = match load_auth() {
         Ok(a) => a,
         Err(e) => {

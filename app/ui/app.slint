@@ -101,6 +101,7 @@ export component App inherits Window {
     in property <string> info: "";
     in property <string> overview: "";
     in property <string> status: "";
+    in property <image> logo;
     callback moved(int, int);      // row, column after a move
     callback activate(int, int);   // row, column
     callback back();
@@ -167,8 +168,14 @@ export component App inherits Window {
         wrap: word-wrap;
         overflow: elide;
     }
+    Image {
+        x: parent.width - self.width - 56px; y: 30px;
+        width: 150px; height: 44px;
+        source: root.logo;
+        visible: !root.search-mode;
+    }
     Text {
-        x: parent.width - self.width - 64px; y: 40px;
+        x: parent.width - self.width - 64px; y: 84px;
         text: root.status;
         color: #6e6e86;
         font-size: 15px;

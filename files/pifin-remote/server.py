@@ -112,6 +112,11 @@ def artwork(item_id):
 
 # ------------------------------------------------------------- HTTP API ----
 class Handler(BaseHTTPRequestHandler):
+    # keep-alive: the phone reuses one connection for every tap, so a weak Wi-Fi
+    # link doesn't pay a new TCP handshake per button press
+    protocol_version = "HTTP/1.1"
+    timeout = 30
+
     def log_message(self, *a):
         pass
 
