@@ -11,7 +11,7 @@ pub struct Auth {
     pub device_id: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaStream {
     pub index: i32,
@@ -25,7 +25,7 @@ pub struct MediaStream {
     pub title: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaSource {
     pub id: String,
@@ -33,7 +33,7 @@ pub struct MediaSource {
     pub media_streams: Vec<MediaStream>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Person {
     pub id: String,
@@ -44,7 +44,7 @@ pub struct Person {
     pub primary_image_tag: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UserData {
     pub playback_position_ticks: i64,
@@ -52,7 +52,7 @@ pub struct UserData {
     pub played_percentage: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Item {
     pub id: String,
@@ -112,8 +112,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(auth: Auth) -> Self {
+        // a cold server can take tens of seconds for one query (it answers in
+        // ~50 ms once warm): wait for it, but give up fast on an unreachable host
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
+            .timeout_connect(Some(Duration::from_secs(3)))
+            .timeout_global(Some(Duration::from_secs(60)))
             .build()
             .into();
         Client { agent, auth }
@@ -229,6 +232,24 @@ impl Client {
             .map_err(|e| format!("image {item_id}: {e}"))
     }
 
+    /// Name of the signed-in user and its avatar (None when it has none).
+    pub fn me(&self, avatar_w: u32) -> Result<(String, Option<Vec<u8>>), String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Me {
+            name: String,
+            #[serde(default)]
+            primary_image_tag: Option<String>,
+        }
+        let me: Me = self.get("/Users/Me", &[])?;
+        let avatar = me.primary_image_tag.and_then(|_| {
+            let url = format!("{}/Users/{}/Images/Primary?maxWidth={avatar_w}&quality=90", self.auth.server.trim_end_matches('/'), self.auth.user_id);
+            let mut r = self.agent.get(&url).header("Authorization", &self.header()).call().ok()?;
+            r.body_mut().with_config().limit(4 * 1024 * 1024).read_to_vec().ok()
+        });
+        Ok((me.name, avatar))
+    }
+
     pub fn resume(&self) -> Result<Vec<Item>, String> {
         let p = format!("/Users/{}/Items/Resume", self.auth.user_id);
         let r: Items = self.get(&p, &[("Limit", "12"), ("Fields", CARD_FIELDS), ("MediaTypes", "Video"), ("EnableImageTypes", "Primary,Backdrop,Thumb")])?;
@@ -296,6 +317,8 @@ struct AuthResult {
 #[serde(rename_all = "PascalCase")]
 struct AuthUser {
     id: String,
+    #[serde(default)]
+    name: String,
 }
 
 impl QuickConnect {
@@ -318,8 +341,8 @@ impl QuickConnect {
         Ok(QuickConnect { agent, server, device_id: device_id.into(), code: st.code, secret: st.secret })
     }
 
-    /// Ok(Some(auth)) once approved, Ok(None) while waiting.
-    pub fn poll(&self) -> Result<Option<Auth>, String> {
+    /// Ok(Some((auth, user name))) once approved, Ok(None) while waiting.
+    pub fn poll(&self) -> Result<Option<(Auth, String)>, String> {
         let mut r = self
             .agent
             .get(&format!("{}/QuickConnect/Connect", self.server))
@@ -337,6 +360,7 @@ impl QuickConnect {
             .send_json(serde_json::json!({ "Secret": self.secret }))
             .map_err(|e| format!("Quick Connect: {e}"))?;
         let a: AuthResult = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
-        Ok(Some(Auth { server: self.server.clone(), user_id: a.user.id, token: a.access_token, device_id: self.device_id.clone() }))
+        let auth = Auth { server: self.server.clone(), user_id: a.user.id, token: a.access_token, device_id: self.device_id.clone() };
+        Ok(Some((auth, a.user.name)))
     }
 }

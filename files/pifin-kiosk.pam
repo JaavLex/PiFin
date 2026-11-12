@@ -1,0 +1,12 @@
+# PAM stack for the TV app (pifin-app.service, PAMName=pifin-kiosk).
+# Like /etc/pam.d/login minus pam_nologin: login refuses users until
+# systemd-user-sessions has run (after NetworkManager), which held the TV app
+# back ~3 s at boot. No password is asked here (systemd starts the session);
+# the session part gives the app its logind session and /run/user/<uid>.
+auth     required pam_permit.so
+account  required pam_permit.so
+session  required pam_loginuid.so
+session  required pam_env.so readenv=1
+session  required pam_env.so readenv=1 envfile=/etc/default/locale
+session  required pam_limits.so
+@include common-session

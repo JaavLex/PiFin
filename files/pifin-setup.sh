@@ -138,6 +138,10 @@ usermod -aG video,render,input,audio,tty,netdev "$USER_NAME"
 systemctl daemon-reload
 systemctl enable pifin-app.service pifin-cec-remote.service pifin-remote.service pifin-wifi-watchdog.service
 systemctl set-default multi-user.target
+# desktop helpers the kiosk never uses (~60 MB, and they pulled in Xwayland)
+systemctl --global mask xdg-desktop-portal.service xdg-desktop-portal-gtk.service \
+  xdg-document-portal.service xdg-permission-store.service at-spi-dbus-bus.service \
+  mpris-proxy.service 2>/dev/null || true
 
 step "Updates: security only, at night (never while watching)"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
@@ -157,6 +161,35 @@ if [ -n "${WIFI_SSID:-}" ] && ! nmcli -t -f NAME con show | grep -qx "$WIFI_SSID
     wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_PSK" connection.autoconnect yes || true
   rm -f /etc/netplan/50-cloud-init.yaml
 fi
+
+step "Security: firewall, SSH keys only, services without root"
+# The Pi joins networks you don't control and is a member of your tailnet.
+# pifin-firewall: see the script; the tailnet ACL in the README is the real fence.
+systemctl enable pifin-firewall.service
+udevadm control --reload || true   # uinput for group "input" (phone/TV remote as $USER_NAME)
+# SSH: password login off as soon as there is a key to log in with
+if [ -s "$USER_HOME/.ssh/authorized_keys" ]; then
+  grep -q '^PasswordAuthentication' /etc/ssh/sshd_config.d/01-pifin.conf ||
+    echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config.d/01-pifin.conf
+else
+  echo "no SSH key installed (SSH_PUBKEY): password login stays on"
+fi
+# never route into the server's home LAN, even if it advertises one
+command -v tailscale >/dev/null && tailscale set --accept-routes=false || true
+
+step "Faster boot (from the next boot on)"
+# Measured on a Pi 4: ~7 s less from power-on to the first frame.
+# - swap: compressed RAM only; the default zram+file re-created a 2 GB swap
+#   file on the SD card at every boot (~1.4 s before /tmp could mount)
+mkdir -p /etc/rpi/swap.conf.d
+printf '[Main]\nMechanism=zram\n' > /etc/rpi/swap.conf.d/90-pifin.conf
+# - firmware: no camera/DSI display probing (~0.8 s); no initramfs: the firmware
+#   reads the SD card at ~5 MB/s, so its 12 MB cost 2.3 s, plus ~1 s in the
+#   kernel. Raspberry Pi kernels have SD and ext4 built in. Done last, once
+#   first-boot setup no longer needs it.
+sed -i -e 's/^camera_auto_detect=1/camera_auto_detect=0/' \
+       -e 's/^display_auto_detect=1/display_auto_detect=0/' \
+       -e 's/^auto_initramfs=1/auto_initramfs=0/' /boot/firmware/config.txt
 
 step "Scrub secrets"
 rm -f /var/lib/cloud/instance/user-data.txt* /var/lib/cloud/instances/*/user-data.txt* 2>/dev/null || true

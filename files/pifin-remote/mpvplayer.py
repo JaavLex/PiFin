@@ -113,7 +113,9 @@ class Player:
         env = ["XDG_RUNTIME_DIR=/run/user/1000", "WAYLAND_DISPLAY=wayland-0"]
         with self.lock:
             self.info = info
-            self.proc = subprocess.Popen(["runuser", "-u", os.environ.get("PIFIN_USER", "pifin"), "--", "env", *env, "mpv", *args, url],
+            # the server runs as the PiFin user now; runuser only if started as root
+            who = [] if os.geteuid() != 0 else ["runuser", "-u", os.environ.get("PIFIN_USER", "pifin"), "--"]
+            self.proc = subprocess.Popen([*who, "env", *env, "mpv", *args, url],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # ------------------------------------------------------------- status --

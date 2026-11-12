@@ -3,9 +3,21 @@ Description=PiFin TV remote (HDMI-CEC) to keyboard bridge
 After=systemd-udevd.service
 
 [Service]
+User=@@PIFIN_USER@@
+Group=@@PIFIN_USER@@
+SupplementaryGroups=video input
 ExecStart=/usr/bin/python3 /usr/local/bin/pifin-cec-remote.py
 Restart=always
 RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Environment=HOME=/tmp
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

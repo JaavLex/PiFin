@@ -1,0 +1,15 @@
+[Unit]
+Description=PiFin firewall (nftables)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pifin-firewall
+ExecStop=/usr/sbin/nft delete table inet pifin
+
+[Install]
+WantedBy=sysinit.target

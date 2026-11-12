@@ -1,0 +1,67 @@
+#!/bin/sh
+# PiFin firewall (nftables, table "inet pifin"; Tailscale keeps its own tables).
+#
+# The Pi travels to networks you don't control (a hotel, a friend's flat) and is
+# a member of your tailnet. So:
+#  - in:  only what the box needs. SSH (keys only, see 01-pifin.conf), the phone
+#         remote on the local network, mDNS, DHCP, Tailscale, and the setup
+#         hotspot's page/DHCP/DNS. Nothing else, from anywhere.
+#  - out over Tailscale: only the Jellyfin port(s), MagicDNS and ping. Even if
+#         the tailnet policy allows more, nothing on the Pi can open your other
+#         devices or your home LAN through the tailnet.
+#  - no forwarding.
+# A tailnet ACL (README, Security) is the real boundary: root on the Pi could
+# remove this table. This one also covers a tailnet left at "allow all".
+set -eu
+
+ports=""
+add_port() {  # port of a URL: explicit, else 443 for https, 80 for http
+  p=$(printf '%s' "$1" | sed -nE 's#^[a-zA-Z]+://(\[[^]]*\]|[^/:]*):([0-9]+).*#\2#p')
+  [ -n "$p" ] || case "$1" in https://*) p=443 ;; http://*) p=80 ;; *) return 0 ;; esac
+  case " $ports " in *" $p "*) ;; *) ports="$ports $p" ;; esac
+}
+add_port "$(sed -n 's/^JELLYFIN_URL=//p' /etc/pifin/app.conf 2>/dev/null | tr -d "'\"")"
+for a in /home/*/.config/pifin/auth.json; do
+  [ -r "$a" ] && add_port "$(sed -nE 's/.*"server": *"([^"]*)".*/\1/p' "$a" | head -1)"
+done
+[ -n "$ports" ] || ports=" 8096"
+set_ports=$(echo $ports | tr ' ' ',')
+
+nft -f - <<NFT
+table inet pifin
+delete table inet pifin
+table inet pifin {
+  chain input {
+    type filter hook input priority filter - 10; policy drop;
+    iif lo accept
+    ct state established,related accept
+    ct state invalid drop
+    meta l4proto { icmp, ipv6-icmp } accept
+    udp dport { 68, 546 } accept                   # DHCP / DHCPv6 client
+    udp dport 41641 accept                         # Tailscale direct connections
+    tcp dport 22 accept                            # SSH, keys only
+    iifname != "tailscale0" tcp dport 8080 accept  # phone remote, local network only
+    iifname != "tailscale0" udp dport 5353 accept  # mDNS (pifin.local)
+    udp dport 67 accept                            # setup hotspot: DHCP server
+    ip daddr 10.41.0.1 tcp dport { 53, 80 } accept # setup hotspot: DNS, Wi-Fi page
+    ip daddr 10.41.0.1 udp dport 53 accept
+    counter comment "dropped in"
+  }
+  chain forward {
+    type filter hook forward priority filter - 10; policy drop;
+  }
+  chain output {
+    type filter hook output priority filter - 10; policy accept;
+    oifname "tailscale0" jump tailnet_out
+  }
+  chain tailnet_out {
+    ct state established,related accept
+    tcp dport { $set_ports } accept                # Jellyfin
+    ip daddr 100.100.100.100 accept                # MagicDNS
+    ip6 daddr fd7a:115c:a1e0::53 accept
+    meta l4proto { icmp, ipv6-icmp } accept
+    counter drop comment "blocked to tailnet"
+  }
+}
+NFT
+echo "pifin-firewall: loaded (Jellyfin port(s):$ports)"

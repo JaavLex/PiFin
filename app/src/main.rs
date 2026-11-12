@@ -9,6 +9,7 @@
 //! drops backdrop results that arrive after the focus moved on.
 
 mod jellyfin;
+mod profiles;
 
 use jellyfin::{Auth, Client, Item};
 use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -49,11 +50,6 @@ fn mpv_command(url: &str, start_s: f64, title: &str) -> Command {
     c
 }
 
-fn load_auth() -> Result<Auth, String> {
-    let path = auth_path();
-    let s = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-    serde_json::from_str(&s).map_err(|e| format!("{path}: {e}"))
-}
 
 /// Background colour of the UI (#0b0b12), used to bake the backdrop fade.
 const BG: [f32; 3] = [11.0, 11.0, 18.0];
@@ -102,6 +98,99 @@ fn decode(bytes: &[u8], slot: Slot, w: u32, h: u32) -> Option<SharedPixelBuffer<
 enum Slot {
     Card { screen: u64, row: usize, col: usize },
     Backdrop { gen: u64 },
+}
+
+/// ~/.cache/pifin (or $XDG_CACHE_HOME/pifin).
+fn cache_dir() -> std::path::PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    std::path::PathBuf::from(base).join("pifin")
+}
+
+/// The last full home screen of a user, shown at once at the next start while
+/// the server is asked again (a cold server took 87 s once; the network itself
+/// comes up ~7 s after the app at boot).
+fn home_cache(user_id: &str) -> std::path::PathBuf {
+    cache_dir().join(format!("home-{user_id}.json"))
+}
+
+fn save_home(user_id: &str, rows: &Rows) {
+    let p = home_cache(user_id);
+    let _ = std::fs::create_dir_all(cache_dir());
+    let tmp = p.with_extension("tmp");
+    if serde_json::to_vec(rows).ok().is_some_and(|b| std::fs::write(&tmp, b).is_ok()) {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+fn load_home_cache(user_id: &str) -> Option<Rows> {
+    serde_json::from_slice(&std::fs::read(home_cache(user_id)).ok()?).ok().filter(|r: &Rows| !r.is_empty())
+}
+
+/// Latest backdrop request: workers skip older ones still in the queue.
+static BACKDROP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Server-resized images kept on disk (~25 KB a poster, ~300 KB a backdrop):
+/// the home screen fills from the SD card at boot, and a slow or remote server
+/// (a hotel, a friend's place) is asked again only after a week.
+mod img_cache {
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+    const FRESH: Duration = Duration::from_secs(7 * 86400);
+    const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+    fn dir() -> PathBuf {
+        super::cache_dir().join("img")
+    }
+
+    fn age(p: &PathBuf) -> Option<Duration> {
+        std::fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
+    }
+
+    /// Cached bytes when fresh, else `fetch` (saved), else stale bytes if any.
+    pub fn get(key: &str, fetch: impl FnOnce() -> Result<Vec<u8>, String>) -> Option<Vec<u8>> {
+        let p = dir().join(key);
+        if age(&p).is_some_and(|a| a < FRESH) {
+            if let Ok(b) = std::fs::read(&p) {
+                return Some(b);
+            }
+        }
+        match fetch() {
+            Ok(b) => {
+                let _ = std::fs::create_dir_all(dir());
+                let tmp = p.with_extension("tmp");
+                if std::fs::write(&tmp, &b).is_ok() {
+                    let _ = std::fs::rename(&tmp, &p);
+                }
+                Some(b)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::fs::read(&p).ok()
+            }
+        }
+    }
+
+    /// Keep the cache under MAX_BYTES, oldest files out first (run once at start).
+    pub fn prune() {
+        let Ok(rd) = std::fs::read_dir(dir()) else { return };
+        let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((m.modified().ok()?, m.len(), e.path()))
+            })
+            .collect();
+        let mut total: u64 = files.iter().map(|f| f.1).sum();
+        files.sort();
+        for (_, len, p) in files {
+            if total <= MAX_BYTES {
+                break;
+            }
+            if std::fs::remove_file(&p).is_ok() {
+                total -= len;
+            }
+        }
+    }
 }
 
 struct ImgJob {
@@ -231,25 +320,94 @@ fn info_line(it: &Item) -> String {
 }
 
 /// Rows for the home screen.
-fn fetch_home(client: &Client) -> Vec<(String, Vec<Item>)> {
-    let mut rows = vec![];
-    let mut push = |title: String, r: Result<Vec<Item>, String>| match r {
-        Ok(v) if !v.is_empty() => rows.push((title, v)),
-        Ok(_) => {}
-        Err(e) => eprintln!("{e}"),
+type Rows = Vec<(String, Vec<Item>)>;
+
+/// Home rows, all requests in parallel. A cold server can take over a minute for
+/// one query (Continue Watching took 81 s once) while the others answer in
+/// 50 ms, so `publish(rows)` gets what is there after `PARTIAL_AFTER`, then the
+/// full set when the last request finishes. Returns false if any request failed.
+fn fetch_home(client: &Arc<Client>, partial: bool, mut publish: impl FnMut(Rows)) -> bool {
+    const PARTIAL_AFTER: Duration = Duration::from_millis(1500);
+    type Res = Result<Vec<Item>, String>;
+    enum Msg {
+        Views(Result<Vec<Item>, String>),
+        Row(usize, Res),
+    }
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let spawn = |slot: usize, f: Box<dyn FnOnce(&Client) -> Res + Send>| {
+        let (tx, client) = (tx.clone(), client.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Row(slot, f(&client)));
+        });
     };
-    push("Continue Watching".into(), client.resume());
-    push("Next Up".into(), client.next_up());
-    if let Ok(views) = client.views() {
-        for v in views.iter() {
-            match v.collection_type.as_deref() {
-                Some("movies") => push(format!("Latest {}", v.name), client.latest(&v.id)),
-                Some("tvshows") => push(v.name.clone(), client.shows(&v.id)),
-                _ => {}
+    let mut slots: Vec<(String, Option<Res>)> = vec![("Continue Watching".into(), None), ("Next Up".into(), None)];
+    spawn(0, Box::new(|c| c.resume()));
+    spawn(1, Box::new(|c| c.next_up()));
+    {
+        let (tx, client) = (tx.clone(), client.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Views(client.views()));
+        });
+    }
+    let t0 = Instant::now();
+    let mut pending = 3;
+    let mut ok = true;
+    let mut published = false;
+    let rows_of = |slots: &[(String, Option<Res>)]| -> Rows {
+        slots.iter().filter_map(|(t, r)| match r {
+            Some(Ok(v)) if !v.is_empty() => Some((t.clone(), v.clone())),
+            _ => None,
+        }).collect()
+    };
+    while pending > 0 {
+        let left = PARTIAL_AFTER.saturating_sub(t0.elapsed());
+        let wait = if !published && !left.is_zero() { left } else { Duration::from_secs(120) };
+        match rx.recv_timeout(wait) {
+            Ok(Msg::Views(Ok(views))) => {
+                pending -= 1;
+                for v in views {
+                    let title = match v.collection_type.as_deref() {
+                        Some("movies") => format!("Latest {}", v.name),
+                        Some("tvshows") => v.name.clone(),
+                        _ => continue,
+                    };
+                    let slot = slots.len();
+                    slots.push((title, None));
+                    pending += 1;
+                    let (id, movies) = (v.id.clone(), v.collection_type.as_deref() == Some("movies"));
+                    spawn(slot, Box::new(move |c| if movies { c.latest(&id) } else { c.shows(&id) }));
+                }
+            }
+            Ok(Msg::Views(Err(e))) => {
+                eprintln!("{e}");
+                ok = false;
+                pending -= 1;
+            }
+            Ok(Msg::Row(slot, r)) => {
+                if let Err(e) = &r {
+                    eprintln!("{e}");
+                    ok = false;
+                }
+                slots[slot].1 = Some(r);
+                pending -= 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if partial && !published && pending > 0 && t0.elapsed() >= PARTIAL_AFTER {
+            let rows = rows_of(&slots);
+            if !rows.is_empty() {
+                eprintln!("HOME_PARTIAL_MS={} rows={} pending={pending}", t0.elapsed().as_millis(), rows.len());
+                publish(rows);
+                published = true;
             }
         }
     }
-    rows
+    let rows = rows_of(&slots);
+    if !rows.is_empty() {
+        publish(rows);
+    }
+    ok
 }
 
 /// A show's page: one row of seasons.
@@ -339,10 +497,16 @@ fn install_screen(app: &App, st: &mut State, rows: Vec<(String, Vec<Item>)>, own
     match replace {
         Some(i) if i < st.screens.len() => {
             // keep the user's place when refreshing
+            // (rows matched by title: a late row such as Continue Watching can
+            // appear above the others)
             let old = &st.screens[i];
-            screen.cur_row = old.cur_row.min(screen.items.len() as i32 - 1).max(0);
+            let old_title = old.titles.get(old.cur_row as usize);
+            screen.cur_row = old_title
+                .and_then(|t| screen.titles.iter().position(|n| n == t))
+                .map(|r| r as i32)
+                .unwrap_or_else(|| old.cur_row.min(screen.items.len() as i32 - 1).max(0));
             for (r, f) in screen.focus.iter_mut().enumerate() {
-                if let Some(of) = old.focus.get(r) {
+                if let Some(of) = old.titles.iter().position(|t| *t == screen.titles[r]).and_then(|o| old.focus.get(o)) {
                     *f = (*of).min(screen.items[r].len() as i32 - 1).max(0);
                 }
             }
@@ -371,6 +535,8 @@ fn show_top(app: &App, st: &mut State) {
         .collect();
     st.rows.set_vec(rows);
     app.set_search_mode(sc.search.is_some());
+    app.set_nav_show(st.screens.len() == 1 && sc.search.is_none());
+    app.set_nav_focus(-1);
     if let Some(q) = &sc.search {
         app.set_query(q.clone().into());
         if sc.items.is_empty() {
@@ -520,12 +686,16 @@ fn spawn_reporter(client: Arc<Client>, item: Item, session: Option<String>, exit
             eprintln!("{e}");
         }
         eprintln!("SAVED id={} pos={}", item.id, fmt_ticks(pos));
-        let rows = fetch_home(&client);
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(app) = weak.upgrade() else { return };
-            with_state(|state| {
-                let mut st = state.borrow_mut();
-                install_screen(&app, &mut st, rows, false, Some(0));
+        // refresh in place: no partial set (it would drop rows for a moment)
+        fetch_home(&client, false, |rows| {
+            save_home(&client.auth.user_id, &rows);
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = weak.upgrade() else { return };
+                with_state(|state| {
+                    let mut st = state.borrow_mut();
+                    install_screen(&app, &mut st, rows, false, Some(0));
+                });
             });
         });
     });
@@ -553,6 +723,14 @@ thread_local! {
 }
 
 /// The address phones on the same network use to reach us.
+/// Set once the phone-remote hint was dismissed, so a late network doesn't bring it back.
+static HINT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn hide_remote_hint(app: &App) {
+    HINT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    app.set_remote_show(false);
+}
+
 fn local_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?; // documentation address: no packet is sent
@@ -631,12 +809,6 @@ fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Im
 }
 
 
-fn auth_path() -> String {
-    std::env::var("PIFIN_AUTH").unwrap_or_else(|_| {
-        format!("{}/.config/pifin/auth.json", std::env::var("HOME").unwrap_or_default())
-    })
-}
-
 /// JELLYFIN_URL from /etc/pifin/app.conf (world-readable, written by build.py).
 fn server_url() -> Option<String> {
     let text = std::fs::read_to_string("/etc/pifin/app.conf").ok()?;
@@ -646,18 +818,25 @@ fn server_url() -> Option<String> {
     })
 }
 
-/// No saved login: show a Quick Connect code full screen, wait for approval,
-/// save the login (0600) and restart into the home screen.
-fn sign_in(app: &App) {
+/// Sign a user in with Quick Connect: show the code full screen, wait for
+/// approval, add the user to auth.json and restart as that user. `adding`:
+/// other users exist, so Back returns to "Who's watching?".
+fn sign_in(app: &App, adding: bool) {
     app.set_wifi_title("Sign in to Jellyfin".into());
     app.set_wifi_has_qr(false);
     app.set_wifi_show(true);
-    let Some(server) = server_url() else {
+    if adding {
+        app.on_cancel(|| profiles::restart(&[]));
+    }
+    // a new user joins the server the others are on; app.conf is for the first sign-in
+    let Some(server) = profiles::Store::load().map(|s| s.server).filter(|s| !s.is_empty()).or_else(server_url) else {
         app.set_wifi_text("No server configured. Set JELLYFIN_URL in /etc/pifin/app.conf.".into());
         return;
     };
     app.set_wifi_text(format!("Connecting to {server}…").into());
+    // one device id per user (Jellyfin ties a token to a device)
     let device_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
+    let back = if adding { "\n\nBack to cancel." } else { "" };
     let weak = app.as_weak();
     std::thread::spawn(move || loop {
         let set = |title: String, text: String, err: String| {
@@ -673,7 +852,7 @@ fn sign_in(app: &App) {
         let qc = match jellyfin::QuickConnect::start(&server, &device_id) {
             Ok(q) => q,
             Err(e) => {
-                set(String::new(), format!("Server: {server}"), format!("{e}. Retrying…"));
+                set(String::new(), format!("Server: {server}{back}"), format!("{e}. Retrying…"));
                 std::thread::sleep(Duration::from_secs(10));
                 continue;
             }
@@ -681,33 +860,127 @@ fn sign_in(app: &App) {
         eprintln!("QUICKCONNECT_CODE={}", qc.code);
         set(
             format!("Sign in code:  {}", qc.code),
-            format!("On a phone or computer signed in to Jellyfin, open Settings → Quick Connect and enter the code above.\n\nServer: {server}"),
+            format!("On a phone or computer signed in to Jellyfin as the user to add, open Settings → Quick Connect and enter the code above.\n\nServer: {server}{back}"),
             String::new(),
         );
         // codes expire after a few minutes: ask for a new one then
         for _ in 0..100 {
             std::thread::sleep(Duration::from_secs(3));
             match qc.poll() {
-                Ok(Some(auth)) => {
-                    let path = auth_path();
-                    if let Some(dir) = std::path::Path::new(&path).parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let saved = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, serde_json::to_string(&auth).unwrap_or_default().as_bytes()));
-                    if let Err(e) = saved {
+                Ok(Some((auth, name))) => {
+                    let mut store = profiles::Store::load().unwrap_or_default();
+                    store.add(&auth, &name);
+                    if let Err(e) = store.save() {
                         set(String::new(), String::new(), format!("Can't save the login: {e}"));
                         return;
                     }
                     eprintln!("signed in; restarting");
-                    use std::os::unix::process::CommandExt;
-                    let err = Command::new(std::env::current_exe().unwrap_or_default()).exec();
-                    eprintln!("restart failed: {err}");
-                    std::process::exit(1);
+                    profiles::restart(&["--user", &auth.user_id]);
                 }
                 Ok(None) => {}
                 Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Avatar as a circle (alpha baked in, so the GPU draws a plain quad).
+fn avatar(bytes: &[u8]) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
+    const S: u32 = 240;
+    let img = image::load_from_memory(bytes).ok()?;
+    let mut rgba = img.resize_to_fill(S, S, image::imageops::FilterType::Triangle).to_rgba8();
+    let r = S as f32 / 2.0;
+    for (x, y, px) in rgba.enumerate_pixels_mut() {
+        let (dx, dy) = (x as f32 + 0.5 - r, y as f32 + 0.5 - r);
+        let a = (r - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+        px.0[3] = (px.0[3] as f32 * a) as u8;
+    }
+    Some(SharedPixelBuffer::clone_from_slice(rgba.as_raw(), S, S))
+}
+
+fn initial(name: &str) -> String {
+    name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()
+}
+
+/// "Who's watching?". `current`: the user this process runs as (None at boot,
+/// where Back does nothing). Picking another user restarts as that user.
+fn show_profiles(app: &App, store: &profiles::Store, current: Option<String>) {
+    let cards: Vec<Card> = store
+        .users
+        .iter()
+        .map(|p| Card { id: p.user_id.clone().into(), title: p.name.clone().into(), subtitle: initial(&p.name).into(), ..Default::default() })
+        .chain(std::iter::once(Card { id: "add".into(), title: "Add user".into(), ..Default::default() }))
+        .collect();
+    let focus = store.users.iter().position(|p| p.user_id == store.user_id).unwrap_or(0);
+    let model = Rc::new(VecModel::from(cards));
+    app.set_profiles(ModelRc::from(model.clone()));
+    app.set_profile_focus(focus as i32);
+    app.set_profiles_show(true);
+
+    let weak = app.as_weak();
+    {
+        let current = current.clone();
+        app.on_profile_pick(move |i| {
+            let Some(app) = weak.upgrade() else { return };
+            let Some(card) = app.get_profiles().row_data(i as usize) else { return };
+            let id = card.id.to_string();
+            if id == "add" {
+                profiles::restart(&["--add-user"]);
+            }
+            if current.as_deref() == Some(id.as_str()) {
+                app.set_profiles_show(false);
+                return;
+            }
+            if let Some(mut st) = profiles::Store::load() {
+                st.activate(&id);
+                let _ = st.save();
+            }
+            profiles::restart(&["--user", &id]);
+        });
+    }
+    let weak = app.as_weak();
+    app.on_profile_close(move || {
+        if current.is_some() {
+            if let Some(app) = weak.upgrade() {
+                app.set_profiles_show(false);
+            }
+        }
+    });
+
+    // names and avatars from the server, one user after another (a few small requests)
+    let auths: Vec<Auth> = store.users.iter().map(|p| store.auth(p)).collect();
+    let weak = app.as_weak();
+    std::thread::spawn(move || {
+        let mut names = vec![];
+        for (i, auth) in auths.into_iter().enumerate() {
+            let Ok((name, bytes)) = Client::new(auth.clone()).me(240) else { continue };
+            names.push((auth.user_id.clone(), name.clone()));
+            let buf = bytes.as_deref().and_then(avatar);
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = weak.upgrade() else { return };
+                let m = app.get_profiles();
+                let Some(mut c) = m.row_data(i) else { return };
+                c.subtitle = initial(&name).into();
+                c.title = name.into();
+                if let Some(b) = buf {
+                    c.image = slint::Image::from_rgba8(b);
+                    c.has_image = true;
+                }
+                m.set_row_data(i, c);
+            });
+        }
+        // remember names changed on the server
+        if let Some(mut st) = profiles::Store::load() {
+            let mut changed = false;
+            for (id, name) in names {
+                if let Some(p) = st.users.iter_mut().find(|p| p.user_id == id && p.name != name) {
+                    p.name = name;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = st.save();
             }
         }
     });
@@ -720,20 +993,62 @@ fn main() {
     }
     let t0 = Instant::now();
     let app = App::new().expect("create window");
+    app.window().set_fullscreen(true);
     // logo, embedded in the binary
     if let Ok(img) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
         let rgba = img.to_rgba8();
         app.set_logo(slint::Image::from_rgba8(SharedPixelBuffer::clone_from_slice(rgba.as_raw(), rgba.width(), rgba.height())));
     }
-    let auth = match load_auth() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("auth: {e}; starting Quick Connect sign-in");
-            sign_in(&app);
-            app.run().ok();
-            return;
-        }
+    // which user: --user <id> (after a pick), the only one, or ask
+    let args: Vec<String> = std::env::args().collect();
+    let store = profiles::Store::load();
+    let Some(store) = store.filter(|_| !args.iter().any(|a| a == "--add-user")) else {
+        let adding = profiles::Store::load().is_some();
+        eprintln!("{}; starting Quick Connect sign-in", if adding { "adding a user" } else { "no saved login" });
+        sign_in(&app, adding);
+        app.run().ok();
+        return;
     };
+    let picked = args.iter().position(|a| a == "--user").and_then(|i| args.get(i + 1)).cloned();
+    let profile = match picked {
+        Some(id) => store.users.iter().find(|p| p.user_id == id).cloned(),
+        None if store.users.len() == 1 => store.users.first().cloned(),
+        None => None,
+    };
+    let Some(profile) = profile else {
+        show_profiles(&app, &store, None);
+        app.run().ok();
+        return;
+    };
+    let auth = store.auth(&profile);
+    // top bar: who is signed in (avatar from the disk cache, refreshed from the server)
+    app.set_user_name(profile.name.clone().into());
+    app.set_user_initial(initial(&profile.name).into());
+    app.set_user_index(store.users.iter().position(|p| p.user_id == profile.user_id).unwrap_or(0) as i32);
+    {
+        let weak = app.as_weak();
+        let auth = auth.clone();
+        std::thread::spawn(move || {
+            let key = format!("avatar-{}", auth.user_id);
+            let bytes = img_cache::get(&key, || match Client::new(auth.clone()).me(96) {
+                Ok((_, Some(b))) => Ok(b),
+                Ok((_, None)) => Err("no avatar".into()),
+                Err(e) => Err(e),
+            });
+            let Some(buf) = bytes.as_deref().and_then(avatar) else { return };
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.set_user_image(slint::Image::from_rgba8(buf));
+                    app.set_user_has_image(true);
+                }
+            });
+        });
+    }
+    if store.user_id != profile.user_id {
+        let mut st = store;
+        st.activate(&profile.user_id);
+        let _ = st.save();
+    }
     let client = Arc::new(Client::new(auth.clone()));
     let (img_tx, img_rx) = mpsc::channel::<ImgJob>();
 
@@ -752,6 +1067,7 @@ fn main() {
     {
         let frames = frames.clone();
         let mut first = true;
+        let weak = app.as_weak();
         app.window()
             .set_rendering_notifier(move |state, _| {
                 let mut f = frames.borrow_mut();
@@ -763,7 +1079,8 @@ fn main() {
                         }
                         if first {
                             first = false;
-                            eprintln!("FIRST_FRAME_MS={}", t0.elapsed().as_millis());
+                            let size = weak.upgrade().map(|a| a.window().size()).unwrap_or_default();
+                            eprintln!("FIRST_FRAME_MS={} window={}x{}", t0.elapsed().as_millis(), size.width, size.height);
                         }
                     }
                     _ => {}
@@ -786,6 +1103,7 @@ fn main() {
     }
 
     // ---- image workers -----------------------------------------------------
+    std::thread::spawn(img_cache::prune);
     let img_rx = Arc::new(Mutex::new(img_rx));
     for _ in 0..2 {
         let rx = img_rx.clone();
@@ -796,7 +1114,13 @@ fn main() {
                 Ok(j) => j,
                 Err(_) => return,
             };
-            let Ok(bytes) = client.image(&job.item_id, job.kind, job.w) else { continue };
+            if let Slot::Backdrop { gen } = job.slot {
+                if gen != BACKDROP_GEN.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue; // the focus moved on while this waited in the queue
+                }
+            }
+            let key = format!("{}-{}-{}.jpg", job.item_id, job.kind, job.w);
+            let Some(bytes) = img_cache::get(&key, || client.image(&job.item_id, job.kind, job.w)) else { continue };
             let Some(buf) = decode(&bytes, job.slot, job.w, job.h) else { continue };
             let slot = job.slot;
             let weak = weak.clone();
@@ -843,33 +1167,66 @@ fn main() {
             if let Some(a) = weak.upgrade() {
                 a.set_status("Loading…".into());
             }
+            // first start: last session's home at once, refreshed in place below
+            let mut cached = false;
+            with_state(|state| {
+                let mut st = state.borrow_mut();
+                if st.screens.is_empty() {
+                    if let (Some(rows), Some(app)) = (load_home_cache(&client.auth.user_id), weak.upgrade()) {
+                        install_screen(&app, &mut st, rows, false, None);
+                        cached = true;
+                        eprintln!("HOME_CACHED_MS={}", t0.elapsed().as_millis());
+                    }
+                }
+            });
             let weak2 = weak.clone();
             std::thread::spawn(move || {
-                let rows = loop {
-                    let rows = fetch_home(&client);
-                    if !rows.is_empty() {
-                        break rows;
+                // unreachable: retry soon (at boot the network or Tailscale may come
+                // up a few seconds after the app); some rows failed: a few more tries
+                let (mut delay, mut partial_tries, mut shown) = (2, 0, cached);
+                loop {
+                    let mut got = false;
+                    let mut last: Option<Rows> = None;
+                    let ok = fetch_home(&client, !shown, |rows| {
+                        got = true;
+                        last = Some(rows.clone());
+                        eprintln!("HOME_DATA_MS={} rows={}", t0.elapsed().as_millis(), rows.len());
+                        let w = weak2.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(app) = w.upgrade() else { return };
+                            with_state(|state| {
+                                let mut st = state.borrow_mut();
+                                let replace = if st.screens.is_empty() { None } else { Some(0) };
+                                install_screen(&app, &mut st, rows, false, replace);
+                            });
+                            app.set_status("".into());
+                            eprintln!("HOME_SHOWN_MS={}", t0.elapsed().as_millis());
+                        });
+                    });
+                    shown |= got;
+                    if let (true, Some(rows)) = (ok, &last) {
+                        save_home(&client.auth.user_id, rows);
                     }
-                    let w = weak2.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(a) = w.upgrade() {
-                            a.set_status("Can't reach the server, retrying…".into());
-                        }
-                    });
-                    std::thread::sleep(Duration::from_secs(15));
-                };
-                eprintln!("HOME_DATA_MS={} rows={}", t0.elapsed().as_millis(), rows.len());
+                    if ok || (got && partial_tries >= 3) {
+                        break;
+                    }
+                    if got {
+                        partial_tries += 1;
+                    } else {
+                        let w = weak2.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(a) = w.upgrade() {
+                                a.set_status("Can't reach the server, retrying…".into());
+                            }
+                        });
+                    }
+                    // every 2 s for the first half minute (boot), then backing off
+                    std::thread::sleep(Duration::from_secs(delay));
+                    if t0.elapsed() > Duration::from_secs(30) {
+                        delay = (delay * 2).min(15);
+                    }
+                }
                 loading.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(app) = weak2.upgrade() else { return };
-                    with_state(|state| {
-                        let mut st = state.borrow_mut();
-                        let replace = if st.screens.is_empty() { None } else { Some(0) };
-                        install_screen(&app, &mut st, rows, false, replace);
-                    });
-                    app.set_status("".into());
-                    eprintln!("HOME_SHOWN_MS={}", t0.elapsed().as_millis());
-                });
             });
         })
     };
@@ -901,7 +1258,7 @@ fn main() {
         app.on_moved(move |r, c| {
             let Some(app) = weak.upgrade() else { return };
             if app.get_remote_show() && app.get_cur_row() != r {
-                app.set_remote_show(false);
+                hide_remote_hint(&app);
             }
             let mut st = state.borrow_mut();
             let st = &mut *st;
@@ -932,6 +1289,7 @@ fn main() {
             }
             st.backdrop_gen += 1;
             let gen = st.backdrop_gen;
+            BACKDROP_GEN.store(gen, std::sync::atomic::Ordering::Relaxed);
             let id = backdrop_id(&it);
             let tx = st.img_tx.clone();
             backdrop_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(250), move || {
@@ -944,9 +1302,11 @@ fn main() {
     // `play` = true plays episodes directly; false opens an episode's series page.
     let player: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
     let poll = Rc::new(slint::Timer::default());
+    let start_gen = Rc::new(std::cell::Cell::new(0u64)); // one per Play, for the "slow" hint
     let open_item: Rc<dyn Fn(Item, bool)> = {
         let weak = app.as_weak();
         let player = player.clone();
+        let start_gen = start_gen.clone();
         let poll = poll.clone();
         let auth = auth.clone();
         let client = client.clone();
@@ -955,7 +1315,7 @@ fn main() {
                 return;
             }
             if let Some(a) = weak.upgrade() {
-                a.set_remote_show(false);
+                hide_remote_hint(&a);
             }
             if it.kind == "Movie" && !play && it.action.is_none() {
                 let client = client.clone();
@@ -1007,15 +1367,42 @@ fn main() {
             if !matches!(it.kind.as_str(), "Movie" | "Episode") {
                 return;
             }
+            // feedback right away: the server lookup and mpv's buffering can take seconds
+            if let Some(app) = weak.upgrade() {
+                let shown = match (&it.series_name, it.parent_index_number, it.index_number) {
+                    (Some(s), Some(se), Some(ep)) => format!("{s} · S{se}:E{ep} {}", it.name),
+                    _ => it.name.clone(),
+                };
+                app.set_starting_title(shown.into());
+                if !app.get_starting() {
+                    app.set_starting_slow(false);
+                    app.set_starting(true);
+                    start_gen.set(start_gen.get() + 1);
+                    let (gen, start_gen, weak) = (start_gen.get(), start_gen.clone(), weak.clone());
+                    slint::Timer::single_shot(Duration::from_secs(12), move || {
+                        if let Some(a) = weak.upgrade().filter(|a| a.get_starting() && start_gen.get() == gen) {
+                            a.set_starting_slow(true);
+                        }
+                    });
+                }
+            }
             // list items carry no media info: fetch the full item first, then come back here
             if it.media_sources.is_empty() {
                 let client = client.clone();
                 let weak = weak.clone();
                 let id = it.id.clone();
                 std::thread::spawn(move || {
-                    let Ok(full) = client.item(&id) else { return };
+                    let full = client.item(&id);
                     let _ = slint::invoke_from_event_loop(move || {
                         let Some(app) = weak.upgrade() else { return };
+                        let Ok(full) = full else {
+                            app.set_starting(false);
+                            app.set_status("Couldn't load this item from the server".into());
+                            return;
+                        };
+                        if !app.get_starting() {
+                            return; // Back pressed while the server answered
+                        }
                         REMOTE.with(|r| {
                             if let Some(f) = r.borrow().as_ref() {
                                 f(&app, "play", Some(full));
@@ -1055,6 +1442,13 @@ fn main() {
                             Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
                             None => true,
                         };
+                        // mpv's window is up and covers the app: stop the spinner
+                        if let Some(a) = weak.upgrade().filter(|a| a.get_starting()) {
+                            if done || mpv_get("vo-configured").and_then(|v| v.as_bool()) == Some(true) {
+                                eprintln!("MPV_VIDEO t={}ms", t0.elapsed().as_millis());
+                                a.set_starting(false);
+                            }
+                        }
                         if done {
                             if let Some(t) = poll_w.upgrade() {
                                 t.stop();
@@ -1072,10 +1466,26 @@ fn main() {
                 Err(e) => {
                     let _ = std::fs::remove_file(NOW_FILE);
                     eprintln!("mpv spawn failed: {e}");
+                    if let Some(a) = weak.upgrade() {
+                        a.set_starting(false);
+                    }
                 }
             }
         })
     };
+    {
+        let weak = app.as_weak();
+        let player = player.clone();
+        app.on_cancel_start(move || {
+            if let Some(c) = player.borrow_mut().as_mut() {
+                let _ = c.kill(); // the poll timer sees the exit and cleans up
+            }
+            if let Some(a) = weak.upgrade() {
+                a.set_starting(false);
+            }
+            eprintln!("START_CANCELLED");
+        });
+    }
     {
         let state = state.clone();
         let open_item = open_item.clone();
@@ -1135,7 +1545,7 @@ fn main() {
         let run_search = run_search.clone();
         Rc::new(move |q: String| {
             let Some(app) = weak.upgrade() else { return };
-            app.set_remote_show(false);
+            hide_remote_hint(&app);
             let mut st = state.borrow_mut();
             let is_search = st.screens.last().map(|s| s.search.is_some()).unwrap_or(false);
             if !is_search {
@@ -1219,7 +1629,7 @@ fn main() {
         let open_search = open_search.clone();
         REMOTE.with(|r| {
             *r.borrow_mut() = Some(Box::new(move |app: &App, cmd: &str, item: Option<Item>| match cmd {
-                "seen" => app.set_remote_show(false),
+                "seen" => hide_remote_hint(app),
                 "home" => {
                     let mut st = state.borrow_mut();
                     if st.screens.len() > 1 {
@@ -1238,24 +1648,47 @@ fn main() {
         });
     }
 
-    // ---- boot hint: QR code for the phone remote until a key press or a phone connects
-    if let Some(ip) = local_ip() {
-        let url = format!("http://{ip}:8080");
-        if let Some(img) = qr_image(&url) {
-            app.set_remote_qr(img);
-            app.set_remote_url(url.into());
-            app.set_remote_show(true);
+    // ---- boot hint: QR code for the phone remote until a key press or a phone connects.
+    // The app starts before the network, so the address is looked up every 2 s
+    // (up to 3 min) until there is one, unless the hint was dismissed meanwhile.
+    if std::env::var_os("PIFIN_RESTARTED").is_none() {
+        let weak = app.as_weak();
+        let tries = std::cell::Cell::new(0u32);
+        let show = move || -> bool {
+            let Some(app) = weak.upgrade() else { return true };
+            tries.set(tries.get() + 1);
+            if HINT_OFF.load(std::sync::atomic::Ordering::Relaxed) || tries.get() > 90 {
+                return true;
+            }
+            let Some(ip) = local_ip() else { return false };
+            let url = format!("http://{ip}:8080");
+            if let Some(img) = qr_image(&url) {
+                app.set_remote_qr(img);
+                app.set_remote_url(url.into());
+                app.set_remote_show(true);
+            }
+            true
+        };
+        if !show() {
+            let timer = Rc::new(slint::Timer::default());
+            let t = timer.clone();
+            timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
+                if show() {
+                    t.stop();
+                }
+            });
         }
     }
 
-    // ---- Back: pop a screen; at home it does nothing (unless PIFIN_EXIT for probes)
+    // ---- Back: pop a screen; at home it opens "Who's watching?" (PIFIN_EXIT quits, for probes)
     {
         let weak = app.as_weak();
         let state = state.clone();
+        let me = auth.user_id.clone();
         app.on_back(move || {
             let Some(app) = weak.upgrade() else { return };
             if app.get_remote_show() {
-                app.set_remote_show(false);
+                hide_remote_hint(&app);
                 return;
             }
             let mut st = state.borrow_mut();
@@ -1264,6 +1697,20 @@ fn main() {
                 show_top(&app, &mut st);
             } else if std::env::var_os("PIFIN_EXIT").is_some() {
                 let _ = slint::quit_event_loop();
+            } else if let Some(store) = profiles::Store::load() {
+                drop(st);
+                show_profiles(&app, &store, Some(me.clone()));
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        let me = auth.user_id.clone();
+        app.on_open_profiles(move || {
+            let Some(app) = weak.upgrade() else { return };
+            hide_remote_hint(&app);
+            if let Some(store) = profiles::Store::load() {
+                show_profiles(&app, &store, Some(me.clone()));
             }
         });
     }

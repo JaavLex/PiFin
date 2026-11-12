@@ -88,6 +88,7 @@ component PosterCard inherits Rectangle {
 
 export component App inherits Window {
     title: "PiFin";
+    no-frame: true;   // no client-side title bar (it cost 35 px at the bottom under cage)
     preferred-width: 1280px;
     preferred-height: 720px;
     background: #0b0b12;
@@ -115,6 +116,15 @@ export component App inherits Window {
     in-out property <bool> kb-active: true;
     property <int> kb-cols: 10;
     callback open-search();
+    // top bar on the home screen: search and the signed-in user (↑ from the first row)
+    in property <bool> nav-show: false;
+    in-out property <int> nav-focus: -1;   // -1 rows, 0 search, 1 user
+    in property <string> user-name;
+    in property <string> user-initial;
+    in property <int> user-index: 0;      // same colour as on "Who's watching?"
+    in property <image> user-image;
+    in property <bool> user-has-image: false;
+    callback open-profiles();
     callback kb-press(string);
 
     // Wi-Fi screen (shown over everything while the Pi has no network)
@@ -124,6 +134,22 @@ export component App inherits Window {
     in property <string> wifi-error;
     in property <image> wifi-qr;
     in property <bool> wifi-has-qr: false;
+
+    // playback starting: shown from Play until mpv's first frame covers the app
+    in property <bool> starting: false;
+    in property <string> starting-title;
+    in property <bool> starting-slow: false;
+    callback cancel-start();
+
+    // "Who's watching?": saved users plus an "Add user" card (id "add")
+    in property <bool> profiles-show: false;
+    in property <[Card]> profiles;
+    in-out property <int> profile-focus: 0;
+    property <[color]> profile-colors: [#00a4dc, #aa5cc3, #e8a33d, #3dbb7e, #e2566b];
+    callback profile-pick(int);
+    callback profile-close();
+    // Back on the sign-in screen (only acts when adding a user)
+    callback cancel();
 
     // phone remote hint (bottom right) shown at boot
     in-out property <bool> remote-show: false;
@@ -144,7 +170,7 @@ export component App inherits Window {
     // header: focused item details
     Text {
         x: 64px; y: 36px;
-        width: 760px;
+        width: root.nav-show ? 620px : 760px;
         visible: !root.search-mode;
         text: root.heading;
         font-size: 36px; font-weight: 700;
@@ -173,6 +199,60 @@ export component App inherits Window {
         width: 150px; height: 44px;
         source: root.logo;
         visible: !root.search-mode;
+    }
+    // top bar: [search] [avatar name], left of the logo
+    if root.nav-show && !root.search-mode: Rectangle {
+        property <bool> f-search: root.nav-focus == 0;
+        property <bool> f-user: root.nav-focus == 1;
+        x: parent.width - 56px - 150px - 24px - self.width; y: 30px;
+        width: user-pill.x + user-pill.width; height: 44px;
+        Rectangle {
+            x: 0; width: 150px; height: 44px;
+            border-radius: 22px;
+            background: f-search ? #f2f2f7 : #1a1c2bd8;
+            Path {
+                x: 16px; y: 12px; width: 20px; height: 20px;
+                viewbox-width: 20; viewbox-height: 20;
+                commands: "M 8.5 2 A 6.5 6.5 0 1 0 8.5 15 A 6.5 6.5 0 1 0 8.5 2 M 13.5 13.5 L 18.5 18.5";
+                stroke: f-search ? #0b0b12 : #c8c8d8;
+                stroke-width: 2.4px;
+            }
+            Text {
+                x: 46px; height: parent.height;
+                vertical-alignment: center;
+                text: "Search";
+                font-size: 18px;
+                font-weight: 600;   // same width focused or not: the bar doesn't shift
+                color: f-search ? #0b0b12 : #c8c8d8;
+            }
+        }
+        user-pill := Rectangle {
+            x: 162px; height: 44px;
+            width: min(176px, 52px + name.preferred-width + 18px);
+            border-radius: 22px;
+            background: f-user ? #f2f2f7 : #1a1c2bd8;
+            Rectangle {
+                x: 4px; y: 4px; width: 36px; height: 36px;
+                border-radius: 18px;
+                background: root.user-has-image ? transparent : root.profile-colors[mod(root.user-index, root.profile-colors.length)];
+                if !root.user-has-image: Text {
+                    text: root.user-initial;
+                    font-size: 18px; font-weight: 700;
+                    color: #0b0b12;
+                }
+                if root.user-has-image: Image { width: 36px; height: 36px; source: root.user-image; }
+            }
+            name := Text {
+                x: 50px; height: parent.height;
+                width: parent.width - 50px - 16px;
+                vertical-alignment: center;
+                text: root.user-name;
+                font-size: 18px;
+                font-weight: 600;   // same width focused or not: the bar doesn't shift
+                color: f-user ? #0b0b12 : #c8c8d8;
+                overflow: elide;
+            }
+        }
     }
     Text {
         x: parent.width - self.width - 64px; y: 84px;
@@ -235,7 +315,7 @@ export component App inherits Window {
                 x: 64px + (ci - max(0, r.focus - 5)) * root.card-step;
                 y: 36px;
                 card: c;
-                focused: ri == root.cur-row && ci == r.focus;
+                focused: ri == root.cur-row && ci == r.focus && root.nav-focus < 0;
                 visible: self.x > -self.width && self.x < root.width;
             }
         }
@@ -294,9 +374,106 @@ export component App inherits Window {
         }
     }
 
+    if root.starting: Rectangle {
+        background: #0b0b12e8;
+        // the only animation in the app, and only while a video starts
+        property <float> phase: mod(animation-tick() / 110ms, 8);
+        for i in 8: Rectangle {
+            width: 14px; height: 14px; border-radius: 7px;
+            x: parent.width / 2 - 7px + 34px * cos(i * 45deg);
+            y: parent.height / 2 - 67px + 34px * sin(i * 45deg);
+            background: #00a4dc;
+            opacity: 1 - mod(parent.phase - i + 8, 8) / 8;
+        }
+        Text {
+            y: parent.height / 2 + 10px; width: parent.width;
+            horizontal-alignment: center;
+            text: root.starting-title;
+            font-size: 26px; font-weight: 700; color: #f2f2f7;
+            overflow: elide;
+        }
+        Text {
+            y: parent.height / 2 + 52px; width: parent.width;
+            horizontal-alignment: center;
+            text: root.starting-slow ? "Still buffering: the connection to the server is slow  ·  Back to cancel" : "Starting…  ·  Back to cancel";
+            font-size: 16px; color: #8e8ea6;
+        }
+    }
+
+    if root.profiles-show: Rectangle {
+        background: #0b0b12;
+        Image {
+            x: parent.width - self.width - 56px; y: 30px;
+            width: 150px; height: 44px;
+            source: root.logo;
+        }
+        Text {
+            y: 170px; width: parent.width;
+            horizontal-alignment: center;
+            text: "Who's watching?";
+            font-size: 40px; font-weight: 700;
+            color: #f2f2f7;
+        }
+        for p[i] in root.profiles: Rectangle {
+            property <bool> focused: i == root.profile-focus;
+            property <length> step: 200px;
+            x: (parent.width - root.profiles.length * self.step) / 2 + i * self.step + 20px;
+            y: 270px;
+            width: 160px; height: 220px;
+            // focus ring
+            Rectangle {
+                x: -6px; y: -6px; width: 172px; height: 172px;
+                border-radius: 86px;
+                border-width: focused ? 4px : 0px;
+                border-color: #ffffff;
+            }
+            Rectangle {
+                width: 160px; height: 160px; x: 0; y: 0;
+                border-radius: 80px;
+                background: p.id == "add" ? #1a1c2b : p.has-image ? transparent : root.profile-colors[mod(i, root.profile-colors.length)];
+                if !p.has-image: Text {
+                    text: p.id == "add" ? "+" : p.title == "" ? "?" : p.subtitle;
+                    font-size: 64px; font-weight: 700;
+                    color: p.id == "add" ? #8e8ea6 : #0b0b12;
+                }
+                if p.has-image: Image { width: 160px; height: 160px; source: p.image; }
+            }
+            Text {
+                y: 180px; width: parent.width;
+                horizontal-alignment: center;
+                text: p.title;
+                font-size: 20px;
+                font-weight: focused ? 700 : 400;
+                color: focused ? #f2f2f7 : #8e8ea6;
+                overflow: elide;
+            }
+        }
+        Text {
+            y: parent.height - 80px; width: parent.width;
+            horizontal-alignment: center;
+            text: root.rows.length > 0 ? "OK to choose  ·  Back to stay" : "OK to choose";
+            font-size: 15px; color: #6e6e86;
+        }
+    }
+
     forward-focus: keys;
     keys := FocusScope {
         key-pressed(event) => {
+            if (root.starting) {
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.cancel-start(); }
+                return accept;
+            }
+            if (root.profiles-show) {
+                if (event.text == Key.RightArrow) { root.profile-focus = min(root.profiles.length - 1, root.profile-focus + 1); }
+                if (event.text == Key.LeftArrow) { root.profile-focus = max(0, root.profile-focus - 1); }
+                if (event.text == Key.Return || event.text == " ") { root.profile-pick(root.profile-focus); }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.profile-close(); }
+                return accept;
+            }
+            if (root.wifi-show) {
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.cancel(); }
+                return accept;
+            }
             if (root.search-mode && (root.kb-active || root.rows.length == 0)) {
                 if (event.text == Key.RightArrow) { root.kb-focus = min(root.kb-keys.length - 1, root.kb-focus + 1); return accept; }
                 if (event.text == Key.LeftArrow) { root.kb-focus = max(0, root.kb-focus - 1); return accept; }
@@ -311,6 +488,20 @@ export component App inherits Window {
                 if (event.text == Key.Backspace) { root.kb-press("delete"); return accept; }
                 if (event.text.character-count == 1) { root.kb-press(event.text); return accept; }
                 return reject;
+            }
+            if (root.nav-show && root.nav-focus >= 0) {
+                if (event.text == Key.LeftArrow) { root.nav-focus = 0; }
+                if (event.text == Key.RightArrow) { root.nav-focus = 1; }
+                if (event.text == Key.DownArrow && root.rows.length > 0) { root.nav-focus = -1; }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { if (root.rows.length > 0) { root.nav-focus = -1; } else { root.back(); } }
+                if (event.text == Key.Return || event.text == " ") {
+                    if (root.nav-focus == 0) { root.nav-focus = -1; root.open-search(); } else { root.open-profiles(); }
+                }
+                return accept;
+            }
+            if (root.nav-show && event.text == Key.UpArrow && (root.rows.length == 0 || root.cur-row == 0)) {
+                root.nav-focus = 0;
+                return accept;
             }
             if (root.rows.length == 0) { return reject; }
             if (event.text == Key.UpArrow && root.cur-row == 0) {

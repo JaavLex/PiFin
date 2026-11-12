@@ -1,13 +1,29 @@
 [Unit]
 Description=PiFin phone remote (web app on port 8080) + TV hint overlay
-After=network-online.target jellyfin-kiosk.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=-/etc/pifin/secrets.env
+# Not root: it's a web server on every network the Pi joins.
+User=@@PIFIN_USER@@
+Group=@@PIFIN_USER@@
+SupplementaryGroups=input
+Environment=PIFIN_USER=@@PIFIN_USER@@
 ExecStart=/usr/bin/python3 /opt/pifin-remote/server.py
 Restart=always
 RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+DevicePolicy=closed
+DeviceAllow=/dev/uinput rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

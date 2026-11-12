@@ -1,14 +1,18 @@
 [Unit]
 Description=PiFin app (native Jellyfin browser) on the TV
-After=network-online.target systemd-user-sessions.service tailscaled.service
-Wants=network-online.target
+# Starts as soon as the seat is there: no wait for the network (the app draws at
+# once and retries the server until it answers), and its own PAM stack
+# (pifin-kiosk, no pam_nologin) so it needn't wait for systemd-user-sessions,
+# which comes after NetworkManager.
+After=seatd.service systemd-logind.service dbus.service
+Wants=seatd.service
 Conflicts=getty@tty1.service jellyfin-kiosk.service
 
 [Service]
 User=@@PIFIN_USER@@
 Group=@@PIFIN_USER@@
 SupplementaryGroups=input video render audio tty
-PAMName=login
+PAMName=pifin-kiosk
 TTYPath=/dev/tty1
 StandardInput=tty-force
 StandardOutput=journal
@@ -16,6 +20,8 @@ StandardError=journal
 Environment=XDG_SESSION_TYPE=wayland
 ExecStart=/bin/sh -c "exec /usr/bin/cage -s -- /usr/local/bin/pifin-app-session >/tmp/pifin-app.log 2>&1"
 Restart=always
+# an exploited app or mpv can't gain root (no sudo, no setuid)
+NoNewPrivileges=yes
 RestartSec=3
 TimeoutStopSec=10
 

@@ -2,62 +2,82 @@
 
 # PiFin
 
-A lightweight Jellyfin hub for Raspberry Pis: flash a card, run one script, and the Pi boots
-into a fast native Jellyfin browser on your TV, with hardware-decoded playback and your phone as
-the remote.
+**Your Jellyfin library, on any TV, anywhere.** PiFin turns a Raspberry Pi 4 into a small box
+you take with you: plug it into the TV at your girlfriend's place, a hotel room or your
+parents' house, join the Wi-Fi from your phone, and watch your own library, streamed from your
+server at home.
+
+PiFin is **not a Jellyfin server**. It stores and transcodes nothing: it's a fast native client
+that connects to your existing server remotely, through Tailscale or any URL the Pi can reach.
+
+<p align="center"><img src="docs/screenshots/tv-home.jpg" width="720" alt="PiFin home screen"></p>
+
+```mermaid
+flowchart LR
+    subgraph home["🏠 Your home"]
+        server[("Jellyfin server")]
+    end
+    subgraph away["📍 Anywhere: a partner's flat, a hotel, family"]
+        wifi["Their Wi-Fi"] <--> pi["PiFin (Pi 4)"]
+        pi -- HDMI --> tv["TV"]
+        phone["📱 Phone remote"] --> pi
+    end
+    server <-->|"Tailscale, encrypted, over the internet"| wifi
+```
+
+Nothing to open on your home router: with Tailscale the Pi and the server find each other. The
+Pi plays the original file with hardware decoding, so the server never transcodes, and your
+progress goes back to the server, so you pick up at home where you stopped at the hotel.
+
+## Features
+
+- **Who's watching?** Each profile is a Jellyfin user of your server, with their own Continue
+  Watching, Next Up and resume points. The avatar at the top of the home screen shows who is
+  signed in; select it to switch or to add a user with a Quick Connect code.
+- **Browse:** home rows, movie pages with Resume and cast, series → seasons → episodes, and
+  search (the Search button at the top) with an on-screen keyboard.
+- **Playback** in mpv with hardware decoding (HEVC, 10-bit, H.264) and a light overlay for
+  progress, audio and subtitles.
+- **Phone remote:** a web page on port 8080, nothing to install. D-pad, now playing, seek,
+  volume, tracks, search. The TV remote works too (HDMI-CEC).
+- **Wi-Fi setup at a new place:** with no known network the Pi opens a hotspot and shows a QR
+  code on the TV; pick the local Wi-Fi on your phone and it carries on by itself.
+- **Fast:** ~20 s from power-on to the home screen (the last session's home shows at once
+  while the server is asked again), ~120 MB for the app, idle CPU near zero.
+
+| | |
+|---|---|
+| ![Who's watching](docs/screenshots/tv-profiles.jpg) | ![Movie page](docs/screenshots/tv-movie-page.jpg) |
+| ![Episodes](docs/screenshots/tv-episodes.jpg) | ![Search](docs/screenshots/tv-search.jpg) |
+| ![Playback overlay](docs/screenshots/tv-playback.png) | ![Wi-Fi setup](docs/screenshots/tv-wifi-setup.jpg) |
 
 <p align="center">
-  <img src="docs/screenshots/remote-playing.png" width="250" alt="Phone remote, now playing">
-  &nbsp;&nbsp;
-  <img src="docs/screenshots/tv-playback.png" width="440" alt="Playback overlay on the TV">
+  <img src="docs/screenshots/remote-idle.png" width="220" alt="Phone remote">
+  &nbsp;
+  <img src="docs/screenshots/remote-playing.png" width="220" alt="Phone remote, playing">
 </p>
-
-## What you get
-
-- **A native TV app** (Rust + Slint under cage, `app/`): home rows (Continue Watching, Next Up,
-  Latest), series pages, posters and backdrops. About 0.7 s from start to home, ~110 MB of
-  memory, and frames well under 16 ms at 1080p60. Sign in once with Jellyfin **Quick Connect**:
-  the TV shows a code, you approve it from any signed-in Jellyfin app.
-- **Hardware-decoded playback** — Play hands the file to mpv, so HEVC, 10-bit and H.264 play
-  from the Pi 4's decoders; progress, resume position and watched state go back to Jellyfin.
-- **Playback overlay** — a light mpv overlay with title, clock, progress bar, end time and
-  audio/subtitle menus on the TV remote's arrows (it costs nothing while hidden).
-- **Phone remote** — a one-screen web app on port 8080 with no install and no account: d-pad,
-  now playing, ±10/30 s skips, pause/seek/volume, audio/subtitle pickers, and search with posters (play or open on
-  the TV). The TV shows a QR code for it at boot.
-- **TV remote** — HDMI-CEC buttons become keys, so a plain TV remote drives the whole UI.
-- **Wi-Fi setup hotspot** — with no known network the Pi opens a hotspot and shows a QR code
-  on the TV; pick your network on the phone and it carries on by itself. The TV says what the Pi
-  is doing ("Connecting to …", then back to the app), and Wi-Fi power save is turned off
-  because the Pi 4's radio (brcmfmac) drops and scans slowly with it on.
-- **Optional Tailscale** — one auth key and the Pi joins your tailnet; leave it empty and it
-  is not even installed.
 
 ## Requirements
 
-- Raspberry Pi 4 with 2 GB or more (a Pi 3 is too weak; a Pi 5 should work, untested).
-- A TV or monitor over HDMI, and a Jellyfin server you can reach from the Pi.
-- On the computer that prepares the card: Python 3 with PyYAML (`pip install pyyaml`) and
-  `openssl`.
+- Raspberry Pi 4 with 2 GB or more (a Pi 5 should work, untested), and an HDMI TV.
+- A Jellyfin server the Pi can reach. For use away from home, Tailscale on the server.
+- To prepare the card: Python 3 with PyYAML (`pip install pyyaml`) and `openssl`.
 
 ## Quick start
 
-1. Flash **Raspberry Pi OS Lite 64-bit** (arm64, Trixie) and mount its boot partition.
+1. Flash **Raspberry Pi OS Lite 64-bit** (Trixie) and mount its boot partition.
 2. Configure:
    ```bash
    cp pifin.env.example pifin.env
    ./build.py --hash-password          # paste the printed line into pifin.env
    $EDITOR pifin.env                   # JELLYFIN_URL and HOTSPOT_PASS are required
    ```
-3. Write it to the card and boot from it:
-   ```bash
-   ./build.py /run/media/you/bootfs
-   ```
+   For use away from home, set `TS_AUTHKEY` and use the server's Tailscale address in
+   `JELLYFIN_URL`.
+3. Write the card and boot the Pi: `./build.py /run/media/you/bootfs`
 
-First boot does the installs (the PiFin app from the latest GitHub release, mpv, comitup,
-optional Tailscale), so give it 10-15 minutes on a wired or good Wi-Fi link. Then sign in with
-the Quick Connect code shown on the TV. It resumes after a power
-cut, and it deletes its own setup files and one-time keys when it is done.
+First boot installs everything by itself (10–15 min), then the TV shows a Quick Connect code to
+approve from any Jellyfin app.
 
 ## Configuration
 
@@ -65,71 +85,70 @@ Everything lives in `pifin.env`; `pifin.env.example` documents each key.
 
 | Key | Required | Default | What it does |
 |---|---|---|---|
-| `PIFIN_PASS` / `PIFIN_PASS_HASH` | yes | – | login password for the PiFin user (`./build.py --hash-password` makes the hash) |
-| `JELLYFIN_URL` | yes | – | the server the TV opens |
+| `PIFIN_PASS` / `PIFIN_PASS_HASH` | yes | – | password of the PiFin user (`./build.py --hash-password`) |
+| `JELLYFIN_URL` | yes | – | the server the first user signs in to |
 | `HOTSPOT_PASS` | yes | – | password of the Wi-Fi setup hotspot |
 | `TS_AUTHKEY` | | – | Tailscale auth key; empty skips Tailscale |
 | `WIFI_SSID` / `WIFI_PSK` | | – | home Wi-Fi; empty means "use the setup hotspot" |
 | `WIFI_COUNTRY` | | – | two-letter radio country code |
 | `TIMEZONE` | | `Etc/UTC` | |
-| `PIFIN_HOSTNAME` | | `pifin` | mDNS name (`pifin.local`) and tailnet name |
-| `PIFIN_USER` | | `pifin` | Linux user the kiosk runs as |
+| `PIFIN_HOSTNAME` | | `pifin` | mDNS and tailnet name |
+| `PIFIN_USER` | | `pifin` | Linux user the app runs as |
 | `SSH_PUBKEY` | | – | file of public keys to install for SSH |
 | `HOTSPOT_SSID` | | `PiFin-setup` | |
-| `MAX_HEIGHT` | | `720` | render height, scaled up by the TV; lower is smoother |
+| `MAX_HEIGHT` | | `1080` | highest TV mode used (a 4K TV runs at 1080p) |
 
-**Security, in one paragraph.** The PiFin user is created with `sudo NOPASSWD:ALL` and SSH
-password auth is on, so first-boot setup can run with nobody at the keyboard. Set a real
-password (or install your `SSH_PUBKEY`), and tighten it once the Pi is set up. Only the
-one-time Tailscale key and the Wi-Fi password are wiped from the card after setup.
+## Security
+
+The Pi joins networks you don't control and is a member of your tailnet, so a stolen or
+compromised Pi must not become a way into your home. What PiFin does on the Pi:
+
+- **Firewall:** inbound, only SSH, the phone remote (local network only), mDNS, DHCP,
+  Tailscale and the setup hotspot. Over Tailscale it can only reach the Jellyfin port, not
+  your other devices or your home LAN. It never accepts subnet routes.
+- **SSH:** keys only once `SSH_PUBKEY` is set (passwords stay on otherwise, so you aren't
+  locked out); no root login.
+- **No root for network-facing code:** the app, mpv and both remotes run as the PiFin user,
+  with no way to gain privileges (no sudo, even if exploited).
+
+What you should do too:
+
+1. **Restrict the Pi in your tailnet policy** (Tailscale admin console → Access controls),
+   tag the Pi `tag:pifin`, and let it reach only Jellyfin:
+   ```json
+   "tagOwners": { "tag:pifin": ["autogroup:admin"] },
+   "hosts":     { "jellyfin": "<your server's Tailscale IP>" },
+   "grants": [
+     { "src": ["autogroup:member"], "dst": ["*"],        "ip": ["*"] },
+     { "src": ["tag:pifin"],        "dst": ["jellyfin"], "ip": ["tcp:8096"] }
+   ]
+   ```
+   (This replaces the default "everything to everything" rule; members keep full access.)
+2. **Sign in on the Pi with a Jellyfin user that is not an administrator.** An admin token
+   on a box that travels can install server plugins, which is code running on your server.
+3. **If the Pi is lost:** remove it in the Tailscale admin console, and delete its devices
+   in Jellyfin (Dashboard → Devices), which revokes its tokens.
+
+The PiFin user keeps passwordless sudo so first boot can run unattended; with key-only SSH,
+that needs your key.
 
 ## Layout
 
-`build.py` is the whole installer: it writes cloud-init `user-data` + `network-config` and a
-`config.txt` block. `files/` is what gets installed — `pifin-setup.sh` (first boot, one shot
-per step, idempotent), the app/CEC/remote systemd units, and `pifin-remote/` (the phone
-remote server, its page, and the mpv overlay script). `app/` is the TV app (build it on a Pi
-with `cargo build --release`; releases ship a prebuilt aarch64 binary). `tools/` are
-development helpers and never run on the Pi.
-
-`pifin-setup.sh` also rewrites comitup's hard-coded `FAIL_TIMEOUT` to 60 s in
-`/usr/share/comitup/comitup/states.py`, so a lost network is retried about a minute after a
-failed attempt instead of six (the edit is guarded and skipped if upstream changed the line).
-
-## Screenshots
-
-| Phone remote, idle | Phone remote, playing |
-|---|---|
-| ![remote idle](docs/screenshots/remote-idle.png) | ![remote playing](docs/screenshots/remote-playing.png) |
-
-| Playback overlay | Subtitle menu (TV remote ↓) |
-|---|---|
-| ![tv playback](docs/screenshots/tv-playback.png) | ![tv menu](docs/screenshots/tv-menu.png) |
-
-The phone shots are rendered from the real page with mocked data (`node tools/shot-remote.mjs`).
-The TV shots were taken on a Pi 4 playing *Big Buck Bunny* (© Blender Foundation, CC BY 3.0).
+`build.py` writes the cloud-init files to the card. `files/` is what gets installed: the
+first-boot script `pifin-setup.sh`, the systemd units and the phone remote. `app/` is the TV app
+(Rust + Slint; releases ship a prebuilt aarch64 binary). `tools/` are development helpers.
 
 ## Contributing
 
-Issues and pull requests welcome — say which Pi and which OS you are on, and paste
-`journalctl -u pifin-setup -e` (or the unit that misbehaved) for anything boot- or
-playback-related. The journal is persistent (capped at 50 MB), so logs survive a reboot.
-Wi-Fi complaints should come with `journalctl -u comitup -u NetworkManager`.
+Issues and pull requests welcome; say which Pi and OS, and paste the journal of the unit that
+misbehaved. The rule: **lightweight and fast**. Test on a real Pi, and before pushing run
+`tools/selftest.sh` and `tools/check-leaks.sh`. No screenshots of your own library: use
+`tools/demo-server.py`.
 
-- The one rule: **lightweight and fast**. A Pi 4 with 2 GB has to keep up, so prefer fewer
-  processes, fewer pixels and less memory over new features.
-- Test on a real Pi before opening a pull request: `tools/selftest.sh` only covers the
-  install-config path.
-- Before pushing: `bash -n files/*.sh files/pifin-comitup-callback`,
-  `python3 -m py_compile build.py files/*.py files/pifin-remote/*.py`, and
-  `tools/check-leaks.sh` — it keeps other people's network out of this repo.
-- No screenshots of your own library, and never commit a `pifin.env`.
-
-## Roadmap
-
-Search on the TV with an on-screen keyboard, movie pages with cast, track choice before Play,
-and a Pi 5 test.
+The TV screenshots were taken on a Pi 4 against that demo server. Artwork: Blender Foundation
+open movies, CC BY 3.0/4.0, via Wikimedia Commons (`tools/demo-server.py --fetch-art` lists each
+file and its license).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

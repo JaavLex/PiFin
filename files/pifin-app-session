@@ -30,4 +30,6 @@ SCALE=$(awk -v h="${H:-720}" 'BEGIN { printf "%.3f", h / 720 }')
 log "height ${H:-?}, scale $SCALE"
 
 export SLINT_SCALE_FACTOR="$SCALE"
+# no X11: a desktop portal started over DISPLAY spawned Xwayland (~85 MB idle)
+unset DISPLAY
 exec /usr/local/bin/pifin
