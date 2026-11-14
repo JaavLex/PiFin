@@ -10,6 +10,8 @@
 
 mod jellyfin;
 mod profiles;
+#[allow(dead_code)] // the Settings UI (later tasks) uses the rest of the API
+mod settings;
 
 use jellyfin::{Auth, Client, Item};
 use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -28,8 +30,24 @@ const CARD_W: u32 = 225;
 const CARD_H: u32 = 338;
 const BACKDROP_W: u32 = 1280;
 
+/// Per-playback mpv options from the settings (and, later, the chosen tracks).
+struct MpvOpts {
+    sub_scale: f32,
+    passthrough: bool,
+    aid: Option<String>,
+    sid: Option<String>,
+}
+
+impl MpvOpts {
+    fn from_settings() -> MpvOpts {
+        let d = settings::current().display.clone();
+        MpvOpts { sub_scale: d.subtitle_scale, passthrough: d.audio_passthrough, aid: None, sid: None }
+    }
+}
+
+
 /// mpv arguments proven on the Pi 4 (0 dropped frames on HEVC 10-bit 1080p).
-fn mpv_command(url: &str, start_s: f64, title: &str) -> Command {
+fn mpv_command(url: &str, start_s: f64, title: &str, opts: &MpvOpts) -> Command {
     let mut c = Command::new("mpv");
     c.args([
         "--fs", "--vo=gpu", "--gpu-context=wayland", "--profile=fast",
@@ -45,6 +63,18 @@ fn mpv_command(url: &str, start_s: f64, title: &str) -> Command {
     c.arg(format!("--force-media-title={title}"));
     if start_s > 0.0 {
         c.arg(format!("--start={start_s:.1}"));
+    }
+    if opts.sub_scale != 1.0 {
+        c.arg(format!("--sub-scale={:.2}", opts.sub_scale));
+    }
+    if opts.passthrough {
+        c.arg("--audio-spdif=ac3,eac3,dts,dts-hd,truehd");
+    }
+    if let Some(a) = &opts.aid {
+        c.arg(format!("--aid={a}"));
+    }
+    if let Some(s) = &opts.sid {
+        c.arg(format!("--sid={s}"));
     }
     c.arg(url);
     c
@@ -608,7 +638,40 @@ struct Plan {
     note: String,
 }
 
-fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
+/// What to do with a file: play it as is, or have the server convert it.
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Direct,
+    Convert { target: i64, max_height: i32 },
+}
+
+/// The link's budget, lowered by the user's limits (global or per network).
+fn decide(source_bitrate: i64, source_height: Option<i32>, link: u64, lim: &settings::Playback) -> Decision {
+    let (mut direct_max, mut target) = bitrate_budget(link);
+    if lim.max_bitrate > 0 {
+        direct_max = direct_max.min(lim.max_bitrate);
+        target = target.min(lim.max_bitrate);
+    }
+    let target = target.clamp(1_500_000, MAX_TRANSCODE_BITRATE);
+    if lim.prefer_original && source_bitrate <= direct_max && source_height.is_none_or(|h| h <= lim.max_height) {
+        Decision::Direct
+    } else {
+        Decision::Convert { target, max_height: lim.max_height }
+    }
+}
+
+/// Widest picture for a height cap.
+fn width_for_height(h: i32) -> i32 {
+    match h {
+        2160.. => 3840,
+        1080..=2159 => 1920,
+        720..=1079 => 1280,
+        _ => 854,
+    }
+}
+
+
+fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
     let server = auth.server.trim_end_matches('/');
     let token = &auth.token;
     let ms = it.media_sources.first();
@@ -617,9 +680,11 @@ fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
     let name = |s: &jellyfin::MediaStream| s.display_title.clone().or(s.title.clone()).unwrap_or_else(|| format!("Track {}", s.index));
     let sub_url = |s: &jellyfin::MediaStream| format!("{server}/Videos/{}/{msid}/Subtitles/{}/0/Stream.srt?ApiKey={token}", it.id, s.index);
     let bitrate = ms.and_then(|m| m.bitrate).unwrap_or(0);
-    let (direct_max, target) = bitrate_budget(link);
-    eprintln!("PLAN id={} source_bitrate={bitrate} link={link} direct_max={direct_max} target={target}", it.id);
-    if bitrate <= direct_max {
+    let height = streams.iter().find(|s| s.kind == "Video").and_then(|s| s.height);
+    let (link_direct_max, link_target) = bitrate_budget(link);
+    let decision = decide(bitrate, height, link, lim);
+    eprintln!("PLAN id={} source_bitrate={bitrate} height={height:?} link={link} direct_max={link_direct_max} target={link_target} limits={lim:?} -> {decision:?}", it.id);
+    let Decision::Convert { target, max_height } = decision else {
         // direct play: internal tracks in file order, then external text subs
         let audio_names = streams.iter().filter(|s| s.kind == "Audio" && !s.is_external).map(|s| name(s)).collect();
         let mut sub_names: Vec<String> = streams.iter().filter(|s| s.kind == "Subtitle" && !s.is_external).map(|s| name(s)).collect();
@@ -633,7 +698,7 @@ fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
             sub_names,
             note: String::new(),
         };
-    }
+    };
     // converted by the server (hardware encoder on the server side), HLS so seeking works
     let session = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
     let audio = streams.iter().find(|s| s.kind == "Audio" && s.is_default).or(streams.iter().find(|s| s.kind == "Audio"));
@@ -642,9 +707,10 @@ fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
     // (sharper than a starved 1080p)
     let audio_br: i64 = if target < 6_000_000 { 256_000 } else { 384_000 };
     let video_br = (target - audio_br).max(1_200_000);
-    let width = if video_br < 3_500_000 { 1280 } else { 1920 };
-    eprintln!("TRANSCODE id={} video={video_br} audio={audio_br} width={width}", it.id);
-    let note = if target < MAX_TRANSCODE_BITRATE || bitrate <= MAX_DIRECT_BITRATE {
+    let width = (if video_br < 3_500_000 { 1280 } else { 1920 }).min(width_for_height(max_height));
+    eprintln!("TRANSCODE id={} video={video_br} audio={audio_br} width={width} max_height={max_height}", it.id);
+    // only the link is named: no note when just the user's limits caused the conversion
+    let note = if bitrate > link_direct_max && (link_target < MAX_TRANSCODE_BITRATE || bitrate <= MAX_DIRECT_BITRATE) {
         format!("lower quality for this connection (≈{} Mbit/s)", (link + 500_000) / 1_000_000)
     } else {
         String::new()
@@ -653,7 +719,7 @@ fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
         url: format!(
             "{server}/Videos/{}/master.m3u8?MediaSourceId={msid}&DeviceId={}&PlaySessionId={session}&ApiKey={token}\
              &VideoCodec=h264&AudioCodec=aac&VideoBitrate={video_br}&AudioBitrate={audio_br}&MaxAudioChannels=6\
-             &TranscodingMaxAudioChannels=6&MaxWidth={width}&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
+             &TranscodingMaxAudioChannels=6&MaxWidth={width}&MaxHeight={max_height}&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
             it.id, auth.device_id,
             audio.map(|a| format!("&AudioStreamIndex={}", a.index)).unwrap_or_default()
         ),
@@ -1272,12 +1338,22 @@ fn main() {
 
     // ---- Wi-Fi screen: watch the callback's state file once per second ----------
     let wifi_timer = slint::Timer::default();
+    let player: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
     {
         let weak = app.as_weak();
         let load_home = load_home.clone();
+        let player = player.clone();
+        let auth = auth.clone();
         let mut qr_cache: Option<(String, slint::Image)> = None;
         wifi_timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
             let Some(app) = weak.upgrade() else { return };
+            // the server address was changed (phone or TV): restart into the new one
+            // (the daemon has already rewritten auth.json)
+            let url = settings::current().system.jellyfin_url.clone();
+            if !url.is_empty() && url.trim_end_matches('/') != auth.server.trim_end_matches('/') && player.borrow().is_none() {
+                eprintln!("SERVER address changed: restarting");
+                profiles::restart(&["--user", &auth.user_id]);
+            }
             let Ok(text) = std::fs::read_to_string(WIFI_FILE) else { return };
             let Ok(w) = serde_json::from_str::<WifiState>(&text) else { return };
             if apply_wifi(&app, &w, &mut qr_cache) {
@@ -1338,7 +1414,6 @@ fn main() {
 
     // ---- open an item: series pages, or hand playback off to mpv -------------------
     // `play` = true plays episodes directly; false opens an episode's series page.
-    let player: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
     let poll = Rc::new(slint::Timer::default());
     let start_gen = Rc::new(std::cell::Cell::new(0u64)); // one per Play, for the "slow" hint
     let open_item: Rc<dyn Fn(Item, bool)> = {
@@ -1464,7 +1539,8 @@ fn main() {
                 });
                 return;
             }
-            let plan = plan(&auth, &it, link_bps().unwrap_or(0));
+            let lim = settings::effective(&settings::current(), settings::current_ssid().as_deref());
+            let plan = plan(&auth, &it, link_bps().unwrap_or(0), &lim);
             if let Some(a) = weak.upgrade() {
                 a.set_starting_note(plan.note.clone().into());
             }
@@ -1481,7 +1557,7 @@ fn main() {
                 "names": { "audio": plan.audio_names, "sub": plan.sub_names },
             });
             let _ = std::fs::write(NOW_FILE, now.to_string());
-            match mpv_command(&plan.url, start, &title).spawn() {
+            match mpv_command(&plan.url, start, &title, &MpvOpts::from_settings()).spawn() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
                     *player.borrow_mut() = Some(child);
@@ -1801,18 +1877,61 @@ mod tests {
     #[test]
     fn weak_link_converts_to_a_stream_it_can_carry() {
         // the LOTR case: 10 Mbit/s conversion on a ~7 Mbit/s Wi-Fi froze every 10-20 s
-        let p = plan(&auth(), &item(30_000_000), 7_400_000);
+        let p = plan(&auth(), &item(30_000_000), 7_400_000, &none());
         assert!(p.url.contains("master.m3u8") && p.url.contains("VideoBitrate=4184000") && p.url.contains("MaxWidth=1920"), "{}", p.url);
         assert!(!p.note.is_empty());
         // very weak: 720p
-        let p = plan(&auth(), &item(30_000_000), 4_000_000);
+        let p = plan(&auth(), &item(30_000_000), 4_000_000, &none());
         assert!(p.url.contains("VideoBitrate=2144000") && p.url.contains("MaxWidth=1280"), "{}", p.url);
         // a light file still plays directly; one too heavy for this link is converted
-        assert!(plan(&auth(), &item(5_000_000), 7_400_000).url.contains("static=true"));
-        assert!(plan(&auth(), &item(7_000_000), 7_400_000).url.contains("master.m3u8"));
+        assert!(plan(&auth(), &item(5_000_000), 7_400_000, &none()).url.contains("static=true"));
+        assert!(plan(&auth(), &item(7_000_000), 7_400_000, &none()).url.contains("master.m3u8"));
         // unknown link: the old rule (direct up to 16 Mbit/s, else 10 Mbit/s, no note)
-        assert!(plan(&auth(), &item(12_000_000), 0).url.contains("static=true"));
-        let p = plan(&auth(), &item(30_000_000), 0);
+        assert!(plan(&auth(), &item(12_000_000), 0, &none()).url.contains("static=true"));
+        let p = plan(&auth(), &item(30_000_000), 0, &none());
         assert!(p.url.contains("VideoBitrate=9616000") && p.note.is_empty(), "{}", p.url);
     }
+
+    fn none() -> settings::Playback {
+        settings::Playback::default()
+    }
+
+    #[test]
+    fn decide_applies_the_users_limits() {
+        let lim = |max_bitrate, max_height, prefer_original| settings::Playback { max_bitrate, max_height, hdr: false, prefer_original };
+        // a 6 Mbit/s cap on a fast link converts an 8 Mbit/s file at 6 Mbit/s
+        assert_eq!(decide(8_000_000, None, 50_000_000, &lim(6_000_000, 1080, true)), Decision::Convert { target: 6_000_000, max_height: 1080 });
+        // a 2160p file under a 1080 cap is converted, however light
+        assert_eq!(decide(5_000_000, Some(2160), 0, &lim(0, 1080, true)), Decision::Convert { target: MAX_TRANSCODE_BITRATE, max_height: 1080 });
+        assert_eq!(decide(5_000_000, Some(1080), 0, &lim(0, 1080, true)), Decision::Direct);
+        // prefer original off: even a 2 Mbit/s file is converted
+        assert!(matches!(decide(2_000_000, None, 0, &lim(0, 1080, false)), Decision::Convert { .. }));
+        // no limits: the link-only rules, as in weak_link_converts_to_a_stream_it_can_carry
+        assert_eq!(decide(30_000_000, None, 7_400_000, &none()), Decision::Convert { target: 4_440_000, max_height: 1080 });
+        assert_eq!(decide(5_000_000, None, 7_400_000, &none()), Decision::Direct);
+        assert_eq!(decide(7_000_000, None, 7_400_000, &none()), Decision::Convert { target: 4_440_000, max_height: 1080 });
+        assert_eq!(decide(12_000_000, None, 0, &none()), Decision::Direct);
+    }
+
+    #[test]
+    fn plan_caps_the_converted_picture_to_max_height() {
+        let lim = settings::Playback { max_height: 720, ..none() };
+        let p = plan(&auth(), &item(30_000_000), 0, &lim);
+        assert!(p.url.contains("MaxHeight=720&") && p.url.contains("MaxWidth=1280"), "{}", p.url);
+        // only the user's cap caused this: no "lower quality for this connection" note
+        assert!(p.note.is_empty());
+        assert_eq!([2160, 1080, 720, 480].map(width_for_height), [3840, 1920, 1280, 854]);
+    }
+
+    #[test]
+    fn mpv_gets_subtitle_scale_and_passthrough_only_when_set() {
+        let args = |o: &MpvOpts| mpv_command("http://x/v", 0.0, "t", o).get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let plain = args(&MpvOpts { sub_scale: 1.0, passthrough: false, aid: None, sid: None });
+        assert!(!plain.iter().any(|a| a.starts_with("--sub-scale") || a.starts_with("--audio-spdif")), "{plain:?}");
+        let set = args(&MpvOpts { sub_scale: 1.25, passthrough: true, aid: Some("2".into()), sid: Some("3".into()) });
+        for want in ["--sub-scale=1.25", "--audio-spdif=ac3,eac3,dts,dts-hd,truehd", "--aid=2", "--sid=3"] {
+            assert!(set.iter().any(|a| a == want), "{want} missing in {set:?}");
+        }
+    }
+
 }

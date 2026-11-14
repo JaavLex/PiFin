@@ -23,6 +23,7 @@ pub struct MediaStream {
     pub is_default: bool,
     pub is_text_subtitle_stream: bool,
     pub title: Option<String>,
+    pub height: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
