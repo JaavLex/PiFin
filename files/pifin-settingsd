@@ -11,6 +11,7 @@ No shell anywhere: every system command goes through RUN (an argument list with 
 timeout), which the tests replace. Every path is under PIFIN_ROOT (tests only).
 Never log a PIN, a password, a key or a token.
 """
+import configparser
 import copy
 import grp
 import hashlib
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 SETTINGS = "/var/lib/pifin/settings.json"
 SECRETS = "/var/lib/pifin/secrets.json"
@@ -89,6 +91,7 @@ def spawn(fn):
 
 
 SPAWN = spawn
+IDLE_POLL = 3600  # seconds; see main()
 
 
 def tailscale_present():
@@ -114,7 +117,8 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 
 URL_MSG = "The Jellyfin address must look like http://host:8096."
 SSID_MSG = "A Wi-Fi name must be 1 to 32 bytes, without control characters."
-PSK_MSG = "The hotspot password must be 8 to 63 plain characters (letters, digits, symbols, spaces)."
+PSK_MSG = ("The hotspot password must be 8 to 63 plain characters (letters, digits, symbols, "
+           "spaces), without spaces at either end.")
 PIN_MSG = "The PIN must be 4 to 8 digits."
 
 
@@ -143,7 +147,7 @@ def check_ssid(v):
 
 
 def is_hotspot_ssid(v):
-    # written unquoted as `ap_name: <v>`: comitup would strip edge spaces and quotes
+    # written unquoted as `ap_name: <v>`: comitup's configparser strips edge spaces
     return is_ssid(v) and v == v.strip() and v[0] not in "'\"#"
 
 
@@ -154,7 +158,13 @@ def check_hotspot_ssid(v):
 
 
 def is_url(v):
-    return isinstance(v, str) and bool(URL_RE.match(v))
+    if not (isinstance(v, str) and URL_RE.match(v)):
+        return False
+    try:
+        port = urllib.parse.urlsplit(v).port  # ValueError above 65535
+    except ValueError:
+        return False
+    return port is None or port >= 1
 
 
 def check_url_or_empty(v):
@@ -167,8 +177,13 @@ def is_psk(v):
     return isinstance(v, str) and 8 <= len(v) <= 63 and all(0x20 <= ord(c) <= 0x7E for c in v)
 
 
+def is_hotspot_psk(v):
+    # written unquoted as `ap_password: <v>`: comitup's configparser strips edge spaces
+    return is_psk(v) and v == v.strip()
+
+
 def check_psk(v):
-    if not is_psk(v):
+    if not is_hotspot_psk(v):
         raise Invalid("invalid_value", PSK_MSG)
 
 
@@ -359,22 +374,21 @@ def parse_env(path):
     return env
 
 
-def unquote_comitup(v):
-    v = v.strip()
-    if len(v) >= 2 and v[0] == v[-1] == "'":
-        return v[1:-1].replace("''", "'")
-    if len(v) >= 2 and v[0] == v[-1] == '"':
-        return v[1:-1]
-    return v
+def comitup_value(v):
+    """comitup reads its file with a plain configparser.ConfigParser: no unquoting,
+    BasicInterpolation. So values go in bare, with `%` doubled."""
+    return v.replace("%", "%%")
 
 
 def parse_comitup(path):
-    conf = {}
-    for line in (read_text(path) or "").splitlines():
-        key, sep, value = line.partition(":")
-        if sep and key.strip() and not key.lstrip().startswith("#"):
-            conf[key.strip()] = unquote_comitup(value)
-    return conf
+    """Read comitup.conf the way comitup does (configparser), so migration sees the
+    password comitup really uses. An unreadable file reads as empty."""
+    cp = configparser.ConfigParser()
+    try:
+        cp.read_string("[DEFAULT]\n" + (read_text(path) or ""))
+        return dict(cp["DEFAULT"])
+    except configparser.Error:
+        return {}
 
 
 def sh_quote(value):
@@ -460,7 +474,7 @@ def first(candidates, ok, default):
 def legacy_psk(env=None, com=None):
     env = parse_env(P(SECRETS_ENV)) if env is None else env
     com = parse_comitup(P(COMITUP_CONF)) if com is None else com
-    return first([env.get("HOTSPOT_PASS"), com.get("ap_password")], is_psk, "")
+    return first([env.get("HOTSPOT_PASS"), com.get("ap_password")], is_hotspot_psk, "")
 
 
 def migrate():
@@ -688,10 +702,10 @@ def sync_hotspot(psk=None, ssid=None):
     env, com = {}, {}
     if psk is not None:
         env["HOTSPOT_PASS"] = psk
-        com["ap_password"] = "'" + psk.replace("'", "''") + "'"
+        com["ap_password"] = comitup_value(psk)
     if ssid is not None:
         env["HOTSPOT_SSID"] = ssid
-        com["ap_name"] = ssid
+        com["ap_name"] = comitup_value(ssid)
     set_env_lines(P(SECRETS_ENV), env, 0o600)
     set_comitup_lines(P(COMITUP_CONF), com)
     _, out = RUN(["busctl", "call", "--system", "com.github.davesteele.comitup",
@@ -1117,6 +1131,7 @@ def remove_auth_json():
 
 
 def factory_reset_now():
+    SLEEP(1)  # let the reply reach the caller before anything goes away
     with LOCK:
         try:
             for p in wifi_profiles():
@@ -1296,7 +1311,9 @@ def main():
     init()
     server = make_server()
     log("listening")
-    server.serve_forever()
+    # Requests wake the selector; the poll interval only bounds how fast shutdown() is
+    # noticed, and nothing calls it. The default 0.5 s woke the idle daemon twice a second.
+    server.serve_forever(poll_interval=IDLE_POLL)
 
 
 if __name__ == "__main__":

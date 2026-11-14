@@ -29,7 +29,7 @@ echo "== A: full pifin.env =="
 cat > "$D/pifin.env" <<EOF
 PIFIN_PASS=selftest-password
 JELLYFIN_URL=http://jellyfin.example:8096
-HOTSPOT_PASS=hot spot \$ 'pass'
+HOTSPOT_PASS=hot spot \$ 'pass' 100%
 TS_AUTHKEY=tskey-selftest-abc
 WIFI_SSID=Example-Cafe
 WIFI_PSK=psk with space
@@ -69,7 +69,7 @@ env = {}
 for line in dev.splitlines():
     k, _, v = line.partition("=")
     env[k] = shlex.split(v)[0]
-eq("hotspot pass survives quoting", env["HOTSPOT_PASS"], "hot spot $ 'pass'")
+eq("hotspot pass survives quoting", env["HOTSPOT_PASS"], "hot spot $ 'pass' 100%")
 eq("wifi psk survives quoting", env["WIFI_PSK"], "psk with space")
 eq("device user", env["PIFIN_USER"], "testuser")
 eq("device hostname", env["PIFIN_HOSTNAME"], "testhub")
@@ -87,7 +87,19 @@ eq("home wifi", wlan["access-points"], {"Example-Cafe": {"password": "psk with s
 (D / "device.env").write_text(dev)
 got = subprocess.run(["bash", "-c", '. "$1"; printf %s "$HOTSPOT_PASS"', "_", str(D / "device.env")],
                      capture_output=True, text=True).stdout
-eq("device env survives 'source'", got, "hot spot $ 'pass'")
+eq("device env survives 'source'", got, "hot spot $ 'pass' 100%")
+# pifin-setup.sh's comitup.conf, read back with comitup's own parser (configparser)
+setup = pathlib.Path("files/pifin-setup.sh").read_text()
+start = setup.index("AP_NAME=")
+end = setup.index("\nEOF\n", start) + 5
+script = setup[start:end].replace("/etc/comitup.conf", '"$2"')
+subprocess.run(["bash", "-c", '. "$1"; ' + script, "_", str(D / "device.env"), str(D / "comitup.conf")],
+               check=True)
+import configparser
+cp = configparser.ConfigParser()
+cp.read_string("[DEFAULT]\n" + (D / "comitup.conf").read_text())
+eq("comitup reads the hotspot pass", cp["DEFAULT"]["ap_password"], "hot spot $ 'pass' 100%")
+eq("comitup reads the hotspot name", cp["DEFAULT"]["ap_name"], "PiFin-setup")
 txt = (D / "bootfs/config.txt").read_text()
 eq("HDMI hotplug appended", txt.count("# --- PiFin ---"), 1)
 eq("audio moved to HDMI", "dtparam=audio=off" in txt, True)
@@ -155,7 +167,8 @@ for case in 'no password: JELLYFIN_URL=http://x\nHOTSPOT_PASS=y' \
             'plaintext in the hash field: PIFIN_PASS_HASH=hunter2hunter2\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=y' \
             'bad name: PIFIN_PASS=pwlongenough\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=y\nPIFIN_USER=Test User' \
             'psk without ssid: PIFIN_PASS=pwlongenough\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=y\nWIFI_PSK=abc' \
-            'missing key file: PIFIN_PASS=pwlongenough\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=y\nSSH_PUBKEY=/nonexistent/nope.pub'; do
+            'missing key file: PIFIN_PASS=pwlongenough\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=y\nSSH_PUBKEY=/nonexistent/nope.pub' \
+            'hotspot pass edge space: PIFIN_PASS=pwlongenough\nJELLYFIN_URL=http://x\nHOTSPOT_PASS=" hotspotpass"'; do
   label="${case%%:*}"; body="${case#*: }"
   printf "$body\n" > "$D/bad.env"
   if python3 build.py --env "$D/bad.env" "$D/bare" >/dev/null 2>&1; then

@@ -2,6 +2,7 @@
 """Tests for files/pifin-settingsd. No Pi, no root: every path is under a temp
 PIFIN_ROOT and every system command goes to a fake runner.
 Run: python3 tools/test_settingsd.py"""
+import configparser
 import glob
 import importlib.machinery
 import importlib.util
@@ -44,7 +45,7 @@ class Base(unittest.TestCase):
                    f"PIFIN_USER='{USER}'\nWIFI_COUNTRY='DE'\nHOTSPOT_PASS='{OLD_PASS}'\n"
                    "JELLYFIN_URL='http://other.example:8096'\nTS_AUTHKEY='tskey-test-abc'\n")
         self.write("/etc/comitup.conf",
-                   f"ap_name: Test-Hotspot\nap_password: '{OLD_PASS}'\nweb_service:\n"
+                   f"ap_name: Test-Hotspot\nap_password: {OLD_PASS}\nweb_service:\n"
                    "enable_appliance_mode: false\n"
                    "external_callback: /usr/local/bin/pifin-comitup-callback\n"
                    "primary_wifi_device: wlan1\n")
@@ -98,6 +99,13 @@ class Base(unittest.TestCase):
         return r
 
 
+def comitup_reads(conf):
+    """comitup's own parser (comitup/config.py): a plain ConfigParser, no unquoting."""
+    cp = configparser.ConfigParser()
+    cp.read_string("[DEFAULT]\n" + conf)
+    return dict(cp["DEFAULT"])
+
+
 class T01Migration(Base):
     def test_migration_fills_every_field(self):
         s = self.settings()
@@ -146,6 +154,11 @@ class T03Validation(Base):
         self.err({"op": "set", "changes": {"secrets.hotspot_pass": "short"}}, "invalid_value")
         for name in (" Spot", "Spot ", "'Spot", "#Spot"):  # unquoted ap_name would change
             self.err({"op": "set", "changes": {"system.hotspot_ssid": name}}, "invalid_value")
+        for pw in (" password", "password "):  # configparser strips edge spaces
+            self.err({"op": "set", "changes": {"secrets.hotspot_pass": pw}}, "invalid_value")
+        for url in ("http://a.example:99999", "http://a.example:65536", "http://a.example:0"):
+            self.err({"op": "set", "changes": {"system.jellyfin_url": url}}, "invalid_value")
+        self.ok({"op": "set", "changes": {"system.jellyfin_url": "http://a.example:65535"}})
         self.err({"op": "nope"}, "bad_request")
         self.assertEqual(sd.handle_line(b"not json\n")["error"], "bad_request")
 
@@ -219,7 +232,7 @@ class T08Hotspot(Base):
                               capture_output=True, text=True).stdout
 
     def test_hotspot_pass_and_ssid(self):
-        pw = "it's a $pass"
+        pw = "it's 100% a $pass"
         inode = os.stat(self.path("/etc/comitup.conf")).st_ino
         self.ok({"op": "set", "changes": {"secrets.hotspot_pass": pw}})
         self.assertEqual(self.secrets()["hotspot_pass"], pw)
@@ -233,15 +246,19 @@ class T08Hotspot(Base):
         self.assertIn("primary_wifi_device: wlan1\n", conf)
         # edited in place: the unit only lets the daemon write that one file in /etc
         self.assertEqual(os.stat(self.path("/etc/comitup.conf")).st_ino, inode)
-        self.assertIn("ap_password: 'it''s a $pass'\n", conf)
+        self.assertIn("ap_password: it's 100%% a $pass\n", conf)
+        self.assertEqual(comitup_reads(conf)["ap_password"], pw)  # what comitup itself sees
         self.assertEqual(sd.parse_comitup(self.path("/etc/comitup.conf"))["ap_password"], pw)
         self.assertNotIn(["systemctl", "restart", "comitup"], self.calls)  # not in HOTSPOT
 
         self.comitup_state = 'ss "HOTSPOT" "Test-Hotspot"\n'
-        self.ok({"op": "set", "changes": {"system.hotspot_ssid": "New Spot"}})
-        self.assertEqual(self.source("HOTSPOT_SSID"), "New Spot")
+        self.ok({"op": "set", "changes": {"system.hotspot_ssid": "New 50% Spot"}})
+        self.assertEqual(self.source("HOTSPOT_SSID"), "New 50% Spot")
         self.assertEqual(self.source("HOTSPOT_PASS"), pw)
-        self.assertIn("ap_name: New Spot\n", self.read("/etc/comitup.conf"))
+        conf = self.read("/etc/comitup.conf")
+        self.assertIn("ap_name: New 50%% Spot\n", conf)
+        self.assertEqual(comitup_reads(conf)["ap_name"], "New 50% Spot")
+        self.assertEqual(comitup_reads(conf)["ap_password"], pw)
         self.assertIn(["systemctl", "restart", "comitup"], self.calls)
 
 
@@ -374,14 +391,14 @@ class T14MigrationFallbacks(Base):
     def test_second_and_third_sources(self):
         os.unlink(self.path("/etc/pifin/app.conf"))
         self.write("/etc/pifin/display.conf", "MAX_HEIGHT=480\n")
-        self.write("/etc/comitup.conf", "ap_password: 'it''s comitup'\nprimary_wifi_device: wlan1\n")
+        self.write("/etc/comitup.conf", "ap_password: it's 100%% comitup\nprimary_wifi_device: wlan1\n")
         self.write("/etc/pifin/secrets.env", f"PIFIN_USER='{USER}'\nHOTSPOT_SSID='Env-Spot'\n"
                    "JELLYFIN_URL='http://other.example:8096'\n")
         s, sec = self.remigrate()
         self.assertEqual(s["system"]["jellyfin_url"], "http://other.example:8096")
         self.assertEqual(s["system"]["hotspot_ssid"], "Env-Spot")
         self.assertEqual(s["display"]["output_max_height"], 1080)
-        self.assertEqual(sec["hotspot_pass"], "it's comitup")
+        self.assertEqual(sec["hotspot_pass"], "it's 100% comitup")
         self.write("/etc/pifin/secrets.env", f"PIFIN_USER='{USER}'\n")
         s, _ = self.remigrate()
         self.assertEqual(s["system"]["jellyfin_url"], "http://old.example:8096")  # auth.json
@@ -622,8 +639,10 @@ class T23Reboot(FixtureBase):
         self.err({"op": "factory_reset"}, "pin_required")
         self.assertEqual(self.joins, [])
         self.calls.clear()
+        sd.SLEEP = lambda s: self.calls.append(["sleep", s])
         self.assertIsNone(self.ok({"op": "factory_reset", "pin": "1234"}))
         self.join()
+        self.assertEqual(self.calls[0], ["sleep", 1])  # the reply goes out before the reset
         for f in ("settings.json", "secrets.json", "pair-token"):
             self.assertFalse(os.path.exists(self.path(f"/var/lib/pifin/{f}")), f)
         self.assertFalse(os.path.exists(self.path(f"/home/{USER}/.config/pifin/auth.json")))
@@ -639,6 +658,19 @@ class T23Reboot(FixtureBase):
         self.join()
         self.assertTrue(os.path.exists(d + "-real/auth.json"))
         self.assertEqual(self.calls[-1], ["systemctl", "reboot"])
+
+
+class T25IdlePoll(unittest.TestCase):
+    def test_daemon_does_not_wake_when_idle(self):
+        server = mock.Mock()
+        with mock.patch.object(sd, "init"), mock.patch.object(sd, "make_server", return_value=server), \
+                mock.patch.object(sd, "log"), mock.patch.object(sys, "argv", ["pifin-settingsd"]):
+            old = os.umask(0o022)
+            try:
+                sd.main()
+            finally:
+                os.umask(old)
+        self.assertGreaterEqual(server.serve_forever.call_args.kwargs.get("poll_interval", 0.5), 600)
 
 
 class T24Demo(unittest.TestCase):

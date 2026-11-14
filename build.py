@@ -125,6 +125,9 @@ def load_config(explicit):
     for key in ("PIFIN_HOSTNAME", "PIFIN_USER"):
         if not NAME_RE.match(cfg[key]):
             sys.exit(f"{key} must be a lower-case name: letters, digits, '-', max 63 chars")
+    for key in ("HOTSPOT_PASS", "HOTSPOT_SSID"):
+        if cfg[key] != cfg[key].strip():  # comitup's configparser would drop them
+            sys.exit(f"{key} must not start or end with a space")
     if cfg.get("WIFI_PSK") and not cfg.get("WIFI_SSID"):
         sys.exit("WIFI_PSK is set but WIFI_SSID is not")
     if not cfg["MAX_HEIGHT"].isdigit():

@@ -91,9 +91,13 @@ mkdir -p "$USER_HOME/.config/pifin"
 chown -R "$USER_NAME:$USER_NAME" "$USER_HOME"
 
 step "Comitup config (Wi-Fi setup hotspot)"
+# comitup reads this file with Python's configparser: values are taken as written (no
+# quotes), and `%` must be doubled
+AP_NAME=${HOTSPOT_SSID:-PiFin-setup}; AP_NAME=${AP_NAME//\%/%%}
+AP_PASS=${HOTSPOT_PASS//\%/%%}
 cat > /etc/comitup.conf <<EOF
-ap_name: ${HOTSPOT_SSID:-PiFin-setup}
-ap_password: '${HOTSPOT_PASS}'
+ap_name: ${AP_NAME}
+ap_password: ${AP_PASS}
 web_service:
 enable_appliance_mode: false
 external_callback: /usr/local/bin/pifin-comitup-callback
