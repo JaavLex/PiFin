@@ -70,14 +70,57 @@
   .modal h2 { margin: 0; font-size: 17px; }
   .modal input { max-width: none; font-size: 20px; letter-spacing: 4px; text-align: center; }
   .modal .line { justify-content: flex-end; }
+  .wiz { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 16px;
+         display: flex; flex-direction: column; gap: 10px; }
+  .wiz h2 { margin: 0; font-size: 18px; }
+  .wiz p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.4; }
+  .wiz input { max-width: none; width: 100%; }
+  .wiz .line { justify-content: flex-end; }
+  .wiz .err { color: var(--bad); font-size: 13px; min-height: 1em; }
+  .wiz .ok { color: #6bd68a; font-size: 13px; }
+  .wiz .steps { color: var(--muted); font-size: 12px; letter-spacing: .5px; text-transform: uppercase; }
 </style>
 </head>
 <body>
 <div class="app">
   <header>
     <a href="/" aria-label="Back to the remote"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
-    <h1>Settings</h1>
+    <h1 id="title">Settings</h1>
   </header>
+
+  <!-- first setup (fresh image: no Jellyfin server yet); hidden once it is done -->
+  <section class="wiz hide" id="wiz">
+    <div class="steps" id="wizSteps"></div>
+    <div data-step="server" id="w-server">
+      <h2>Welcome to PiFin</h2>
+      <p>Your Jellyfin server's address, as you open it in a browser.</p>
+      <div class="line"><input id="wUrl" type="url" inputmode="url" autocomplete="off" placeholder="http://host:8096"></div>
+      <div class="line"><button id="wTest">Test</button></div>
+      <div id="wTestOk" class="ok"></div>
+    </div>
+    <div data-step="tailscale" id="w-tailscale">
+      <h2>Tailscale (optional)</h2>
+      <p>To reach your server from anywhere: paste an auth key from the Tailscale admin console. Skip if your server is on this network.</p>
+      <div class="line"><input id="wTs" type="password" autocomplete="off" placeholder="tskey-..."></div>
+    </div>
+    <div data-step="hotspot" id="w-hotspot">
+      <h2>Setup hotspot password</h2>
+      <p>When no known Wi-Fi is around, PiFin opens its setup hotspot so a phone can pick a network. Choose its password (8 to 63 characters), or leave it empty to keep the one the TV shows.</p>
+      <div class="line"><input id="wHp" type="password" autocomplete="new-password" maxlength="63" placeholder="8 to 63 characters"></div>
+    </div>
+    <div data-step="pin" id="w-pin">
+      <h2>PIN (optional)</h2>
+      <p>A PIN protects the server address, Tailscale, the hotspot password and factory reset. Leave empty for none.</p>
+      <div class="line"><input id="wPin1" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="New PIN">
+        <input id="wPin2" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="Repeat"></div>
+    </div>
+    <div data-step="done" id="w-done">
+      <h2>Almost there</h2>
+      <p>Now sign in on the TV: it shows a Quick Connect code. In the Jellyfin app on this phone, open Settings &gt; Quick Connect and enter the code.</p>
+    </div>
+    <div class="err" id="wErr"></div>
+    <div class="line"><button id="wBack">Back</button><button class="go" id="wNext">Next</button></div>
+  </section>
 
   <details id="secNet">
     <summary>Network</summary>
@@ -142,6 +185,7 @@
       <div class="row" id="aTsRow"><span class="lbl">Tailscale address</span><span class="val" id="aTs"></span></div>
       <div class="row"><span class="lbl">MAC (built-in)</span><span class="val" id="aMac">—</span></div>
       <div class="row" id="aUsbRow"><span class="lbl">MAC (USB)</span><span class="val" id="aUsb"></span></div>
+      <div class="row"><span class="lbl">Updates<small id="updNote"></small></span><button id="updBtn">Check</button></div>
       <div class="row"><span class="lbl">Restart PiFin</span><button id="rebootBtn">Restart</button></div>
       <div class="row"><span class="lbl sens">Factory reset</span><button id="resetBtn" class="danger">Reset</button></div>
     </div>
@@ -169,6 +213,40 @@ const OPTS = {
 };
 const PIN_MSG = { pin_wrong: "Wrong PIN.", locked_out: "Too many wrong PINs. Try again in a minute." };
 let S = null;            // last "get" result: {settings, status}
+
+// ---- wizard logic (pure; tools/test_wizard.mjs runs it) ----
+const WIZ_STEPS = ["server", "tailscale", "hotspot", "pin", "done"];
+const URL_RE = /^https?:\/\/[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?(\/[A-Za-z0-9._~\-\/]*)?$/;
+// the wizard shows on a fresh PiFin (no server address) and stays until its last step
+function wizVisible(settings, step) {
+  return step === "done" || (!!settings && !settings.system.jellyfin_url);
+}
+// "" when the step's input is fine, else the message to show
+function wizCheck(step, d) {
+  if (step === "server" && !URL_RE.test((d.url || "").trim())) return "The address must look like http://host:8096.";
+  if (step === "tailscale" && d.tsKey && !/^tskey-[A-Za-z0-9-]{10,200}$/.test(d.tsKey.trim()))
+    return "That doesn't look like a Tailscale auth key (tskey-...).";
+  if (step === "hotspot" && d.hotspot && (d.hotspot.length < 8 || d.hotspot.length > 63))
+    return "The hotspot password needs 8 to 63 characters.";
+  if (step === "pin" && (d.pin || d.pin2)) {
+    if (!/^[0-9]{4,8}$/.test(d.pin || "")) return "The PIN has 4 to 8 digits.";
+    if (d.pin !== d.pin2) return "The PINs don't match.";
+  }
+  return "";
+}
+function wizNext(step, d) {
+  const error = wizCheck(step, d);
+  if (error) return { step, error };
+  return { step: WIZ_STEPS[Math.min(WIZ_STEPS.indexOf(step) + 1, WIZ_STEPS.length - 1)], error: "" };
+}
+function wizBack(step) { return WIZ_STEPS[Math.max(WIZ_STEPS.indexOf(step) - 1, 0)]; }
+// what Finish sends: one "set" (server, and the hotspot password when given), then the PIN
+function wizFinal(d) {
+  const changes = { "system.jellyfin_url": d.url.trim() };
+  if (d.hotspot) changes["secrets.hotspot_pass"] = d.hotspot;
+  return { changes, pin: d.pin || null };
+}
+// ---- end wizard logic ----
 let toastTimer = 0;
 
 function toast(text) {
@@ -287,7 +365,7 @@ function render() {
 
 async function refresh() {
   const r = await op("get");
-  if (r && r.settings) { S = r; render(); }
+  if (r && r.settings) { S = r; render(); wizRender(); }
 }
 
 async function set(changes, sensitive = false) {
@@ -444,6 +522,66 @@ $("rebootBtn").onclick = async () => {
 $("resetBtn").onclick = async () => {
   if (!confirm("Factory reset?\nRemoves all settings, sign-ins and saved Wi-Fi networks, then restarts.")) return;
   if (await guarded("factory_reset", {}) !== null) toast("Resetting…");
+};
+
+// ---- Updates (D9: manual, never during playback) ----
+$("updBtn").onclick = async () => {
+  $("updNote").textContent = "Checking…";
+  const u = await op("update_check");
+  $("updNote").textContent = "";
+  if (!u) return;
+  if (!u.available) { $("updNote").textContent = `Up to date (${u.current})`; return; }
+  $("updNote").textContent = `PiFin ${u.latest} available`;
+  if (!confirm(`Install PiFin ${u.latest}?\nYou have ${u.current || "an older version"}. PiFin restarts when it is done (a minute or two). Not while a video plays.`)) return;
+  if (await op("update_install") !== null) toast("Updating… PiFin restarts when it is done.");
+};
+
+// ---- first setup wizard ----
+let wizStep = "server", wizSent = false;
+const wizData = () => ({ url: $("wUrl").value, tsKey: $("wTs").value, hotspot: $("wHp").value,
+                         pin: $("wPin1").value, pin2: $("wPin2").value });
+function wizRender() {
+  const on = wizVisible(S && S.settings, wizStep);
+  show("wiz", on);
+  for (const id of ["secNet", "secPlay", "secDisp", "secSys"]) show(id, !on);
+  $("title").textContent = on ? "Set up PiFin" : "Settings";
+  if (!on) return;
+  for (const s of WIZ_STEPS) show("w-" + s, s === wizStep);
+  const i = WIZ_STEPS.indexOf(wizStep);
+  $("wizSteps").textContent = wizStep === "done" ? "Done" : `Step ${i + 1} of ${WIZ_STEPS.length - 1}`;
+  show("wBack", i > 0 && wizStep !== "done");
+  show("wNext", wizStep !== "done");
+  $("wNext").textContent = wizStep === "pin" ? "Finish" : wizStep === "tailscale" && !$("wTs").value ? "Skip" : "Next";
+}
+$("wTs").oninput = wizRender;
+$("wTest").onclick = async () => {
+  $("wErr").textContent = ""; $("wTestOk").textContent = "Testing…";
+  try {
+    const j = await post("/api/server_test", { url: $("wUrl").value.trim() });
+    $("wTestOk").textContent = j.ok ? `Found ${j.result.name || "Jellyfin"} (Jellyfin ${j.result.version}).` : "";
+    if (!j.ok) $("wErr").textContent = j.message;
+  } catch (e) { $("wTestOk").textContent = ""; if (e.message !== "not paired") $("wErr").textContent = "PiFin is not reachable."; }
+};
+$("wBack").onclick = () => { $("wErr").textContent = ""; wizStep = wizBack(wizStep); wizRender(); };
+$("wNext").onclick = async () => {
+  const d = wizData(), r = wizNext(wizStep, d);
+  $("wErr").textContent = r.error;
+  if (r.error) return;
+  if (wizStep === "tailscale" && d.tsKey) {
+    $("wErr").textContent = "Signing in to Tailscale…";
+    const ok = await op("tailscale_login", { authkey: d.tsKey.trim() });
+    $("wErr").textContent = "";
+    if (ok === null) return;
+    $("wTs").value = "";
+  }
+  if (r.step === "done" && !wizSent) {
+    const f = wizFinal(d);
+    if (await op("set", { changes: f.changes }) === null) return;
+    wizSent = true;
+    if (f.pin && await op("pin_set", { pin: f.pin }) === null)
+      $("wErr").textContent = "The server is saved, but the PIN is not: set it later in System.";
+  }
+  wizStep = r.step; wizRender(); refresh();
 };
 
 // ---- start ----

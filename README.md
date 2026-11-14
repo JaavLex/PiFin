@@ -66,9 +66,31 @@ progress goes back to the server, so you pick up at home where you stopped at th
   Pi 4's built-in Wi-Fi tops out around 10 Mbit/s and HDMI drowns its 2.4 GHz band). Plug it
   in and PiFin switches to it on its own; pull it out and the built-in Wi-Fi takes over again.
 - A Jellyfin server the Pi can reach. For use away from home, Tailscale on the server.
-- To prepare the card: Python 3 with PyYAML (`pip install pyyaml`) and `openssl`.
+- A microSD card (8 GB or more) and a phone.
 
 ## Quick start
+
+1. Download `pifin-<version>.img.xz` from the
+   [latest release](https://github.com/JaavLex/PiFin/releases/latest) and flash it with
+   Raspberry Pi Imager ("Use custom"; skip its OS customisation) or any image writer.
+2. Put the card in the Pi, connect the TV and power it on. The first boot takes about a minute
+   and needs no internet.
+3. **No known Wi-Fi yet:** the TV shows a QR code for the setup hotspot. Scan it, pick your
+   Wi-Fi on the page that opens, and PiFin joins it.
+4. **On the network:** the TV shows a second QR code. Scan it: your phone opens the setup
+   wizard. Enter your Jellyfin server address (Test checks the Pi can reach it), optionally a
+   Tailscale auth key, the setup hotspot password and a PIN.
+5. The TV shows a Quick Connect code: approve it in any Jellyfin app signed in as your user.
+
+**Updates:** Settings → System → Check for updates (on the TV or the phone) shows the newest
+release and installs it when you say so, never while a video plays.
+
+### Advanced: prepare the card with build.py
+
+To have everything set before the first boot (home Wi-Fi, Tailscale, SSH key, password),
+flash Raspberry Pi OS Lite 64-bit (Trixie) or the PiFin image, mount its boot partition and
+write `pifin.env` to it. Needs Python 3 with PyYAML (`pip install pyyaml`) and `openssl`. On
+plain Raspberry Pi OS the first boot installs everything (10-15 min).
 
 1. Flash **Raspberry Pi OS Lite 64-bit** (Trixie) and mount its boot partition.
 2. Configure:
@@ -86,7 +108,9 @@ approve from any Jellyfin app.
 
 ## Configuration
 
-Everything lives in `pifin.env`; `pifin.env.example` documents each key.
+On the ready-made image you set everything from the phone (Settings on the phone remote, or
+the TV's Settings). With build.py, the starting values come from `pifin.env`;
+`pifin.env.example` documents each key.
 
 | Key | Required | Default | What it does |
 |---|---|---|---|
@@ -139,8 +163,11 @@ that needs your key.
 
 ## Layout
 
-`build.py` writes the cloud-init files to the card. `files/` is what gets installed: the
-first-boot script `pifin-setup.sh`, the systemd units and the phone remote. `app/` is the TV app
+`files/` is what gets installed (the list: `files/install.list`): the setup script
+`pifin-setup.sh` (an image-time install phase and a first-boot configure phase), the systemd
+units, the settings daemon, the updater and the phone remote. `tools/build-image.sh` builds the
+ready-made image (GitHub Actions runs it on each release, `.github/workflows/image.yml`);
+`build.py` writes the cloud-init files for the advanced path. `app/` is the TV app
 (Rust + Slint; releases ship a prebuilt aarch64 binary). `tools/` are development helpers.
 
 ## Contributing

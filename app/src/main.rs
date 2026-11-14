@@ -1083,10 +1083,109 @@ fn server_url() -> Option<String> {
     })
 }
 
+/// What the first-setup screen shows (fresh image: no Jellyfin server address yet).
+#[derive(Debug, PartialEq)]
+enum SetupStep {
+    /// the phone set the server: on to the Quick Connect sign-in
+    Done,
+    /// no Wi-Fi known: the setup hotspot's QR code (join it, pick a network)
+    Wifi,
+    /// on a network: the phone remote's QR code, which opens the phone's setup wizard
+    Phone,
+    NoNetwork,
+}
+
+fn setup_step(server: &str, wifi_state: &str, ip: Option<&str>) -> SetupStep {
+    if !server.is_empty() {
+        SetupStep::Done
+    } else if wifi_state == "HOTSPOT" {
+        SetupStep::Wifi
+    } else if ip.is_some() {
+        SetupStep::Phone
+    } else {
+        SetupStep::NoNetwork
+    }
+}
+
+/// First setup on the TV: a QR code for the phone, which does the typing (server address,
+/// Tailscale key, hotspot password, PIN). Checked every 2 s; once the server address is
+/// there the app restarts into the Quick Connect sign-in. Keep the timer alive.
+fn setup_screen(app: &App) -> slint::Timer {
+    let weak = app.as_weak();
+    let mut cache: Option<(String, slint::Image)> = None;
+    let mut tick = move || {
+        let Some(app) = weak.upgrade() else { return };
+        let server = settings::current().system.jellyfin_url.clone();
+        let w: WifiState = std::fs::read_to_string(settings::paths().wifi)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let ip = local_ip().map(|i| i.to_string());
+        app.set_wifi_pickable(false);
+        app.set_wifi_error("".into());
+        let qr_text = match setup_step(&server, &w.state, ip.as_deref()) {
+            SetupStep::Done => {
+                eprintln!("SETUP done: restarting into the sign-in");
+                profiles::restart(&[]) // never returns
+            }
+            SetupStep::Wifi => {
+                app.set_wifi_title("Set up PiFin: Wi-Fi".into());
+                app.set_wifi_text(format!(
+                    "1.  Scan the code with your phone to join the network \"{}\" (password: {}).\n\n\
+                     2.  A page opens: pick your Wi-Fi and enter its password. If it doesn't open, go to http://10.41.0.1\n\n\
+                     3.  PiFin joins it, then shows the next code here.",
+                    w.ap_ssid, w.ap_pass
+                ).into());
+                Some(format!("WIFI\n{}\n{}", w.ap_ssid, w.ap_pass))
+            }
+            SetupStep::Phone => {
+                app.set_wifi_title("Set up PiFin".into());
+                app.set_wifi_text(
+                    "1.  Scan the code with your phone (on the same Wi-Fi as PiFin).\n\n\
+                     2.  Enter your Jellyfin server address on the phone, and optionally a Tailscale key, \
+                     the setup hotspot password and a PIN.\n\n\
+                     3.  Then sign in to Jellyfin here, with Quick Connect."
+                        .into(),
+                );
+                let url = remote_url(ip.as_deref().unwrap_or(""), settings::pair_token().as_deref());
+                Some(format!("URL\n{url}"))
+            }
+            SetupStep::NoNetwork => {
+                app.set_wifi_title("Set up PiFin".into());
+                app.set_wifi_text("Waiting for a network…".into());
+                None
+            }
+        };
+        match qr_text {
+            Some(key) => {
+                if cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                    let img = match key.split_once('\n') {
+                        Some(("WIFI", _)) => wifi_qr(&w.ap_ssid, &w.ap_pass),
+                        Some((_, url)) => qr_image(url),
+                        None => None,
+                    };
+                    cache = img.map(|i| (key, i));
+                }
+                if let Some((_, img)) = &cache {
+                    app.set_wifi_qr(img.clone());
+                }
+                app.set_wifi_has_qr(cache.is_some());
+            }
+            None => app.set_wifi_has_qr(false),
+        }
+        app.set_wifi_show(true);
+    };
+    tick();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), tick);
+    timer
+}
+
 /// Sign a user in with Quick Connect: show the code full screen, wait for
 /// approval, add the user to auth.json and restart as that user. `adding`:
-/// other users exist, so Back returns to "Who's watching?".
-fn sign_in(app: &App, adding: bool) {
+/// other users exist, so Back returns to "Who's watching?". No server address yet
+/// (fresh image): the first-setup screen instead, whose timer the caller keeps.
+fn sign_in(app: &App, adding: bool) -> Option<slint::Timer> {
     app.set_wifi_title("Sign in to Jellyfin".into());
     app.set_wifi_has_qr(false);
     app.set_wifi_show(true);
@@ -1094,9 +1193,9 @@ fn sign_in(app: &App, adding: bool) {
         app.on_cancel(|| profiles::restart(&[]));
     }
     // a new user joins the server the others are on; app.conf is for the first sign-in
-    let Some(server) = profiles::Store::load().map(|s| s.server).filter(|s| !s.is_empty()).or_else(server_url) else {
-        app.set_wifi_text("No server configured. Set JELLYFIN_URL in /etc/pifin/app.conf.".into());
-        return;
+    let from_settings = || Some(settings::current().system.jellyfin_url.clone()).filter(|s| !s.is_empty());
+    let Some(server) = profiles::Store::load().map(|s| s.server).filter(|s| !s.is_empty()).or_else(server_url).or_else(from_settings) else {
+        return Some(setup_screen(app));
     };
     app.set_wifi_text(format!("Connecting to {server}…").into());
     // one device id per user (Jellyfin ties a token to a device)
@@ -1142,11 +1241,12 @@ fn sign_in(app: &App, adding: bool) {
                     eprintln!("signed in; restarting");
                     profiles::restart(&["--user", &auth.user_id]);
                 }
-                Ok(None) => {}
-                Err(_) => break,
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
             }
-        }
-    });
+        });
+    None
 }
 
 /// Avatar as a circle (alpha baked in, so the GPU draws a plain quad).
@@ -1270,7 +1370,7 @@ fn main() {
     let Some(store) = store.filter(|_| !args.iter().any(|a| a == "--add-user")) else {
         let adding = profiles::Store::load().is_some();
         eprintln!("{}; starting Quick Connect sign-in", if adding { "adding a user" } else { "no saved login" });
-        sign_in(&app, adding);
+        let _setup = sign_in(&app, adding);
         app.run().ok();
         return;
     };
@@ -2223,6 +2323,17 @@ mod tests {
         let t = "0123456789abcdef0123456789abcdef";
         assert_eq!(remote_url("192.0.2.5", Some(t)), format!("http://192.0.2.5:8080/pair?t={t}"));
         assert_eq!(remote_url("192.0.2.5", None), "http://192.0.2.5:8080");
+    }
+
+    #[test]
+    fn setup_screen_steps() {
+        // a server address ends the setup, whatever the network
+        assert_eq!(setup_step("http://host:8096", "HOTSPOT", None), SetupStep::Done);
+        // no known Wi-Fi: the hotspot's code first
+        assert_eq!(setup_step("", "HOTSPOT", Some("10.41.0.1")), SetupStep::Wifi);
+        // on a network: the phone's code
+        assert_eq!(setup_step("", "CONNECTED", Some("192.0.2.7")), SetupStep::Phone);
+        assert_eq!(setup_step("", "", None), SetupStep::NoNetwork);
     }
 
 }

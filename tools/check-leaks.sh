@@ -6,7 +6,7 @@ cd "$(git rev-parse --show-toplevel)"
 fail=0
 
 # 1. Everything tracked must be on the publish list.
-allowed='^(\.gitignore|LICENSE|README\.md|pifin\.env\.example|build\.py|files/|docs/|tools/|app/)'
+allowed='^(\.gitignore|LICENSE|README\.md|pifin\.env\.example|build\.py|files/|docs/|tools/|app/|\.github/workflows/)'
 while IFS= read -r f; do
   if ! echo "$f" | grep -qE "$allowed"; then
     echo "NOT FOR PUBLISH: $f"; fail=1

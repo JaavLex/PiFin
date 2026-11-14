@@ -177,6 +177,8 @@ pub struct View<'a> {
     pub restart_offered: bool,
     pub net: &'a net::NetState,
     pub lang: &'a lang::LangState,
+    /// The "Check for updates" row's value: "", "Checking…", "Up to date", "PiFin x available".
+    pub update: &'a str,
 }
 
 pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
@@ -213,6 +215,7 @@ pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
                 row("system.pin", "action", "PIN", if pin { "On" } else { "Off" }, pin),
                 row("system.pair", "action", "Phone remote", "Show code", false),
                 row("system.about", "info", "About", format!("PiFin {}", env!("CARGO_PKG_VERSION")), false),
+                row("system.update", "action", "Check for updates", v.update, false),
                 row("system.ip", "info", "Address", st.wifi.ip.as_deref().unwrap_or("—"), false),
             ];
             if let Some(ip) = &st.tailscale.ip {
@@ -391,6 +394,8 @@ enum ConfirmFor {
     Factory(Option<String>),
     Forget { ssid: String, current: bool },
     Join(String),
+    /// Install this release (D9: on request only).
+    Update(String),
 }
 
 #[derive(Default)]
@@ -418,6 +423,7 @@ struct Ui {
     message: String,
     net: net::NetState,
     lang: lang::LangState,
+    update: String,
 }
 
 thread_local! {
@@ -432,7 +438,7 @@ fn error_text(e: &DaemonError) -> String {
 fn sync(app: &App, u: &Ui) {
     let s = settings::current();
     let section = app.get_settings_section().clamp(0, SECTIONS.len() as i32 - 1) as usize;
-    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net, lang: &u.lang };
+    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net, lang: &u.lang, update: &u.update };
     let rows = build_rows(section, &view);
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
     app.set_settings_row(valid_focus(&kinds, app.get_settings_row()));
@@ -484,6 +490,11 @@ fn sync(app: &App, u: &Ui) {
                     "Factory reset?".into(),
                     "Removes all settings, sign-ins and saved Wi-Fi networks, then restarts.".into(),
                     "Reset".into(),
+                ),
+                ConfirmFor::Update(v) => (
+                    format!("Install PiFin {v}?"),
+                    "PiFin downloads it and restarts when it is done (a minute or two). It never updates while a video plays.".into(),
+                    "Install".into(),
                 ),
                 ConfirmFor::Forget { .. } | ConfirmFor::Join(_) => net::confirm_text(purpose),
             };
@@ -635,6 +646,7 @@ fn activate(app: &App, u: &mut Ui, key: &str) {
         "system.pin" => open_pad(app, u, "New PIN", PadFor::NewPin { old: None }),
         "system.pair" => open_overlay(app, u, pair_overlay(String::new())),
         "system.reboot" => open_overlay(app, u, Overlay::Confirm(ConfirmFor::Reboot)),
+        "system.update" => check_update(app, u),
         k if k.starts_with("net.") => net::activate(app, u, k),
         k if k.starts_with("lang.") => lang::activate(app, u, k),
         _ => {}
@@ -851,12 +863,61 @@ fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
         return;
     }
     let (op, args) = match purpose {
+        ConfirmFor::Update(v) => return install_update(app, u, v),
         ConfirmFor::Reboot => ("reboot", json!({})),
         ConfirmFor::Factory(pin) => ("factory_reset", with_pin(json!({}), pin)),
         ConfirmFor::Forget { .. } | ConfirmFor::Join(_) => return net::confirmed(app, u, purpose),
     };
     u.message = "Restarting…".into();
     send(app, op, args, SHORT, |_, u, res| {
+        if let Err(e) = res {
+            if let Some(text) = restart_error_text(&e) {
+                u.message = text;
+            }
+        }
+    });
+}
+
+// ---- updates (D9) -----------------------------------------------------------------------------
+
+/// update_check takes up to ~60 s (GitHub over a slow link).
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// An `update_check` answer -> (row value, the version to offer when there is a newer one).
+fn update_outcome(res: &Value) -> (String, Option<String>) {
+    let text = |k: &str| res.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let latest = text("latest");
+    if res.get("available").and_then(|v| v.as_bool()) == Some(true) && !latest.is_empty() {
+        (format!("PiFin {latest} available"), Some(latest))
+    } else {
+        let current = text("current");
+        (if current.is_empty() { "Up to date".into() } else { format!("Up to date ({current})") }, None)
+    }
+}
+
+fn check_update(app: &App, u: &mut Ui) {
+    if u.update == "Checking…" {
+        return;
+    }
+    u.update = "Checking…".into();
+    send(app, "update_check", json!({}), UPDATE_TIMEOUT, |app, u, res| match res {
+        Ok(v) => {
+            let (label, offer) = update_outcome(&v);
+            u.update = label;
+            if let Some(latest) = offer {
+                open_overlay(app, u, Overlay::Confirm(ConfirmFor::Update(latest)));
+            }
+        }
+        Err(e) => {
+            u.update.clear();
+            u.message = error_text(&e);
+        }
+    });
+}
+
+fn install_update(app: &App, u: &mut Ui, version: String) {
+    u.message = format!("Updating to PiFin {version}… PiFin restarts when it is done.");
+    send(app, "update_install", json!({}), SHORT, |_, u, res| {
         if let Err(e) = res {
             if let Some(text) = restart_error_text(&e) {
                 u.message = text;
@@ -1019,7 +1080,23 @@ mod tests {
             macs: Macs { builtin: Some("aa".into()), usb: Some("bb".into()) },
             ..Default::default()
         };
-        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default(), lang: &lang::LangState::default() })
+        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default(), lang: &lang::LangState::default(), update: "" })
+    }
+
+    #[test]
+    fn update_check_offers_only_a_newer_release() {
+        let (label, offer) = update_outcome(&json!({"current": "0.2.0", "latest": "0.3.0", "available": true}));
+        assert_eq!((label.as_str(), offer.as_deref()), ("PiFin 0.3.0 available", Some("0.3.0")));
+        let (label, offer) = update_outcome(&json!({"current": "0.3.0", "latest": "0.3.0", "available": false}));
+        assert_eq!((label.as_str(), offer), ("Up to date (0.3.0)", None));
+        // "available" without a version to name is not offered
+        assert_eq!(update_outcome(&json!({"available": true})).1, None);
+    }
+
+    #[test]
+    fn system_has_a_check_for_updates_row() {
+        let rows = system_rows(false);
+        assert!(rows.iter().any(|r| r.key == "system.update" && r.kind == "action" && !r.locked));
     }
 
     #[test]

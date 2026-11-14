@@ -22,6 +22,7 @@ import pwd
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import socketserver
 import stat
@@ -37,6 +38,7 @@ PAIR_TOKEN = "/var/lib/pifin/pair-token"
 RUN_DIR = "/run/pifin"
 SOCK = "/run/pifin/settings.sock"
 WIFI_JSON = "/run/pifin/wifi.json"
+UPDATE_JSON = "/run/pifin/update.json"
 APP_CONF = "/etc/pifin/app.conf"
 DISPLAY_CONF = "/etc/pifin/display.conf"
 SECRETS_ENV = "/etc/pifin/secrets.env"
@@ -1154,6 +1156,53 @@ def op_factory_reset(req):
     return None
 
 
+# ---- updates (D9) -----------------------------------------------------------
+# The work happens in pifin-update@.service (pifin-update): this daemon has no network
+# access and a read-only system on purpose.
+
+UPDATE_FAILED = "Couldn't check for updates. Is PiFin online?"
+
+
+def read_update_json():
+    try:
+        with open(P(UPDATE_JSON)) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def text_field(doc, key, limit=600):
+    v = doc.get(key)
+    return v[:limit] if isinstance(v, str) else ""
+
+
+def op_update_check(req):
+    """Runs the check (up to ~30 s) and answers {current, latest, available, notes}."""
+    unlink_quiet(P(UPDATE_JSON))
+    rc, _ = RUN(["systemctl", "start", "pifin-update@check.service"], timeout=60)
+    doc = read_update_json()
+    if rc != 0 or doc.get("state") not in ("available", "up_to_date"):
+        raise Invalid("failed", text_field(doc, "message", 200) or UPDATE_FAILED)
+    return {"current": text_field(doc, "current", 32), "latest": text_field(doc, "latest", 32),
+            "available": doc.get("available") is True, "notes": text_field(doc, "notes")}
+
+
+def playing():
+    return RUN(["pgrep", "-x", "mpv"], timeout=5)[0] == 0
+
+
+def op_update_install(req):
+    """Starts the install in the background; PiFin's services restart when it is done.
+    Never while a video plays (pifin-update checks again)."""
+    if playing():
+        raise Invalid("busy", "Not while a video plays. Stop it, then try again.")
+    rc, _ = RUN(["systemctl", "start", "--no-block", "pifin-update@install.service"])
+    if rc != 0:
+        raise Invalid("failed", "Couldn't start the update.")
+    return {"started": True}
+
+
 # op -> (function, needs the store lock)
 OPS = {
     "get": (op_get, False),
@@ -1170,6 +1219,8 @@ OPS = {
     "tailscale_login": (op_tailscale_login, True),
     "reboot": (op_reboot, False),
     "factory_reset": (op_factory_reset, True),
+    "update_check": (op_update_check, False),
+    "update_install": (op_update_install, False),
 }
 LOCK = threading.Lock()
 
@@ -1283,6 +1334,15 @@ def fixture_runner(fdir):
             return 0, ""
         if argv[:5] == mode_cmd and len(argv) == 6 and argv[5] in wireless:
             return 0, text(f"con-mode-{wireless.index(argv[5]) + 1}.txt")
+        if argv == ["systemctl", "start", "pifin-update@check.service"]:
+            if not os.path.exists(os.path.join(fdir, "update.json")):
+                return 1, ""
+            shutil.copyfile(os.path.join(fdir, "update.json"), P(UPDATE_JSON))
+            return 0, ""
+        if argv == ["systemctl", "start", "--no-block", "pifin-update@install.service"]:
+            return 0, ""
+        if argv[0] == "pgrep":
+            return 1, ""
         if argv == [os.path.basename(PIFIN_BIN), "--version"]:
             return 0, "pifin demo\n"
         for prefix, name in table:

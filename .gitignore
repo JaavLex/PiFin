@@ -24,3 +24,6 @@ __pycache__/
 
 # Rust build output
 target/
+
+# tools/build-image.sh output
+dist/

@@ -1,0 +1,94 @@
+# On each published release: build the app for aarch64, the ready-made Raspberry Pi OS
+# image with PiFin installed, and the update files; attach them to the release.
+#   pifin-<version>.img.xz (+ .sha256)  flash it, boot, scan the QR code on the TV
+#   pifin-aarch64                       the app (also what older set-ups download)
+#   pifin-files.tar.gz                  files/ for "Check for updates"
+#   SHA256SUMS                          all of the above
+name: image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build for, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  app:
+    # Native arm64 runner: the app links libudev and uses Wayland/fontconfig, so a native
+    # build needs only the -dev packages; a cross build would need an arm64 sysroot.
+    # glibc 2.39 here, 2.41 on Raspberry Pi OS Trixie: the binary runs there.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version matches the tag
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' app/Cargo.toml | head -1)
+          [ "v$v" = "$TAG" ] || { echo "Cargo.toml has $v, the tag is $TAG"; exit 1; }
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev libfontconfig1-dev \
+            libxkbcommon-dev libwayland-dev
+      - name: Rust (stable; rust-version in Cargo.toml is the minimum)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Test and build
+        working-directory: app
+        run: |
+          cargo test --locked --quiet
+          cargo build --release --locked
+          ./target/release/pifin --version
+          cp target/release/pifin ../pifin-aarch64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pifin-aarch64
+          path: pifin-aarch64
+          if-no-files-found: error
+
+  image:
+    needs: app
+    # x86 runner + qemu-user-static: the chroot runs arm64 programs through binfmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # upload the release assets
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pifin-aarch64
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support xz-utils \
+            e2fsprogs fdisk
+          python3 tools/test_setup.py
+          python3 tools/test_updates.py
+          tools/build-image.sh --dry-run --app pifin-aarch64 --version "${TAG#v}" > /dev/null
+      - name: Build the image
+        run: sudo tools/build-image.sh --app pifin-aarch64 --version "${TAG#v}" --out dist
+      - name: Update files and checksums
+        run: |
+          cp pifin-aarch64 dist/
+          tar --owner=0 --group=0 -czf dist/pifin-files.tar.gz files
+          cd dist
+          sha256sum pifin-aarch64 pifin-files.tar.gz "pifin-${TAG#v}.img.xz" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          gh release upload "$TAG" --clobber pifin-aarch64 pifin-files.tar.gz SHA256SUMS \
+            "pifin-${TAG#v}.img.xz" "pifin-${TAG#v}.img.xz.sha256"

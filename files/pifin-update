@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""PiFin updates from the GitHub releases ("Check for updates" on the TV and the phone).
+
+Runs as root from pifin-update@.service, which pifin-settingsd starts (the daemon itself
+has no network access and a read-only system):
+
+  pifin-update check     ask GitHub for the latest release -> /run/pifin/update.json
+  pifin-update install   download, verify and install it, then restart PiFin's services
+
+Release assets (made by .github/workflows/image.yml): pifin-aarch64 (the app),
+pifin-files.tar.gz (the repo's files/ directory) and SHA256SUMS. Each download must
+match the sha256 GitHub reports for the asset (the API's "digest") and SHA256SUMS.
+Never installs while a video plays. Every replaced file is backed up first and put
+back if anything fails. Python stdlib only; every path is under PIFIN_ROOT (tests).
+"""
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+REPO = "JaavLex/PiFin"
+API = f"https://api.github.com/repos/{REPO}/releases/latest"  # latest non-draft, non-prerelease
+VERSION_FILE = "/etc/pifin/version"
+STATE = "/run/pifin/update.json"
+BACKUP_DIR = "/var/lib/pifin/update-backup"
+APP_BIN = "/usr/local/bin/pifin"
+APP_UNIT = "/etc/systemd/system/pifin-app.service"
+APP_ASSET = "pifin-aarch64"
+FILES_ASSET = "pifin-files.tar.gz"
+SUMS_ASSET = "SHA256SUMS"
+# pifin-setup.sh edits this one per device (password login off once a key is there)
+KEEP = {"/etc/ssh/sshd_config.d/01-pifin.conf"}
+# restarted after an install; the app last, so the TV shows the new version at once
+SERVICES = ["pifin-settingsd", "pifin-remote", "pifin-cec-remote", "pifin-wifi-watchdog", "pifin-app"]
+MAX_DOWNLOAD = 200 * 1024 * 1024
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class UpdateError(Exception):
+    """A failure with a message for the TV and the phone."""
+
+
+def P(path):
+    return os.environ.get("PIFIN_ROOT", "") + path
+
+
+def log(msg):
+    print(f"pifin-update: {msg}", file=sys.stderr, flush=True)
+
+
+def fetch(url, limit=MAX_DOWNLOAD):
+    req = urllib.request.Request(url, headers={"User-Agent": "pifin-update",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise UpdateError("A download is larger than expected.")
+    return data
+
+
+def run(argv, timeout=60):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return 1, ""
+
+
+FETCH = fetch
+RUN = run
+
+
+# ---- versions and assets ---------------------------------------------------
+
+def parse_version(text):
+    """"v0.3.0" / "0.3" -> (0, 3, 0). None for anything else (pre-releases included)."""
+    if not isinstance(text, str):
+        return None
+    m = re.fullmatch(r"v?(\d{1,4})\.(\d{1,4})(?:\.(\d{1,4}))?", text.strip())
+    if not m:
+        return None
+    return (int(m[1]), int(m[2]), int(m[3] or 0))
+
+
+def newer(latest, current):
+    """True when latest is a strictly higher version. An unknown current version counts
+    as older, so a box without a version file can still update."""
+    lv = parse_version(latest)
+    if lv is None:
+        return False
+    cv = parse_version(current)
+    return cv is None or lv > cv
+
+
+def installed_version():
+    try:
+        with open(P(VERSION_FILE)) as f:
+            v = f.read().strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    rc, out = RUN([APP_BIN, "--version"], timeout=5)
+    out = out.strip()
+    return out[len("pifin "):] if rc == 0 and out.startswith("pifin ") else ""
+
+
+def pick_assets(release):
+    """name -> {url, size, digest} for the assets an install needs."""
+    if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+        raise UpdateError("No release found.")
+    found = {}
+    for a in release.get("assets") or []:
+        if isinstance(a, dict) and a.get("name") in (APP_ASSET, FILES_ASSET, SUMS_ASSET):
+            url = a.get("browser_download_url")
+            if not isinstance(url, str) or not url.startswith("https://"):
+                continue
+            found[a["name"]] = {"url": url, "size": a.get("size") or 0, "digest": a.get("digest") or ""}
+    missing = [n for n in (APP_ASSET, FILES_ASSET) if n not in found]
+    if missing:
+        raise UpdateError("This release has no PiFin update files (" + ", ".join(missing) + ").")
+    return found
+
+
+def sums_table(text):
+    """SHA256SUMS ("<hex>  <name>" lines) -> {name: hex}."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and SHA_RE.match(parts[0].lower()):
+            out[parts[1].lstrip("*")] = parts[0].lower()
+    return out
+
+
+def expected_sha(name, asset, sums):
+    """The sha256 a download must have: GitHub's digest and SHA256SUMS, which must agree.
+    At least one is required."""
+    digest = asset.get("digest", "")
+    gh = digest[len("sha256:"):].lower() if digest.startswith("sha256:") else ""
+    if gh and not SHA_RE.match(gh):
+        gh = ""
+    listed = sums.get(name, "")
+    if gh and listed and gh != listed:
+        raise UpdateError(f"The checksums of {name} disagree. Not installing.")
+    if not (gh or listed):
+        raise UpdateError(f"No checksum for {name}. Not installing.")
+    return gh or listed
+
+
+def verify(name, data, sha):
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise UpdateError(f"{name} is damaged (checksum mismatch). Not installing.")
+
+
+def latest_release():
+    try:
+        return json.loads(FETCH(API, 1024 * 1024))
+    except UpdateError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- offline, DNS, HTTP error, bad JSON
+        log(f"release check failed: {type(e).__name__}")
+        raise UpdateError("Couldn't reach GitHub. Is PiFin online?") from None
+
+
+# ---- state file --------------------------------------------------------------
+
+def write_state(doc):
+    doc = dict(doc, time=int(time.time()))
+    path = P(STATE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f)
+    os.chmod(tmp, 0o644)  # the app and the phone server (user pifin) read it
+    os.replace(tmp, path)
+
+
+def check():
+    current = installed_version()
+    rel = latest_release()
+    tag = rel.get("tag_name") if isinstance(rel, dict) else None
+    latest = tag[1:] if isinstance(tag, str) and tag.startswith("v") else (tag or "")
+    available = newer(latest, current)
+    if available:
+        pick_assets(rel)  # a release without update files is not offered
+    notes = rel.get("body") if isinstance(rel.get("body"), str) else ""
+    doc = {"state": "available" if available else "up_to_date", "current": current,
+           "latest": latest, "available": available, "notes": notes[:600]}
+    write_state(doc)
+    return doc
+
+
+# ---- install -------------------------------------------------------------------
+
+def playing():
+    return RUN(["pgrep", "-x", "mpv"], timeout=5)[0] == 0
+
+
+def kiosk_user():
+    """The user PiFin runs as: from the installed app unit, else secrets.env, else pifin."""
+    for path, pat in ((APP_UNIT, r"^User=([a-z][a-z0-9-]{0,62})$"),
+                      ("/etc/pifin/secrets.env", r"^PIFIN_USER='?([a-z][a-z0-9-]{0,62})'?$")):
+        try:
+            with open(P(path)) as f:
+                m = re.search(pat, f.read(), re.M)
+            if m:
+                return m[1]
+        except OSError:
+            pass
+    return "pifin"
+
+
+def safe_extract(blob, dest):
+    """Unpack the files tarball: regular files and directories under files/ only."""
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            name = os.path.normpath(m.name)
+            if name.startswith(("/", "..")) or not (name == "files" or name.startswith("files/")) \
+                    or not (m.isfile() or m.isdir()):
+                raise UpdateError("The update files look wrong. Not installing.")
+        tar.extractall(dest, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(dest)
+
+
+def read_list(path):
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                src, dst, mode = line.split()
+                if ".." in src.split("/") or not dst.startswith("/"):
+                    raise UpdateError("The update file list looks wrong. Not installing.")
+                out.append((src, dst, int(mode, 8)))
+    return out
+
+
+def put(dst, data, mode, backup, done):
+    """Write dst atomically; the old file goes to backup first (restored on failure)."""
+    path = P(dst)
+    old = None
+    if os.path.exists(path):
+        old = os.path.join(backup, dst.lstrip("/"))
+        os.makedirs(os.path.dirname(old), exist_ok=True)
+        shutil.copy2(path, old)
+    done.append((path, old))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.pifin-new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def roll_back(done):
+    for path, old in reversed(done):
+        try:
+            if old:
+                shutil.copy2(old, path + ".pifin-new")
+                os.replace(path + ".pifin-new", path)
+            else:
+                os.unlink(path)
+        except OSError as e:
+            log(f"roll back of {path} failed: {type(e).__name__}")
+
+
+def install():
+    if playing():
+        raise UpdateError("Not while a video plays. Stop it, then try again.")
+    current = installed_version()
+    rel = latest_release()
+    tag = rel.get("tag_name") or ""
+    latest = tag[1:] if tag.startswith("v") else tag
+    if not newer(latest, current):
+        doc = {"state": "up_to_date", "current": current, "latest": latest, "available": False}
+        write_state(doc)
+        return doc
+    assets = pick_assets(rel)
+    write_state({"state": "downloading", "current": current, "latest": latest, "available": True})
+    sums = sums_table(FETCH(assets[SUMS_ASSET]["url"], 64 * 1024).decode()) if SUMS_ASSET in assets else {}
+    blobs = {}
+    for name in (APP_ASSET, FILES_ASSET):
+        sha = expected_sha(name, assets[name], sums)
+        blobs[name] = FETCH(assets[name]["url"])
+        verify(name, blobs[name], sha)
+    write_state({"state": "installing", "current": current, "latest": latest, "available": True})
+    user, host = kiosk_user(), socket.gethostname()
+    backup = os.path.join(P(BACKUP_DIR), current or "unknown")
+    shutil.rmtree(backup, ignore_errors=True)
+    os.makedirs(backup, exist_ok=True)
+    done = []
+    with tempfile.TemporaryDirectory() as tmp:
+        safe_extract(blobs[FILES_ASSET], tmp)
+        try:
+            for src, dst, mode in read_list(os.path.join(tmp, "files", "install.list")):
+                if dst in KEEP:
+                    continue
+                with open(os.path.join(tmp, "files", src), "rb") as f:
+                    data = f.read()
+                data = data.replace(b"@@PIFIN_USER@@", user.encode()).replace(b"@@PIFIN_HOSTNAME@@", host.encode())
+                put(dst, data, mode, backup, done)
+            put(APP_BIN, blobs[APP_ASSET], 0o755, backup, done)
+            put(VERSION_FILE, (latest + "\n").encode(), 0o644, backup, done)
+        except Exception:
+            roll_back(done)
+            raise
+    log(f"installed {latest} (was {current or 'unknown'}), backup in {backup}")
+    write_state({"state": "done", "current": latest, "latest": latest, "available": False})
+    RUN(["systemctl", "daemon-reload"])
+    for s in SERVICES:
+        RUN(["systemctl", "try-restart", s + ".service"])
+    return {"state": "done", "current": latest}
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("check", "install"):
+        sys.exit("usage: pifin-update check|install")
+    try:
+        doc = check() if argv[1] == "check" else install()
+        print(json.dumps(doc))
+    except UpdateError as e:
+        write_state({"state": "error", "message": str(e)})
+        log(str(e))
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 -- always leave a state the TV can show
+        write_state({"state": "error", "message": f"The update failed ({type(e).__name__})."})
+        log(f"failed: {type(e).__name__}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

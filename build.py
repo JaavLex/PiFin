@@ -24,36 +24,20 @@ import yaml
 HERE = pathlib.Path(__file__).parent
 FILES = HERE / "files"
 
-# (source file in files/, destination on the Pi, mode)
-INSTALL = [
-    ("pifin-setup.sh", "/usr/local/sbin/pifin-setup.sh", "0755"),
-    ("pifin-setup.service", "/etc/systemd/system/pifin-setup.service", "0644"),
-    ("pifin-cec-remote.py", "/usr/local/bin/pifin-cec-remote.py", "0755"),
-    ("pifin-cec-remote.service", "/etc/systemd/system/pifin-cec-remote.service", "0644"),
-    ("pifin-comitup-callback", "/usr/local/bin/pifin-comitup-callback", "0755"),
-    ("pifin-wifi-select", "/usr/local/sbin/pifin-wifi-select", "0755"),
-    ("pifin-comitup.conf", "/etc/systemd/system/comitup.service.d/pifin.conf", "0644"),
-    ("90-pifin-usb-wifi.rules", "/etc/udev/rules.d/90-pifin-usb-wifi.rules", "0644"),
-    ("pifin-remote/server.py", "/opt/pifin-remote/server.py", "0755"),
-    ("pifin-remote/index.html", "/opt/pifin-remote/index.html", "0644"),
-    ("pifin-remote/settings.html", "/opt/pifin-remote/settings.html", "0644"),
-    ("pifin-remote/icon.svg", "/opt/pifin-remote/icon.svg", "0644"),
-    ("pifin-remote/mpvplayer.py", "/opt/pifin-remote/mpvplayer.py", "0644"),
-    ("pifin-remote/mpv-input.conf", "/opt/pifin-remote/mpv-input.conf", "0644"),
-    ("pifin-remote/pifin-osd.lua", "/opt/pifin-remote/pifin-osd.lua", "0644"),
-    ("pifin-remote.service", "/etc/systemd/system/pifin-remote.service", "0644"),
-    ("pifin-app-session", "/usr/local/bin/pifin-app-session", "0755"),
-    ("pifin-app.service", "/etc/systemd/system/pifin-app.service", "0644"),
-    ("pifin-kiosk.pam", "/etc/pam.d/pifin-kiosk", "0644"),
-    ("pifin-wifi-watchdog", "/usr/local/bin/pifin-wifi-watchdog", "0755"),
-    ("pifin-wifi-watchdog.service", "/etc/systemd/system/pifin-wifi-watchdog.service", "0644"),
-    ("pifin-firewall", "/usr/local/sbin/pifin-firewall", "0755"),
-    ("pifin-firewall.service", "/etc/systemd/system/pifin-firewall.service", "0644"),
-    ("pifin-sshd.conf", "/etc/ssh/sshd_config.d/01-pifin.conf", "0644"),
-    ("99-pifin-uinput.rules", "/etc/udev/rules.d/99-pifin-uinput.rules", "0644"),
-    ("pifin-settingsd", "/usr/local/sbin/pifin-settingsd", "0755"),
-    ("pifin-settingsd.service", "/etc/systemd/system/pifin-settingsd.service", "0644"),
-]
+
+def read_install_list(path=FILES / "install.list"):
+    """(source file in files/, destination on the Pi, mode), from files/install.list."""
+    out = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            src, dst, mode = line.split()
+            out.append((src, dst, mode))
+    return out
+
+
+INSTALL = read_install_list()
+
 # Config the Pi needs at run time -> /etc/pifin/secrets.env (0600, sourced by root only)
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",
                "HOTSPOT_PASS", "JELLYFIN_URL", "WIFI_SSID", "WIFI_PSK", "TS_AUTHKEY"]

@@ -1,0 +1,32 @@
+# Files PiFin installs: <source in files/> <destination> <mode>
+# Read by build.py (cloud-init write_files), tools/build-image.sh (the ready-made image)
+# and pifin-update (Check for updates). @@PIFIN_USER@@ / @@PIFIN_HOSTNAME@@ are replaced.
+pifin-setup.sh /usr/local/sbin/pifin-setup.sh 0755
+pifin-setup.service /etc/systemd/system/pifin-setup.service 0644
+pifin-cec-remote.py /usr/local/bin/pifin-cec-remote.py 0755
+pifin-cec-remote.service /etc/systemd/system/pifin-cec-remote.service 0644
+pifin-comitup-callback /usr/local/bin/pifin-comitup-callback 0755
+pifin-wifi-select /usr/local/sbin/pifin-wifi-select 0755
+pifin-comitup.conf /etc/systemd/system/comitup.service.d/pifin.conf 0644
+90-pifin-usb-wifi.rules /etc/udev/rules.d/90-pifin-usb-wifi.rules 0644
+pifin-remote/server.py /opt/pifin-remote/server.py 0755
+pifin-remote/index.html /opt/pifin-remote/index.html 0644
+pifin-remote/settings.html /opt/pifin-remote/settings.html 0644
+pifin-remote/icon.svg /opt/pifin-remote/icon.svg 0644
+pifin-remote/mpvplayer.py /opt/pifin-remote/mpvplayer.py 0644
+pifin-remote/mpv-input.conf /opt/pifin-remote/mpv-input.conf 0644
+pifin-remote/pifin-osd.lua /opt/pifin-remote/pifin-osd.lua 0644
+pifin-remote.service /etc/systemd/system/pifin-remote.service 0644
+pifin-app-session /usr/local/bin/pifin-app-session 0755
+pifin-app.service /etc/systemd/system/pifin-app.service 0644
+pifin-kiosk.pam /etc/pam.d/pifin-kiosk 0644
+pifin-wifi-watchdog /usr/local/bin/pifin-wifi-watchdog 0755
+pifin-wifi-watchdog.service /etc/systemd/system/pifin-wifi-watchdog.service 0644
+pifin-firewall /usr/local/sbin/pifin-firewall 0755
+pifin-firewall.service /etc/systemd/system/pifin-firewall.service 0644
+pifin-sshd.conf /etc/ssh/sshd_config.d/01-pifin.conf 0644
+99-pifin-uinput.rules /etc/udev/rules.d/99-pifin-uinput.rules 0644
+pifin-settingsd /usr/local/sbin/pifin-settingsd 0755
+pifin-settingsd.service /etc/systemd/system/pifin-settingsd.service 0644
+pifin-update /usr/local/sbin/pifin-update 0755
+pifin-update@.service /etc/systemd/system/pifin-update@.service 0644

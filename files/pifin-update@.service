@@ -1,0 +1,11 @@
+[Unit]
+Description=PiFin update: %i (started by pifin-settingsd, "Check for updates")
+After=network-online.target
+
+[Service]
+Type=oneshot
+# check: ask GitHub for the latest release -> /run/pifin/update.json
+# install: download, verify (sha256) and install it, then restart PiFin's services.
+# A unit of its own: the settings daemon has no network access and a read-only system.
+ExecStart=/usr/bin/python3 /usr/local/sbin/pifin-update %i
+TimeoutStartSec=15min

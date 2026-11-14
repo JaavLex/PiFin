@@ -16,7 +16,8 @@ echo "== syntax =="
 python3 -m py_compile build.py files/*.py files/pifin-remote/*.py \
   && ok "python compiles" || bad "python compiles"
 python3 -m py_compile files/pifin-settingsd && ok "pifin-settingsd compiles" || bad "pifin-settingsd compiles"
-for f in files/pifin-setup.sh files/pifin-comitup-callback files/pifin-wifi-select files/pifin-wifi-watchdog; do
+python3 -m py_compile files/pifin-update && ok "pifin-update compiles" || bad "pifin-update compiles"
+for f in files/pifin-setup.sh files/pifin-comitup-callback files/pifin-wifi-select files/pifin-wifi-watchdog tools/build-image.sh; do
   bash -n "$f" && ok "bash -n $(basename "$f")" || bad "bash -n $(basename "$f")"
 done
 if command -v node >/dev/null; then
@@ -60,7 +61,7 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 30)  # 27 installed + secrets.env + display.conf + app.conf
+eq("file count", len(wf), 32)  # 29 installed (files/install.list) + secrets.env + display.conf + app.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 eq("app.conf", wf["/etc/pifin/app.conf"]["content"], "JELLYFIN_URL=http://jellyfin.example:8096\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")
@@ -190,6 +191,27 @@ if python3 tools/test_remote_pairing.py > "$D/pairing.log" 2>&1; then
   ok "phone remote pairing tests"
 else
   tail -20 "$D/pairing.log"; bad "phone remote pairing tests"
+fi
+
+echo "== G: ready-made image: setup phases, wizard, updates =="
+if python3 tools/test_setup.py > "$D/setup.log" 2>&1; then ok "setup phases + phone wizard"; else tail -20 "$D/setup.log"; bad "setup phases + phone wizard"; fi
+if command -v node >/dev/null; then
+  node tools/test_wizard.mjs > "$D/wizard.log" 2>&1 && ok "wizard logic" || { tail -20 "$D/wizard.log"; bad "wizard logic"; }
+fi
+if python3 tools/test_updates.py > "$D/updates.log" 2>&1; then ok "updates"; else tail -20 "$D/updates.log"; bad "updates"; fi
+# every install.list entry exists, and the image build's dry run names each of them
+missing=$(awk '!/^#/ && NF==3 {print $1}' files/install.list | while read -r f; do [ -f "files/$f" ] || echo "$f"; done)
+[ -z "$missing" ] && ok "install.list: every file exists" || bad "install.list: missing $missing"
+if tools/build-image.sh --dry-run --app "$D/none" --version 0.0.1 --out "$D/dist" > "$D/image.log" 2>&1 \
+   && grep -q "pifin-setup.sh install" "$D/image.log" \
+   && [ "$(grep -c '^+ install -D' "$D/image.log")" -eq "$(awk '!/^#/ && NF==3' files/install.list | wc -l)" ] \
+   && [ ! -e "$D/dist/work/pifin.img" ]; then
+  ok "build-image.sh --dry-run"
+else
+  tail -20 "$D/image.log"; bad "build-image.sh --dry-run"
+fi
+if command -v shellcheck >/dev/null; then
+  shellcheck -S warning tools/build-image.sh files/pifin-setup.sh && ok "shellcheck" || bad "shellcheck"
 fi
 
 echo

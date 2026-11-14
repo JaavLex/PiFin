@@ -1,6 +1,9 @@
 [Unit]
 Description=PiFin settings service (the only writer of the settings)
 After=local-fs.target
+# first boot of the ready-made image: start once pifin-setup.sh has written the
+# hotspot password, so the store is migrated from complete legacy files
+After=pifin-setup.service
 
 [Service]
 ExecStart=/usr/bin/python3 /usr/local/sbin/pifin-settingsd

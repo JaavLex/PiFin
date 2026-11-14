@@ -37,7 +37,9 @@ PAIR_TOKEN = os.environ.get("PIFIN_PAIR_TOKEN", "/var/lib/pifin/pair-token")
 SETTINGS_SOCK = os.environ.get("PIFIN_SETTINGS_SOCK", "/run/pifin/settings.sock")
 # what the phone may ask the daemon; pair_reset stays TV-only (it needs the TV in hand)
 SETTINGS_OPS = frozenset("get set network_set wifi_list wifi_scan wifi_add wifi_forget pin_set "
-                         "pin_clear pin_check tailscale_login reboot factory_reset".split())
+                         "pin_clear pin_check tailscale_login reboot factory_reset update_check "
+                         "update_install".split())
+STORE = os.environ.get("PIFIN_SETTINGS", "/var/lib/pifin/settings.json")
 SUB_MODES = frozenset(("Default", "Always", "OnlyForced", "None", "Smart"))
 FORBIDDEN = (b'<!doctype html><html lang="en"><head><meta charset="utf-8">'
              b'<meta name="viewport" content="width=device-width, initial-scale=1"><title>PiFin</title></head>'
@@ -130,7 +132,7 @@ def daemon(req):
     """One request to the settings daemon; its JSON reply line comes back as is."""
     try:
         with socket.socket(socket.AF_UNIX) as s:
-            s.settimeout(40)   # tailscale_login and wifi_add take up to ~30 s
+            s.settimeout(70)   # tailscale_login, wifi_add ~30 s; update_check up to 60 s
             s.connect(SETTINGS_SOCK)
             s.sendall((json.dumps(req) + "\n").encode())
             buf = b""
@@ -145,6 +147,33 @@ def daemon(req):
         return json.dumps({"ok": False, "error": "failed", "message": "Settings service not running."}).encode()
     return buf.strip() or json.dumps({"ok": False, "error": "failed",
                                       "message": "Settings service did not answer."}).encode()
+
+
+def setup_needed():
+    """A fresh image: no Jellyfin server address yet, so the phone opens the setup wizard."""
+    try:
+        doc = json.loads(pathlib.Path(STORE).read_text())
+        return not doc["system"]["jellyfin_url"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False  # no store (yet) or unreadable: the remote, as before
+
+
+def server_test(url):
+    """Can PiFin reach this Jellyfin server? Asked from the Pi, not the phone: only the Pi's
+    network matters. Answers the server's name and version, nothing else."""
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")) or len(url) > 300:
+        return {"ok": False, "error": "invalid_value", "message": "The address must look like http://host:8096."}
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/System/Info/Public", headers={"User-Agent": "PiFin"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            info = json.loads(r.read(64 * 1024))
+        name, version = info.get("ServerName"), info.get("Version")
+        if not isinstance(version, str):
+            raise ValueError("not Jellyfin")
+        return {"ok": True, "result": {"name": str(name or "")[:80], "version": version[:20]}}
+    except Exception:
+        return {"ok": False, "error": "failed",
+                "message": "No Jellyfin server answered at that address. Check it, or sign in to Tailscale first if the server is on your tailnet."}
 
 
 # ------------------------------------------------------------ Jellyfin ------
@@ -303,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.forbidden()
         if path.path in ("/", "/index.html"):
             self.seen()
+            if setup_needed():  # first setup: the wizard is on the settings page
+                return self.reply(200, SETTINGS_PAGE, "text/html; charset=utf-8")
             return self.reply(200, INDEX, "text/html; charset=utf-8")
         if path.path == "/settings":
             return self.reply(200, SETTINGS_PAGE, "text/html; charset=utf-8")
@@ -348,6 +379,12 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict) or data.get("op") not in SETTINGS_OPS:
                 return self.json({"ok": False, "error": "bad_request", "message": "Unknown op."}, 400)
             return self.reply(200, daemon(data))
+        if path == "/api/server_test":
+            try:
+                data = self.body()
+            except ValueError:
+                data = None
+            return self.json(server_test(data.get("url") if isinstance(data, dict) else None))
         if path == "/api/langs":
             try:
                 data = self.body()
