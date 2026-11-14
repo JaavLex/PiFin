@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""PiFin settings daemon: the only writer of the settings store.
+
+Runs as root. The TV app and the phone server (user pifin) read
+/var/lib/pifin/settings.json directly and change it only through the Unix socket
+/run/pifin/settings.sock: one JSON object per line in, one per line out.
+It also keeps the legacy files other scripts read (app.conf, display.conf,
+secrets.env, comitup.conf, auth.json) in sync.
+
+No shell anywhere: every system command goes through RUN (an argument list with a
+timeout), which the tests replace. Every path is under PIFIN_ROOT (tests only).
+Never log a PIN, a password, a key or a token.
+"""
+import copy
+import grp
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import re
+import secrets
+import shlex
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+SETTINGS = "/var/lib/pifin/settings.json"
+SECRETS = "/var/lib/pifin/secrets.json"
+PAIR_TOKEN = "/var/lib/pifin/pair-token"
+RUN_DIR = "/run/pifin"
+SOCK = "/run/pifin/settings.sock"
+WIFI_JSON = "/run/pifin/wifi.json"
+APP_CONF = "/etc/pifin/app.conf"
+DISPLAY_CONF = "/etc/pifin/display.conf"
+SECRETS_ENV = "/etc/pifin/secrets.env"
+COMITUP_CONF = "/etc/comitup.conf"
+PIFIN_BIN = "/usr/local/bin/pifin"
+
+MAX_LINE = 64 * 1024
+IDLE_TIMEOUT = 30
+PIN_ITER = 200000
+PIN_MAX_FAILS = 5
+PIN_LOCK_SECS = 60
+
+
+def root():
+    return os.environ.get("PIFIN_ROOT", "")
+
+
+def P(path):
+    return root() + path
+
+
+def log(msg):
+    print(f"pifin-settingsd: {msg}", file=sys.stderr, flush=True)
+
+
+# ---- runner ---------------------------------------------------------------
+
+def run(argv, timeout=10):
+    """Run argv (never through a shell). Returns (rc, stdout)."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except FileNotFoundError:
+        return 127, ""
+
+
+RUN = run
+NOW = time.monotonic
+
+
+# ---- validation -----------------------------------------------------------
+
+class Invalid(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+URL_RE = re.compile(r"^https?://[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+PIN_RE = re.compile(r"^[0-9]{4,8}$")
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+
+URL_MSG = "The Jellyfin address must look like http://host:8096."
+SSID_MSG = "A Wi-Fi name must be 1 to 32 bytes, without control characters."
+PSK_MSG = "The hotspot password must be 8 to 63 plain characters (letters, digits, symbols, spaces)."
+PIN_MSG = "The PIN must be 4 to 8 digits."
+
+
+def boolean(label):
+    def check(v):
+        if type(v) is not bool:
+            raise Invalid("invalid_value", f"{label} must be true or false.")
+    return check
+
+
+def choice(values, message, numbers=(int,)):
+    def check(v):
+        if isinstance(v, bool) or not isinstance(v, numbers) or v not in values:
+            raise Invalid("invalid_value", message)
+    return check
+
+
+def is_ssid(v):
+    return (isinstance(v, str) and 1 <= len(v.encode("utf-8", "surrogatepass")) <= 32
+            and not CONTROL_RE.search(v))
+
+
+def check_ssid(v):
+    if not is_ssid(v):
+        raise Invalid("invalid_value", SSID_MSG)
+
+
+def is_url(v):
+    return isinstance(v, str) and bool(URL_RE.match(v))
+
+
+def check_url_or_empty(v):
+    # "" = migrated "not set"; `set` refuses it separately
+    if not (v == "" or is_url(v)):
+        raise Invalid("invalid_value", URL_MSG)
+
+
+def is_psk(v):
+    return isinstance(v, str) and 8 <= len(v) <= 63 and all(0x20 <= ord(c) <= 0x7E for c in v)
+
+
+def check_psk(v):
+    if not is_psk(v):
+        raise Invalid("invalid_value", PSK_MSG)
+
+
+PLAYBACK = {
+    "max_bitrate": choice({0, 40000000, 20000000, 10000000, 6000000, 3000000},
+                          "Max bitrate must be one of: no limit, 40, 20, 10, 6 or 3 Mbit/s."),
+    "max_height": choice({2160, 1080, 720, 480},
+                         "Max resolution must be one of 2160, 1080, 720 or 480 lines."),
+    "hdr": boolean("HDR"),
+    "prefer_original": boolean("Prefer original"),
+}
+FIELDS = {
+    "playback": PLAYBACK,
+    "display": {
+        "output_max_height": choice({2160, 1080, 720},
+                                    "TV output resolution must be one of 2160, 1080 or 720 lines."),
+        "subtitle_scale": choice({0.8, 1.0, 1.25, 1.5},
+                                 "Subtitle size must be one of 0.8, 1.0, 1.25 or 1.5.",
+                                 (int, float)),
+        "audio_passthrough": boolean("Audio passthrough"),
+    },
+    "system": {
+        "jellyfin_url": check_url_or_empty,
+        "hotspot_ssid": check_ssid,
+        "pin_set": boolean("pin_set"),
+    },
+}
+TOP_KEYS = {"version", "playback", "networks", "display", "system"}
+
+
+def check_keys(d, want, where, exact=True):
+    if not isinstance(d, dict):
+        raise Invalid("bad_request", f"{where} must be an object.")
+    for k in d:
+        if k not in want:
+            raise Invalid("bad_request", f"Unknown setting: {where}.{str(k)[:64]}.")
+    if exact:
+        for k in want:
+            if k not in d:
+                raise Invalid("bad_request", f"Missing setting: {where}.{k}.")
+
+
+def validate(doc):
+    """Raise Invalid unless doc is a complete, valid settings.json v1."""
+    check_keys(doc, TOP_KEYS, "settings")
+    if type(doc["version"]) is not int or doc["version"] != 1:
+        raise Invalid("invalid_value", "Unsupported settings version.")
+    for section, fields in FIELDS.items():
+        check_keys(doc[section], fields, section)
+        for k, check in fields.items():
+            check(doc[section][k])
+    nets = doc["networks"]
+    if not isinstance(nets, dict):
+        raise Invalid("bad_request", "networks must be an object.")
+    for ssid, limits in nets.items():
+        check_ssid(ssid)
+        check_limits(limits)
+
+
+def check_limits(limits):
+    check_keys(limits, PLAYBACK, "networks", exact=False)
+    if not limits:
+        raise Invalid("invalid_value", "A network entry needs at least one limit.")
+    for k, v in limits.items():
+        PLAYBACK[k](v)
+
+
+SETTABLE = {
+    "playback.max_bitrate", "playback.max_height", "playback.hdr", "playback.prefer_original",
+    "display.output_max_height", "display.subtitle_scale", "display.audio_passthrough",
+    "system.jellyfin_url", "system.hotspot_ssid", "secrets.hotspot_pass",
+}
+SENSITIVE = {"system.jellyfin_url", "secrets.hotspot_pass"}
+
+
+# ---- files ----------------------------------------------------------------
+
+def chown(path, uid, gid):
+    if root():  # tests run unprivileged
+        return
+    os.chown(path, -1 if uid is None else uid, -1 if gid is None else gid)
+
+
+def write_atomic(path, text, mode, uid=None, gid=None):
+    """tmp file in the same dir, fsync, chmod, chown, rename over the target."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if uid is not None or gid is not None:
+            chown(tmp, uid, gid)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def parse_env(path):
+    """KEY=VALUE lines without a shell: the value is shlex's first token."""
+    env = {}
+    for line in (read_text(path) or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        try:
+            tokens = shlex.split(value)
+            value = tokens[0] if tokens else ""
+        except ValueError:
+            pass
+        env[key.strip()] = value
+    return env
+
+
+def unquote_comitup(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def parse_comitup(path):
+    conf = {}
+    for line in (read_text(path) or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() and not key.lstrip().startswith("#"):
+            conf[key.strip()] = unquote_comitup(value)
+    return conf
+
+
+def sh_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def user_name():
+    u = parse_env(P(SECRETS_ENV)).get("PIFIN_USER", "pifin")
+    return u if NAME_RE.match(u) else "pifin"
+
+
+def auth_path():
+    return P(f"/home/{user_name()}/.config/pifin/auth.json")
+
+
+def user_ids():
+    """(uid, gid) of the pifin user and group; (None, None) in tests."""
+    if root():
+        return None, None
+    u = user_name()
+    return pwd.getpwnam(u).pw_uid, grp.getgrnam(u).gr_gid
+
+
+def group_id():
+    return user_ids()[1]
+
+
+def dump(doc):
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_settings():
+    return load_json(P(SETTINGS))
+
+
+def load_secrets():
+    return load_json(P(SECRETS))
+
+
+def write_settings(doc):
+    write_atomic(P(SETTINGS), dump(doc), 0o644, 0, 0)
+
+
+def write_secrets(doc):
+    write_atomic(P(SECRETS), dump(doc), 0o600, 0, 0)
+
+
+def secrets_ok(doc):
+    return (isinstance(doc, dict) and set(doc) == {"pin_hash", "hotspot_pass"}
+            and (doc["pin_hash"] is None
+                 or (isinstance(doc["pin_hash"], str) and doc["pin_hash"].startswith("pbkdf2_sha256$")))
+            and isinstance(doc["hotspot_pass"], str))
+
+
+# ---- migration / start ----------------------------------------------------
+
+def first(candidates, ok, default):
+    for c in candidates:
+        if c and ok(c):
+            return c
+    return default
+
+
+def migrate():
+    """Build settings.json (and secrets.json if missing) from the legacy files."""
+    app = parse_env(P(APP_CONF))
+    env = parse_env(P(SECRETS_ENV))
+    disp = parse_env(P(DISPLAY_CONF))
+    com = parse_comitup(P(COMITUP_CONF))
+    try:
+        auth = load_json(auth_path())
+        server = auth.get("server") if isinstance(auth, dict) else None
+    except (OSError, ValueError):
+        server = None
+    url = first([app.get("JELLYFIN_URL"), env.get("JELLYFIN_URL"), server], is_url, "")
+    ssid = first([com.get("ap_name"), env.get("HOTSPOT_SSID")], is_ssid, "PiFin-setup")
+    psk = first([env.get("HOTSPOT_PASS"), com.get("ap_password")], is_psk, "")
+    try:
+        height = int(disp.get("MAX_HEIGHT", ""))
+    except ValueError:
+        height = 1080
+    if height not in (2160, 1080, 720):
+        height = 1080
+
+    sec = None
+    try:
+        sec = load_secrets()
+        if not secrets_ok(sec):
+            sec = None
+    except (OSError, ValueError):
+        pass
+    if sec is None:
+        sec = {"pin_hash": None, "hotspot_pass": psk}
+        write_secrets(sec)
+    doc = {
+        "version": 1,
+        "playback": {"max_bitrate": 0, "max_height": 1080, "hdr": False, "prefer_original": True},
+        "networks": {},
+        "display": {"output_max_height": height, "subtitle_scale": 1.0, "audio_passthrough": False},
+        "system": {"jellyfin_url": url, "hotspot_ssid": ssid, "pin_set": sec["pin_hash"] is not None},
+    }
+    validate(doc)
+    write_settings(doc)
+    log("settings migrated from the legacy files")
+    return doc
+
+
+VERSION = ""
+
+
+def init():
+    """Load or migrate the store, make sure the pair token exists, cache the version."""
+    global VERSION
+    os.makedirs(P("/var/lib/pifin"), exist_ok=True)
+    path = P(SETTINGS)
+    doc = None
+    if os.path.exists(path):
+        try:
+            doc = load_settings()
+            validate(doc)
+        except (OSError, ValueError, Invalid):
+            bad = f"{path}.bad-{int(time.time())}"
+            os.replace(path, bad)
+            log(f"settings.json was invalid, kept as {os.path.basename(bad)}")
+            doc = None
+    if doc is None:
+        doc = migrate()
+    try:
+        sec = load_secrets()
+        if not secrets_ok(sec):
+            raise ValueError("bad secrets.json")
+    except (OSError, ValueError):
+        if os.path.exists(P(SECRETS)):
+            os.replace(P(SECRETS), f"{P(SECRETS)}.bad-{int(time.time())}")
+            log("secrets.json was invalid, recreated (the PIN is cleared)")
+        sec = {"pin_hash": None, "hotspot_pass": ""}
+        write_secrets(sec)
+    pin_set = sec["pin_hash"] is not None
+    if doc["system"]["pin_set"] != pin_set:
+        doc["system"]["pin_set"] = pin_set
+        write_settings(doc)
+    if not os.path.exists(P(PAIR_TOKEN)):
+        write_pair_token()
+    rc, out = RUN([PIFIN_BIN, "--version"], timeout=5)
+    out = out.strip()
+    VERSION = out[len("pifin "):] if rc == 0 and out.startswith("pifin ") else ""
+
+
+def write_pair_token():
+    token = secrets.token_hex(16)
+    write_atomic(P(PAIR_TOKEN), token, 0o640, 0, group_id())
+    return token
+
+
+# ---- PIN ------------------------------------------------------------------
+
+FAILS = 0
+LOCK_UNTIL = 0.0
+
+
+def hash_pin(pin):
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, PIN_ITER)
+    return f"pbkdf2_sha256${PIN_ITER}${salt.hex()}${h.hex()}"
+
+
+def pin_matches(pin, stored):
+    try:
+        _, iters, salt, want = stored.split("$")
+        h = hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), int(iters))
+    except (ValueError, UnicodeEncodeError):
+        return False
+    return hmac.compare_digest(h.hex(), want)
+
+
+def verify_pin(pin, stored):
+    """Raise unless pin matches stored. Counts failures; 5 in a row lock for 60 s."""
+    global FAILS, LOCK_UNTIL
+    if NOW() < LOCK_UNTIL:
+        raise Invalid("locked_out", "Too many wrong PINs. Try again in a minute.")
+    if pin is None or pin == "":
+        raise Invalid("pin_required", "Enter the PIN.")
+    if not isinstance(pin, str) or not pin_matches(pin, stored):
+        FAILS += 1
+        if FAILS >= PIN_MAX_FAILS:
+            FAILS = 0
+            LOCK_UNTIL = NOW() + PIN_LOCK_SECS
+            raise Invalid("locked_out", "Too many wrong PINs. Try again in a minute.")
+        raise Invalid("pin_wrong", "Wrong PIN.")
+    FAILS = 0
+
+
+def pin_gate(pin):
+    """Sensitive ops: free when no PIN is set, else the PIN must verify."""
+    stored = load_secrets()["pin_hash"]
+    if stored:
+        verify_pin(pin, stored)
+
+
+def store_pin(pin_hash):
+    sec = load_secrets()
+    sec["pin_hash"] = pin_hash
+    write_secrets(sec)
+    doc = load_settings()
+    doc["system"]["pin_set"] = pin_hash is not None
+    write_settings(doc)
+
+
+# ---- side effects ---------------------------------------------------------
+
+def set_env_lines(path, values, mode):
+    """Replace or append KEY=<sh_quote> lines, keep every other line."""
+    lines = (read_text(path) or "").splitlines()
+    done = set()
+    out = []
+    for line in lines:
+        key = line.partition("=")[0].strip()
+        if key in values:
+            if key in done:
+                continue
+            out.append(f"{key}={sh_quote(values[key])}")
+            done.add(key)
+        else:
+            out.append(line)
+    out += [f"{k}={sh_quote(v)}" for k, v in values.items() if k not in done]
+    write_atomic(path, "\n".join(out) + "\n", mode, 0, 0)
+
+
+def set_comitup_lines(path, values):
+    """Edit comitup.conf in place: only the given `key: value` lines change."""
+    lines = (read_text(path) or "").splitlines()
+    done = set()
+    out = []
+    for line in lines:
+        key = line.partition(":")[0].strip()
+        if ":" in line and key in values:
+            if key in done:
+                continue
+            out.append(f"{key}: {values[key]}")
+            done.add(key)
+        else:
+            out.append(line)
+    out += [f"{k}: {v}" for k, v in values.items() if k not in done]
+    # In place, not tmp + rename: the unit makes /etc read-only except this one file
+    # (ReadWritePaths=/etc/comitup.conf), so no temp file can be created next to it.
+    data = ("\n".join(out) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.ftruncate(fd, len(data))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def sync_jellyfin_url(url):
+    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
+    path = auth_path()
+    try:
+        auth = load_json(path)
+    except FileNotFoundError:
+        auth = None  # nobody signed in yet
+    except (OSError, ValueError):
+        log("auth.json unreadable, server address not updated there")
+        auth = None
+    if isinstance(auth, dict):
+        auth["server"] = url
+        uid, gid = user_ids()
+        write_atomic(path, json.dumps(auth, indent=2) + "\n", 0o600, uid, gid)
+    RUN(["systemctl", "restart", "pifin-firewall"])
+
+
+def sync_hotspot(psk=None, ssid=None):
+    env, com = {}, {}
+    if psk is not None:
+        env["HOTSPOT_PASS"] = psk
+        com["ap_password"] = "'" + psk.replace("'", "''") + "'"
+    if ssid is not None:
+        env["HOTSPOT_SSID"] = ssid
+        com["ap_name"] = ssid
+    set_env_lines(P(SECRETS_ENV), env, 0o600)
+    set_comitup_lines(P(COMITUP_CONF), com)
+    _, out = RUN(["busctl", "call", "--system", "com.github.davesteele.comitup",
+                  "/com/github/davesteele/comitup", "com.github.davesteele.comitup", "state"])
+    if out.startswith('ss "HOTSPOT"'):
+        RUN(["systemctl", "restart", "comitup"])
+
+
+# ---- ops ------------------------------------------------------------------
+
+def status():
+    try:
+        wifi = load_json(P(WIFI_JSON))
+        if not isinstance(wifi, dict):
+            wifi = {}
+    except (OSError, ValueError):
+        wifi = {}
+    return {
+        "wifi": {"state": wifi.get("state") or "unknown", "ssid": wifi.get("ssid") or "",
+                 "radio": None, "iface": None, "signal_dbm": None, "ip": None},
+        "macs": {"builtin": None, "usb": None},
+        "tailscale": {"state": "unknown", "name": None, "ip": None},
+        "version": VERSION,
+    }
+
+
+def op_get(req):
+    return {"settings": load_settings(), "status": status()}
+
+
+def op_set(req):
+    changes = req.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        raise Invalid("bad_request", "changes must be a non-empty object.")
+    for k in changes:
+        if k not in SETTABLE:
+            raise Invalid("bad_request", f"Unknown setting: {str(k)[:64]}.")
+    if SENSITIVE & changes.keys():
+        pin_gate(req.get("pin"))
+    doc = load_settings()
+    sec = load_secrets()
+    new, new_sec = copy.deepcopy(doc), dict(sec)
+    for k, v in changes.items():
+        if k == "secrets.hotspot_pass":
+            check_psk(v)
+            new_sec["hotspot_pass"] = v
+        elif k == "system.jellyfin_url" and v == "":
+            raise Invalid("invalid_value", URL_MSG)
+        else:
+            section, field = k.split(".")
+            new[section][field] = v
+    validate(new)
+    if new != doc:
+        write_settings(new)
+    if new_sec != sec:
+        write_secrets(new_sec)
+    if "system.jellyfin_url" in changes:
+        sync_jellyfin_url(new["system"]["jellyfin_url"])
+    if "display.output_max_height" in changes:
+        write_atomic(P(DISPLAY_CONF), f"MAX_HEIGHT={new['display']['output_max_height']}\n", 0o644, 0, 0)
+    if "secrets.hotspot_pass" in changes or "system.hotspot_ssid" in changes:
+        sync_hotspot(new_sec["hotspot_pass"] if "secrets.hotspot_pass" in changes else None,
+                     new["system"]["hotspot_ssid"] if "system.hotspot_ssid" in changes else None)
+    return {"settings": new}
+
+
+def op_network_set(req):
+    ssid, limits = req.get("ssid"), req.get("limits")
+    check_ssid(ssid)
+    doc = load_settings()
+    new = copy.deepcopy(doc)
+    if limits is None or limits == {}:
+        new["networks"].pop(ssid, None)
+    else:
+        check_limits(limits)
+        new["networks"][ssid] = limits
+    validate(new)
+    if new != doc:
+        write_settings(new)
+    return {"settings": new}
+
+
+def check_pin_format(pin):
+    if not isinstance(pin, str) or not PIN_RE.match(pin):
+        raise Invalid("invalid_value", PIN_MSG)
+
+
+def op_pin_set(req):
+    pin = req.get("pin")
+    check_pin_format(pin)
+    stored = load_secrets()["pin_hash"]
+    if stored:
+        verify_pin(req.get("old_pin"), stored)
+    store_pin(hash_pin(pin))
+    return None
+
+
+def op_pin_clear(req):
+    stored = load_secrets()["pin_hash"]
+    if stored:
+        verify_pin(req.get("pin"), stored)
+        store_pin(None)
+    return None
+
+
+def op_pin_check(req):
+    pin_gate(req.get("pin"))
+    return True
+
+
+def op_pair_reset(req):
+    return {"token": write_pair_token()}
+
+
+# op -> (function, needs the store lock). Task 2 adds the system ops here.
+OPS = {
+    "get": (op_get, False),
+    "set": (op_set, True),
+    "network_set": (op_network_set, True),
+    "pin_set": (op_pin_set, True),
+    "pin_clear": (op_pin_clear, True),
+    "pin_check": (op_pin_check, True),
+    "pair_reset": (op_pair_reset, True),
+}
+LOCK = threading.Lock()
+
+
+def handle(req):
+    """One request dict -> one response dict."""
+    if not isinstance(req, dict) or not isinstance(req.get("op"), str):
+        return {"ok": False, "error": "bad_request", "message": "Expected a JSON object with an op."}
+    op = req["op"]
+    if op not in OPS:
+        return {"ok": False, "error": "bad_request", "message": f"Unknown op: {op[:32]}."}
+    fn, locked = OPS[op]
+    try:
+        if locked:
+            with LOCK:
+                result = fn(req)
+        else:
+            result = fn(req)
+        return {"ok": True, "result": result}
+    except Invalid as e:
+        return {"ok": False, "error": e.code, "message": e.message}
+    except Exception as e:  # noqa: BLE001 -- the daemon must keep answering
+        # type and file name only: an exception text could quote a value
+        where = f" ({getattr(e, 'filename', '')})" if isinstance(e, OSError) else ""
+        log(f"op {op} failed: {type(e).__name__}{where}")
+        return {"ok": False, "error": "failed", "message": f"Internal error ({type(e).__name__})."}
+
+
+def handle_line(line):
+    try:
+        req = json.loads(line)
+    except ValueError:
+        return {"ok": False, "error": "bad_request", "message": "Not JSON."}
+    return handle(req)
+
+
+# ---- socket ---------------------------------------------------------------
+
+class Handler(socketserver.StreamRequestHandler):
+    timeout = IDLE_TIMEOUT
+
+    def handle(self):
+        while True:
+            try:
+                line = self.rfile.readline(MAX_LINE + 1)
+            except OSError:  # idle timeout or peer gone
+                return
+            if not line:
+                return
+            if len(line) > MAX_LINE:
+                self.reply({"ok": False, "error": "bad_request", "message": "Request too long."})
+                return
+            self.reply(handle_line(line))
+
+    def reply(self, resp):
+        try:
+            self.wfile.write((json.dumps(resp) + "\n").encode())
+            self.wfile.flush()
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+
+def make_server():
+    gid = group_id()
+    run_dir = P(RUN_DIR)
+    os.makedirs(run_dir, exist_ok=True)
+    chown(run_dir, 0, gid)
+    os.chmod(run_dir, 0o750)
+    sock = P(SOCK)
+    try:
+        os.unlink(sock)  # stale socket from a previous run
+    except FileNotFoundError:
+        pass
+    server = Server(sock, Handler)
+    os.chmod(sock, 0o660)
+    chown(sock, 0, gid)
+    return server
+
+
+def main():
+    os.umask(0o077)  # the socket stays private until its chmod
+    init()
+    server = make_server()
+    log("listening")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -50,6 +50,8 @@ INSTALL = [
     ("pifin-firewall.service", "/etc/systemd/system/pifin-firewall.service", "0644"),
     ("pifin-sshd.conf", "/etc/ssh/sshd_config.d/01-pifin.conf", "0644"),
     ("99-pifin-uinput.rules", "/etc/udev/rules.d/99-pifin-uinput.rules", "0644"),
+    ("pifin-settingsd", "/usr/local/sbin/pifin-settingsd", "0755"),
+    ("pifin-settingsd.service", "/etc/systemd/system/pifin-settingsd.service", "0644"),
 ]
 # Config the Pi needs at run time -> /etc/pifin/secrets.env (0600, sourced by root only)
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",

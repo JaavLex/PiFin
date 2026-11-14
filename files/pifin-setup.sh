@@ -138,7 +138,7 @@ fi
 step "App, TV remote (CEC) and phone remote services"
 usermod -aG video,render,input,audio,tty,netdev "$USER_NAME"
 systemctl daemon-reload
-systemctl enable pifin-app.service pifin-cec-remote.service pifin-remote.service pifin-wifi-watchdog.service
+systemctl enable pifin-app.service pifin-cec-remote.service pifin-remote.service pifin-wifi-watchdog.service pifin-settingsd.service
 systemctl set-default multi-user.target
 # desktop helpers the kiosk never uses (~60 MB, and they pulled in Xwayland)
 systemctl --global mask xdg-desktop-portal.service xdg-desktop-portal-gtk.service \
