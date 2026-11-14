@@ -1,0 +1,4 @@
+# PiFin: a USB Wi-Fi adapter plugged in or pulled out -> comitup restarts and
+# pifin-wifi-select picks the radio again (does nothing while comitup is stopped,
+# e.g. at boot before it starts, or while the Wi-Fi watchdog resets the adapter).
+ACTION=="add|remove", SUBSYSTEM=="net", ENV{DEVTYPE}=="wlan", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemctl --no-block try-restart comitup.service"

@@ -1,0 +1,66 @@
+#!/bin/sh
+# PiFin: choose the Wi-Fi radio, just before comitup starts (its ExecStartPre).
+#
+# The Pi 4's built-in Wi-Fi is weak: ~10 Mbit/s at best, and HDMI drowns its
+# 2.4 GHz band. When a USB Wi-Fi adapter is plugged in, it does everything (the
+# local network and the setup hotspot), and the built-in radio rests: unmanaged,
+# so NetworkManager never puts a second connection on it. Without an adapter the
+# built-in radio does everything, as before. Interface names (wlan0, wlan1) can
+# swap between boots, so radios are told apart by their bus, not by name.
+# 90-pifin-usb-wifi.rules restarts comitup when an adapter comes or goes.
+#
+# It never fails: comitup must start whatever happens here.
+
+CONF=/etc/comitup.conf
+NMCONF=/etc/NetworkManager/conf.d/91-pifin-builtin-wifi.conf
+
+usb="" builtin=""
+for d in /sys/class/net/*; do
+  [ -d "$d/wireless" ] || continue
+  case "$(readlink -f "$d/device")" in
+    */usb*) [ -n "$usb" ] || usb=${d##*/} ;;
+    *) builtin="$builtin ${d##*/}" ;;
+  esac
+done
+builtin=${builtin# }
+
+if [ -n "$usb" ]; then
+  primary=$usb
+  macs=""
+  for i in $builtin; do macs="$macs${macs:+,}mac:$(cat "/sys/class/net/$i/address")"; done
+  if [ -n "$macs" ]; then
+    # persistent, so a NetworkManager restart (an update at night) keeps it off
+    want=$(printf '# pifin-wifi-select: a USB Wi-Fi adapter is in use, the built-in radio rests\n[device-pifin-builtin-wifi]\nmatch-device=%s\nmanaged=0' "$macs")
+    if [ "$(cat "$NMCONF" 2>/dev/null)" != "$want" ]; then
+      printf '%s\n' "$want" > "$NMCONF"
+      nmcli general reload conf
+    fi
+    for i in $builtin; do
+      case "$(nmcli -g GENERAL.STATE device show "$i" 2>/dev/null)" in
+        10\ *) ;;  # already unmanaged
+        *) nmcli device disconnect "$i" >/dev/null 2>&1
+           nmcli device set "$i" managed no ;;
+      esac
+      ip link set "$i" down
+    done
+  fi
+else
+  primary=${builtin%% *}
+  if [ -e "$NMCONF" ]; then  # the adapter is gone: the built-in radio takes over
+    rm -f "$NMCONF"
+    nmcli general reload conf
+    for i in $builtin; do nmcli device set "$i" managed yes; done
+  fi
+fi
+
+if [ -n "$primary" ] && [ -f "$CONF" ]; then
+  if ! grep -qx "primary_wifi_device: $primary" "$CONF"; then
+    if grep -q '^primary_wifi_device:' "$CONF"; then
+      sed -i "s/^primary_wifi_device:.*/primary_wifi_device: $primary/" "$CONF"
+    else
+      echo "primary_wifi_device: $primary" >> "$CONF"
+    fi
+  fi
+fi
+echo "pifin-wifi-select: comitup uses ${primary:-none}${usb:+ (USB adapter)}${builtin:+, built-in: $builtin}"
+exit 0

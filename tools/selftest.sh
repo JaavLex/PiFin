@@ -15,7 +15,7 @@ ssh-keygen -q -t ed25519 -N '' -C selftest -f "$D/id_ed25519"
 echo "== syntax =="
 python3 -m py_compile build.py files/*.py files/pifin-remote/*.py \
   && ok "python compiles" || bad "python compiles"
-for f in files/pifin-setup.sh files/pifin-comitup-callback; do
+for f in files/pifin-setup.sh files/pifin-comitup-callback files/pifin-wifi-select files/pifin-wifi-watchdog; do
   bash -n "$f" && ok "bash -n $(basename "$f")" || bad "bash -n $(basename "$f")"
 done
 if command -v node >/dev/null; then
@@ -59,7 +59,7 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 24)  # 21 installed + secrets.env + display.conf + app.conf
+eq("file count", len(wf), 27)  # 24 installed + secrets.env + display.conf + app.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 eq("app.conf", wf["/etc/pifin/app.conf"]["content"], "JELLYFIN_URL=http://jellyfin.example:8096\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")

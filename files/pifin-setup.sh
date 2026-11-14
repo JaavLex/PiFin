@@ -113,7 +113,9 @@ cat > /etc/NetworkManager/conf.d/90-pifin-wifi.conf <<'EOF'
 wifi.powersave = 2
 EOF
 systemctl reload NetworkManager || true        # reloads conf.d, does not touch the link
-iw dev wlan0 set power_save off 2>/dev/null || true   # best effort for the current association
+for w in /sys/class/net/*/wireless; do         # best effort for the current association
+  [ -d "$w" ] && { i=${w%/wireless}; iw dev "${i##*/}" set power_save off 2>/dev/null || true; }
+done
 
 step "Comitup: retry the known networks 1 min after a failed attempt"
 # comitup's FAIL_TIMEOUT is hard-coded: it is how long comitup waits in HOTSPOT
@@ -157,10 +159,20 @@ systemctl daemon-reload
 
 step "Migrate home Wi-Fi to a native NetworkManager profile"
 if [ -n "${WIFI_SSID:-}" ] && ! nmcli -t -f NAME con show | grep -qx "$WIFI_SSID"; then
-  nmcli con add type wifi ifname wlan0 con-name "$WIFI_SSID" ssid "$WIFI_SSID" \
+  nmcli con add type wifi con-name "$WIFI_SSID" ssid "$WIFI_SSID" \
     wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_PSK" connection.autoconnect yes || true
   rm -f /etc/netplan/50-cloud-init.yaml
 fi
+
+step "Wi-Fi: a USB adapter takes over from the built-in radio"
+# pifin-wifi-select (before comitup) picks the radio: a USB Wi-Fi adapter when one
+# is plugged in, else the built-in one. So no network profile may be tied to an
+# interface name (older PiFin bound the home Wi-Fi to wlan0), and all use the
+# standard MTU (some had 1280, which fragments every full-size Tailscale packet).
+for u in $(nmcli -t -f UUID,TYPE con show | sed -n 's/:802-11-wireless$//p'); do
+  case "$(nmcli -g 802-11-wireless.mode con show "$u")" in ap|adhoc|mesh) continue ;; esac
+  nmcli con modify "$u" connection.interface-name "" 802-11-wireless.mtu 0 || true
+done
 
 step "Security: firewall, SSH keys only, services without root"
 # The Pi joins networks you don't control and is a member of your tailnet.

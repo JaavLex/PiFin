@@ -60,6 +60,11 @@ progress goes back to the server, so you pick up at home where you stopped at th
 ## Requirements
 
 - Raspberry Pi 4 with 2 GB or more (a Pi 5 should work, untested), and an HDMI TV.
+- Optional booster: a USB Wi-Fi adapter with an in-kernel driver (tested: TP-Link Archer T3U
+  Plus, `rtw88_8822bu`), on a short USB extension away from the HDMI cable. PiFin works the
+  same without one, on the built-in Wi-Fi; an adapter just makes it faster and steadier (the
+  Pi 4's built-in Wi-Fi tops out around 10 Mbit/s and HDMI drowns its 2.4 GHz band). Plug it
+  in and PiFin switches to it on its own; pull it out and the built-in Wi-Fi takes over again.
 - A Jellyfin server the Pi can reach. For use away from home, Tailscale on the server.
 - To prepare the card: Python 3 with PyYAML (`pip install pyyaml`) and `openssl`.
 
