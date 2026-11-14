@@ -45,15 +45,55 @@ ART = {
 }
 
 
-def movie(id, name, year, secs, overview, genres, rating, art_b=True, people=()):
+def streams_of(multi):
+    """One audio and one subtitle track, or (multi) English + French audio and subtitles."""
+    s = [{"Index": 0, "Type": "Video", "Codec": "h264", "DisplayTitle": "1080p H264 SDR"},
+         {"Index": 1, "Type": "Audio", "Codec": "aac", "Language": "eng", "DisplayTitle": "English - AAC - Stereo - Default", "IsDefault": True}]
+    if multi:
+        s += [{"Index": 2, "Type": "Audio", "Codec": "aac", "Language": "fre", "DisplayTitle": "French - AAC - Stereo"},
+              {"Index": 3, "Type": "Subtitle", "Codec": "subrip", "Language": "eng", "DisplayTitle": "English - SUBRIP", "IsTextSubtitleStream": True},
+              {"Index": 4, "Type": "Subtitle", "Codec": "subrip", "Language": "fre", "DisplayTitle": "French - SUBRIP", "IsTextSubtitleStream": True}]
+    else:
+        s.append({"Index": 2, "Type": "Subtitle", "Codec": "subrip", "Language": "eng", "DisplayTitle": "English - SUBRIP", "IsTextSubtitleStream": True})
+    return s
+
+
+# per user Configuration (in memory), as GET /Users/Me returns it and POST /Users/Configuration stores it
+CONFIGS = {}
+CULTURES = [("Arabic", "ar", "ara"), ("Chinese", "zh", "chi"), ("Dutch", "nl", "dut"), ("English", "en", "eng"),
+            ("French", "fr", "fre"), ("German", "de", "ger"), ("Italian", "it", "ita"), ("Japanese", "ja", "jpn"),
+            ("Portuguese", "pt", "por"), ("Russian", "ru", "rus"), ("Spanish", "es", "spa"), ("Swedish", "sv", "swe")]
+
+
+def config_of(uid):
+    return CONFIGS.setdefault(uid, {"AudioLanguagePreference": None, "SubtitleLanguagePreference": "",
+                                    "SubtitleMode": "Default", "PlayDefaultAudioTrack": True,
+                                    "RememberAudioSelections": True, "EnableNextEpisodeAutoPlay": True})
+
+
+def default_streams(streams, cfg):
+    """(audio index, subtitle index or -1) the way Jellyfin picks them from the user's prefs."""
+    audio = [s for s in streams if s["Type"] == "Audio"]
+    subs = [s for s in streams if s["Type"] == "Subtitle"]
+    want = cfg.get("AudioLanguagePreference") or ""
+    a = next((s for s in audio if want and s.get("Language") == want), None) \
+        or next((s for s in audio if s.get("IsDefault")), None) or (audio[0] if audio else None)
+    mode, lang = cfg.get("SubtitleMode", "Default"), cfg.get("SubtitleLanguagePreference") or ""
+    if mode == "None":
+        sub = None
+    elif mode == "Always":
+        sub = next((s for s in subs if not lang or s.get("Language") == lang), None)
+    else:
+        sub = next((s for s in subs if s.get("IsDefault") or s.get("IsForced")), None)
+    return (a["Index"] if a else None), (sub["Index"] if sub else -1)
+
+
+def movie(id, name, year, secs, overview, genres, rating, art_b=True, people=(), multi=False):
     return {"Id": id, "Name": name, "Type": "Movie", "ProductionYear": year, "RunTimeTicks": secs * T,
             "Overview": overview, "Genres": genres, "CommunityRating": rating, "OfficialRating": "PG",
             "ImageTags": {"Primary": id + "-p"}, "BackdropImageTags": [id + "-b"] if art_b else [id + "-p"],
             "People": [{"Id": "p-" + re.sub(r"\W", "", n).lower(), "Name": n, "Role": r, "Type": "Actor"} for n, r in people],
-            "MediaSources": [{"Id": id, "Bitrate": 8_000_000, "MediaStreams": [
-                {"Index": 0, "Type": "Video", "Codec": "h264", "DisplayTitle": "1080p H264 SDR"},
-                {"Index": 1, "Type": "Audio", "Codec": "aac", "DisplayTitle": "English - AAC - Stereo - Default", "IsDefault": True},
-                {"Index": 2, "Type": "Subtitle", "Codec": "subrip", "DisplayTitle": "English - SUBRIP", "IsTextSubtitleStream": True}]}]}
+            "MediaSources": [{"Id": id, "Bitrate": 8_000_000, "MediaStreams": streams_of(multi)}]}
 
 
 MOVIES = [
@@ -64,8 +104,8 @@ MOVIES = [
     movie("tos", "Tears of Steel", 2012, 734, "In a future Amsterdam, a group of scientists tries to save the world from destructive robots.", ["Science Fiction", "Action"], 6.2,
           people=[("Derek de Lint", ""), ("Sergio Hasselbaink", ""), ("Rogier Schippers", ""), ("Vanja Rukavina", ""), ("Denise Rebergen", "")]),
     movie("sintel", "Sintel", 2010, 888, "A lonely young woman searches the world for the baby dragon she once rescued and raised.", ["Fantasy", "Adventure"], 7.4,
-          people=[("Halina Reijn", "Sintel"), ("Thom Hoffman", "Shaman")]),
-    movie("bbb", "Big Buck Bunny", 2008, 596, "A giant rabbit with a heart bigger than himself gets even with three bullying rodents.", ["Animation", "Comedy"], 6.5),
+          people=[("Halina Reijn", "Sintel"), ("Thom Hoffman", "Shaman")], multi=True),
+    movie("bbb", "Big Buck Bunny", 2008, 596, "A giant rabbit with a heart bigger than himself gets even with three bullying rodents.", ["Animation", "Comedy"], 6.5, multi=True),
     movie("ed", "Elephants Dream", 2006, 654, "Two men wander through a strange machine world, and do not agree on what it is.", ["Animation", "Science Fiction"], 5.9,
           people=[("Tygo Gernandt", "Proog"), ("Cas Jansen", "Emo")]),
 ]
@@ -138,6 +178,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/QuickConnect/Initiate":
             return self.send(200, {"Secret": "demo", "Code": "318427", "Authenticated": False})
+        if path == "/Users/Configuration":
+            uid, _ = self.user()
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if uid:
+                config_of(uid).update(body)
         self.send(204)
 
     def do_DELETE(self):
@@ -164,7 +210,16 @@ class Handler(BaseHTTPRequestHandler):
         if not uid:
             return self.send(401, {"error": "unauthorized"})
         if path == "/Users/Me":
-            return self.send(200, {"Id": uid, "Name": name, "Policy": {"IsAdministrator": uid == "u1"}})
+            return self.send(200, {"Id": uid, "Name": name, "Policy": {"IsAdministrator": uid == "u1"}, "Configuration": config_of(uid)})
+        if path == "/Localization/Cultures":
+            return self.send(200, [{"Name": n, "DisplayName": n, "TwoLetterISOLanguageName": two,
+                                    "ThreeLetterISOLanguageName": three, "ThreeLetterISOLanguageNames": [three]}
+                                   for n, two, three in CULTURES])
+        if m := re.fullmatch(r"/Items/([\w-]+)/PlaybackInfo", path):
+            src = ITEMS.get(m.group(1), {}).get("MediaSources", [{}])[0]
+            a, s = default_streams(src.get("MediaStreams", []), config_of(uid))
+            return self.send(200, {"PlaySessionId": "demo", "MediaSources": [
+                {"Id": src.get("Id"), "DefaultAudioStreamIndex": a, "DefaultSubtitleStreamIndex": s}]})
         if re.fullmatch(r"/Users/\w+/Images/Primary", path):
             return self.send(404, {"error": "no avatar"})
         if path.endswith("/Items/Resume"):

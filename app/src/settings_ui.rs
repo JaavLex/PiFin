@@ -6,6 +6,7 @@
 //! Sections: rows come from `build_rows`; the Network section lives in `net`
 //! (settings_ui/net.rs), Task 6 adds the language rows to Display & audio.
 
+mod lang;
 mod net;
 
 use crate::settings::{self, DaemonError, Settings};
@@ -175,6 +176,7 @@ pub struct View<'a> {
     /// A TV resolution change was saved: offer "Restart now".
     pub restart_offered: bool,
     pub net: &'a net::NetState,
+    pub lang: &'a lang::LangState,
 }
 
 pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
@@ -198,7 +200,7 @@ pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
             }
             r.push(choice_row("display.subtitle_scale", "Subtitle size"));
             r.push(toggle_row("display.audio_passthrough", "Audio passthrough"));
-            // Task 6: audio language, subtitle language, subtitle mode
+            r.extend(lang::rows(v.lang));
             r
         }
         SYSTEM => {
@@ -362,8 +364,11 @@ enum PadFor {
     CurrentForRemove,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum PickFor {
+    LangAudio,
+    LangSub,
+    LangMode,
     Choice(&'static str),
     PinMenu,
     Saved,
@@ -410,6 +415,7 @@ struct Ui {
     busy: bool,
     message: String,
     net: net::NetState,
+    lang: lang::LangState,
 }
 
 thread_local! {
@@ -424,7 +430,7 @@ fn error_text(e: &DaemonError) -> String {
 fn sync(app: &App, u: &Ui) {
     let s = settings::current();
     let section = app.get_settings_section().clamp(0, SECTIONS.len() as i32 - 1) as usize;
-    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net };
+    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net, lang: &u.lang };
     let rows = build_rows(section, &view);
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
     app.set_settings_row(valid_focus(&kinds, app.get_settings_row()));
@@ -534,6 +540,9 @@ fn refresh_status(app: &App) {
 // ---- choices and toggles: shown at once, sent after the last step ---------------------------
 
 fn step(app: &App, u: &mut Ui, key: &str, delta: i32) {
+    if key == "lang.mode" {
+        return lang::step(app, u, delta);
+    }
     let s = settings::current();
     let cur = u.pending.get(key).cloned().or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
     let new = match choice(key) {
@@ -615,6 +624,7 @@ fn activate(app: &App, u: &mut Ui, key: &str) {
         "system.pair" => u.message = "Coming soon".into(),
         "system.reboot" => open_overlay(app, u, Overlay::Confirm(ConfirmFor::Reboot)),
         k if k.starts_with("net.") => net::activate(app, u, k),
+        k if k.starts_with("lang.") => lang::activate(app, u, k),
         _ => {}
     }
 }
@@ -652,6 +662,7 @@ fn picker_ok(app: &App, u: &mut Ui) {
                 set_pending(app, u, key, c.json(sel));
             }
         }
+        PickFor::LangAudio | PickFor::LangSub | PickFor::LangMode => lang::picked(app, u, purpose, sel),
         PickFor::PinMenu if sel == 0 => open_pad(app, u, "Current PIN", PadFor::CurrentForChange),
         PickFor::PinMenu => open_pad(app, u, "Current PIN", PadFor::CurrentForRemove),
         PickFor::Saved | PickFor::Scan => net::picked(app, u, purpose, sel, &items),
@@ -822,14 +833,21 @@ fn open_at(app: &App, section: usize) {
             net::section_opened(app, u);
         } else {
             refresh_status(app);
+            if section == DISPLAY {
+                lang::section_opened(app, u);
+            }
         }
     });
 }
 
 /// Register the Settings callbacks (the gear's `open-settings` is wired by main) and the
 /// Wi-Fi setup screen's OK. `server_probe` measures the Jellyfin server for Test connection.
-pub fn install(app: &App, server_probe: net::Probe) {
-    UI.with(|cell| cell.borrow_mut().net.probe = Some(server_probe));
+pub fn install(app: &App, server_probe: net::Probe, client: std::sync::Arc<crate::jellyfin::Client>, user: String) {
+    UI.with(|cell| {
+        let mut u = cell.borrow_mut();
+        u.net.probe = Some(server_probe);
+        u.lang.api = Some(lang::Api { client, user });
+    });
     let sections: Vec<SharedString> = SECTIONS.iter().map(|s| SharedString::from(*s)).collect();
     app.set_settings_sections(ModelRc::new(VecModel::from(sections)));
 
@@ -854,6 +872,9 @@ pub fn install(app: &App, server_probe: net::Probe) {
             net::section_opened(app, u);
         } else {
             net::section_left(u);
+            if section == DISPLAY as i32 {
+                lang::section_opened(app, u);
+            }
         }
     }));
     // OK on the Wi-Fi setup screen (hotspot): Settings > Network, straight into Add network
@@ -929,7 +950,7 @@ mod tests {
             macs: Macs { builtin: Some("aa".into()), usb: Some("bb".into()) },
             ..Default::default()
         };
-        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default() })
+        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default(), lang: &lang::LangState::default() })
     }
 
     #[test]

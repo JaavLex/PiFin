@@ -24,6 +24,8 @@ pub struct MediaStream {
     pub is_text_subtitle_stream: bool,
     pub title: Option<String>,
     pub height: Option<i32>,
+    /// ISO 639 code of the track's language (display only).
+    pub language: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -81,6 +83,9 @@ pub struct Item {
     /// Set by the app for the action cards on a movie page ("resume" / "start").
     #[serde(skip)]
     pub action: Option<&'static str>,
+    /// The server's default (audio, subtitle) stream indexes for this user; None until fetched.
+    #[serde(skip)]
+    pub defaults: Option<(Option<i32>, Option<i32>)>,
 }
 
 impl Item {
@@ -101,6 +106,95 @@ impl Item {
 struct Items {
     items: Vec<Item>,
     total_record_count: i64,
+}
+/// Audio language, subtitle language ("" = Any) and subtitle mode of a Jellyfin user.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LangPrefs {
+    pub audio: String,
+    pub subtitle: String,
+    pub mode: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct PbSource {
+    default_audio_stream_index: Option<i32>,
+    default_subtitle_stream_index: Option<i32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct PbInfo {
+    media_sources: Vec<PbSource>,
+}
+
+/// (audio, subtitle) defaults out of a PlaybackInfo answer; subtitle -1 or missing = none.
+fn parse_playback_defaults(json: &str) -> Result<(Option<i32>, Option<i32>), String> {
+    let p: PbInfo = serde_json::from_str(json).map_err(|e| format!("bad PlaybackInfo: {e}"))?;
+    Ok(p.media_sources.first().map_or((None, None), |s| {
+        (s.default_audio_stream_index.filter(|i| *i >= 0), s.default_subtitle_stream_index.filter(|i| *i >= 0))
+    }))
+}
+
+/// Read the three language keys out of a user's Configuration.
+pub(crate) fn lang_prefs_of(cfg: &serde_json::Value) -> LangPrefs {
+    let s = |k: &str| cfg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    LangPrefs { audio: s("AudioLanguagePreference"), subtitle: s("SubtitleLanguagePreference"), mode: s("SubtitleMode") }
+}
+
+/// Write the three language keys into a Configuration.
+fn with_lang_prefs(mut cfg: serde_json::Value, p: &LangPrefs) -> serde_json::Value {
+    if let Some(o) = cfg.as_object_mut() {
+        o.insert("AudioLanguagePreference".into(), p.audio.clone().into());
+        o.insert("SubtitleLanguagePreference".into(), p.subtitle.clone().into());
+        o.insert("SubtitleMode".into(), p.mode.clone().into());
+    }
+    cfg
+}
+
+/// Cultures list -> (ThreeLetterISOLanguageName, DisplayName), deduped by code, sorted by name.
+fn parse_cultures(v: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for c in v {
+        let (Some(code), Some(name)) = (c.get("ThreeLetterISOLanguageName").and_then(|x| x.as_str()), c.get("DisplayName").and_then(|x| x.as_str())) else { continue };
+        if !code.is_empty() && !out.iter().any(|(k, _)| k == code) {
+            out.push((code.to_string(), name.to_string()));
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_defaults_minus_one_and_missing_mean_none() {
+        let p = |s: &str| parse_playback_defaults(s).unwrap();
+        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":-1}]}"#), (Some(1), None));
+        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":2}]}"#), (Some(2), None));
+        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":3}]}"#), (Some(1), Some(3)));
+        assert_eq!(p(r#"{"MediaSources":[]}"#), (None, None));
+    }
+
+    #[test]
+    fn cultures_dedupe_by_code_and_sort_by_name() {
+        let v: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"DisplayName":"French","ThreeLetterISOLanguageName":"fre"},{"DisplayName":"English","ThreeLetterISOLanguageName":"eng"},
+                {"DisplayName":"French (Canada)","ThreeLetterISOLanguageName":"fre"},{"DisplayName":"None","ThreeLetterISOLanguageName":""}]"#,
+        )
+        .unwrap();
+        assert_eq!(parse_cultures(&v), vec![("eng".to_string(), "English".to_string()), ("fre".to_string(), "French".to_string())]);
+    }
+
+    #[test]
+    fn saving_keeps_the_rest_of_the_configuration() {
+        let cfg = serde_json::json!({ "PlayDefaultAudioTrack": true, "AudioLanguagePreference": null });
+        let out = with_lang_prefs(cfg, &LangPrefs { audio: "fre".into(), subtitle: "".into(), mode: "Smart".into() });
+        assert_eq!(out["PlayDefaultAudioTrack"], true);
+        assert_eq!((out["AudioLanguagePreference"].as_str(), out["SubtitleMode"].as_str()), (Some("fre"), Some("Smart")));
+    }
 }
 
 /// Fields every list asks for: enough for a card, nothing more.
@@ -238,6 +332,30 @@ impl Client {
 
     pub fn item(&self, id: &str) -> Result<Item, String> {
         self.get(&format!("/Users/{}/Items/{id}", self.auth.user_id), &[])
+    }
+
+    /// The user's language preferences, and the whole Configuration they came from.
+    pub fn lang_prefs(&self) -> Result<(LangPrefs, serde_json::Value), String> {
+        let me: serde_json::Value = self.get("/Users/Me", &[])?;
+        let cfg = me.get("Configuration").cloned().ok_or("no Configuration in /Users/Me")?;
+        Ok((lang_prefs_of(&cfg), cfg))
+    }
+
+    /// Save the three language keys inside the full Configuration (the server replaces it whole).
+    pub fn set_lang_prefs(&self, cfg: serde_json::Value, p: &LangPrefs) -> Result<(), String> {
+        self.post(&format!("/Users/Configuration?userId={}", self.auth.user_id), &with_lang_prefs(cfg, p))
+    }
+
+    /// Languages the server knows: (3-letter code, display name), by name, no duplicates.
+    pub fn cultures(&self) -> Result<Vec<(String, String)>, String> {
+        let v: Vec<serde_json::Value> = self.get("/Localization/Cultures", &[])?;
+        Ok(parse_cultures(&v))
+    }
+
+    /// The server's default (audio, subtitle) stream indexes for this user and item.
+    pub fn playback_defaults(&self, item_id: &str) -> Result<(Option<i32>, Option<i32>), String> {
+        let v: serde_json::Value = self.get(&format!("/Items/{item_id}/PlaybackInfo"), &[("userId", &self.auth.user_id)])?;
+        parse_playback_defaults(&v.to_string())
     }
 
     /// A TV library's shows, most recently updated first.

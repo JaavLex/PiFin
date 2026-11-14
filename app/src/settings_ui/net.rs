@@ -517,7 +517,7 @@ mod tests {
     fn net_rows(s: &Settings, w: WifiStatus, test: Test) -> Vec<Row> {
         let status = Status { wifi: w, ..Default::default() };
         let net = NetState { test, ..Default::default() };
-        build_rows(NETWORK, &View { settings: s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net })
+        build_rows(NETWORK, &View { settings: s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net, lang: &crate::settings_ui::lang::LangState::default() })
     }
 
     fn find<'a>(rows: &'a [Row], key: &str) -> Option<&'a Row> {

@@ -637,6 +637,45 @@ struct Plan {
     sub_names: Vec<String>,
     /// shown while starting when the connection forced a lower quality
     note: String,
+    /// mpv's track numbers for the server's default tracks (None = leave mpv's choice)
+    aid: Option<String>,
+    sid: Option<String>,
+    /// index into `subs` of the subtitle to switch on once it is added
+    select_sub: Option<usize>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Tracks {
+    aid: Option<String>,
+    sid: Option<String>,
+    select_sub: Option<usize>,
+}
+
+/// The tracks the server's defaults ask for, in mpv's terms. Direct play: mpv numbers the
+/// file's own tracks from 1 in file order (the order Jellyfin lists them); an external
+/// text subtitle is added later and selected there. Converted: the stream carries one audio
+/// track and every text subtitle is added as a file. A default that is not found leaves
+/// mpv's own choice; no default subtitle means off.
+fn tracks(streams: &[&jellyfin::MediaStream], defaults: Option<(Option<i32>, Option<i32>)>, convert: bool) -> Tracks {
+    let Some((audio, sub)) = defaults else { return Tracks::default() };
+    let mut t = Tracks::default();
+    if !convert {
+        let internal_audio = streams.iter().filter(|s| s.kind == "Audio" && !s.is_external);
+        t.aid = audio.and_then(|i| internal_audio.map(|s| s.index).position(|x| x == i)).map(|p| (p + 1).to_string());
+    }
+    match sub {
+        None => t.sid = Some("no".into()),
+        Some(i) => {
+            let internal = streams.iter().filter(|s| s.kind == "Subtitle" && !s.is_external);
+            if let Some(p) = internal.map(|s| s.index).position(|x| x == i).filter(|_| !convert) {
+                t.sid = Some((p + 1).to_string());
+                return t;
+            }
+            let files = streams.iter().filter(|s| s.kind == "Subtitle" && s.is_text_subtitle_stream && (convert || s.is_external));
+            t.select_sub = files.map(|s| s.index).position(|x| x == i);
+        }
+    }
+    t
 }
 
 /// What to do with a file: play it as is, or have the server convert it.
@@ -697,7 +736,8 @@ fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
     let height = streams.iter().find(|s| s.kind == "Video").and_then(|s| s.height);
     let (link_direct_max, link_target) = bitrate_budget(link);
     let decision = decide(bitrate, height, link, lim);
-    eprintln!("PLAN id={} source_bitrate={bitrate} height={height:?} link={link} direct_max={link_direct_max} target={link_target} limits={lim:?} -> {decision:?}", it.id);
+    let tr = tracks(&streams, it.defaults, matches!(decision, Decision::Convert { .. }));
+    eprintln!("PLAN id={} source_bitrate={bitrate} height={height:?} link={link} direct_max={link_direct_max} target={link_target} limits={lim:?} -> {decision:?} defaults={:?} aid={:?} sid={:?} select_sub={:?}", it.id, it.defaults, tr.aid, tr.sid, tr.select_sub);
     let Decision::Convert { target, max_height } = decision else {
         // direct play: internal tracks in file order, then external text subs
         let audio_names = streams.iter().filter(|s| s.kind == "Audio" && !s.is_external).map(|s| name(s)).collect();
@@ -711,11 +751,15 @@ fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
             audio_names,
             sub_names,
             note: String::new(),
-        };
+            aid: tr.aid,
+            sid: tr.sid,
+            select_sub: tr.select_sub,
+            };
     };
     // converted by the server (hardware encoder on the server side), HLS so seeking works
     let session = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
-    let audio = streams.iter().find(|s| s.kind == "Audio" && s.is_default).or(streams.iter().find(|s| s.kind == "Audio"));
+    let wanted = it.defaults.and_then(|d| d.0).and_then(|i| streams.iter().find(|s| s.kind == "Audio" && s.index == i));
+    let audio = wanted.or(streams.iter().find(|s| s.kind == "Audio" && s.is_default)).or(streams.iter().find(|s| s.kind == "Audio"));
     let text_subs: Vec<&&jellyfin::MediaStream> = streams.iter().filter(|s| s.kind == "Subtitle" && s.is_text_subtitle_stream).collect();
     // a weak link gets a lighter stream: less audio, and 720p below ~3.5 Mbit/s
     // (sharper than a starved 1080p)
@@ -742,7 +786,10 @@ fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
         session: Some(session),
         audio_names: audio.map(|a| vec![format!("{} (converted)", name(a))]).unwrap_or_default(),
         sub_names: text_subs.iter().map(|s| name(s)).collect(),
-    }
+        aid: None,
+        sid: tr.sid,
+        select_sub: tr.select_sub,
+        }
 }
 
 /// Send a command to the running mpv (blocking; used off the UI thread).
@@ -755,7 +802,7 @@ fn mpv_send(args: &[&str]) -> bool {
 
 /// External/extracted subtitles are added once playback runs: the server may take
 /// a while to extract them from a big file, and that must not delay the picture.
-fn spawn_sub_loader(subs: Vec<(String, String)>) {
+fn spawn_sub_loader(subs: Vec<(String, String)>, select: Option<usize>) {
     if subs.is_empty() {
         return;
     }
@@ -766,8 +813,8 @@ fn spawn_sub_loader(subs: Vec<(String, String)>) {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        for (url, title) in subs {
-            mpv_send(&["sub-add", &url, "auto", &title]);
+        for (i, (url, title)) in subs.into_iter().enumerate() {
+            mpv_send(&["sub-add", &url, if select == Some(i) { "select" } else { "auto" }, &title]);
         }
     });
 }
@@ -1522,7 +1569,7 @@ fn main() {
             // list items carry no media info: fetch the full item first, and measure
             // the link meanwhile (unless measured a minute ago), then come back here
             let need_link = link_bps().is_none();
-            if it.media_sources.is_empty() || need_link {
+            if it.media_sources.is_empty() || need_link || it.defaults.is_none() {
                 let client = client.clone();
                 let weak = weak.clone();
                 let it = it.clone();
@@ -1545,7 +1592,20 @@ fn main() {
                             app.set_starting(false);
                             app.set_status("Couldn't load this item from the server".into());
                             return;
+                    let defaults = it.defaults.is_none().then(|| {
+                        let (c, id) = (client.clone(), it.id.clone());
+                        std::thread::spawn(move || c.playback_defaults(&id))
+                    });
                         };
+                    let full = full.map(|mut f| {
+                        if let Some(d) = defaults {
+                            // no answer: the old behaviour (mpv's / the file's own choice)
+                            let d = d.join().ok().and_then(|r| r.map_err(|e| eprintln!("PLAYBACK_DEFAULTS: {e}")).ok());
+                            // (-1, -1) matches no stream, so `tracks` leaves everything to mpv
+                            f.defaults = Some(d.unwrap_or((Some(-1), Some(-1))));
+                        }
+                        f
+                    });
                         if !app.get_starting() {
                             return; // Back pressed while the server answered
                         }
@@ -1576,14 +1636,14 @@ fn main() {
                 "names": { "audio": plan.audio_names, "sub": plan.sub_names },
             });
             let _ = std::fs::write(NOW_FILE, now.to_string());
-            match mpv_command(&plan.url, start, &title, &MpvOpts::from_settings()).spawn() {
+            match mpv_command(&plan.url, start, &title, &MpvOpts { aid: plan.aid.clone(), sid: plan.sid.clone(), ..MpvOpts::from_settings() }).spawn() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
                     *player.borrow_mut() = Some(child);
                     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     spawn_reporter(client.clone(), it.clone(), plan.session.clone(), exited.clone(), weak.clone());
                     let sub_titles = plan.sub_names.iter().skip(plan.sub_names.len() - plan.subs.len()).cloned();
-                    spawn_sub_loader(plan.subs.iter().cloned().zip(sub_titles).collect());
+                    spawn_sub_loader(plan.subs.iter().cloned().zip(sub_titles).collect(), plan.select_sub);
                     let weak = weak.clone();
                     let player = player.clone();
                     let poll_w = Rc::downgrade(&poll);
@@ -1855,14 +1915,14 @@ fn main() {
     }
     {
         // Test connection's server side; its result also serves the next Play
-        let client = client.clone();
+        let probe_client = client.clone();
         settings_ui::install(&app, Arc::new(move || {
-            let rate = client.server_test();
+            let rate = probe_client.server_test();
             if let (Some(r), Ok(mut l)) = (rate, LINK.lock()) {
                 *l = Some((Instant::now(), r));
             }
             rate
-        }));
+        }), client.clone(), profile.name.clone());
     }
     {
         let weak = app.as_weak();
@@ -1990,3 +2050,29 @@ mod tests {
     }
 
 }
+    #[test]
+    fn default_tracks_become_mpv_track_numbers() {
+        let st = |index, kind: &str, ext: bool| jellyfin::MediaStream {
+            index,
+            kind: kind.into(),
+            is_external: ext,
+            is_text_subtitle_stream: kind == "Subtitle",
+            ..Default::default()
+        };
+        // V0, A1 eng, A2 fre, S3 eng, S4 fre, external S5
+        let all = [st(0, "Video", false), st(1, "Audio", false), st(2, "Audio", false), st(3, "Subtitle", false), st(4, "Subtitle", false), st(5, "Subtitle", true)];
+        let s: Vec<&jellyfin::MediaStream> = all.iter().collect();
+        let t = tracks(&s, Some((Some(2), Some(4))), false);
+        assert_eq!((t.aid.as_deref(), t.sid.as_deref(), t.select_sub), (Some("2"), Some("2"), None));
+        // an external default subtitle is selected when it is added
+        let t = tracks(&s, Some((Some(1), Some(5))), false);
+        assert_eq!((t.aid.as_deref(), t.sid, t.select_sub), (Some("1"), None, Some(0)));
+        // no default subtitle: off
+        assert_eq!(tracks(&s, Some((Some(1), None)), false).sid.as_deref(), Some("no"));
+        // not found, or not asked: leave mpv's choice
+        assert_eq!(tracks(&s, Some((Some(-1), Some(-1))), false), Tracks::default());
+        assert_eq!(tracks(&s, None, false), Tracks::default());
+        // converted: every text subtitle is a file, the default one is selected
+        let t = tracks(&s, Some((Some(2), Some(4))), true);
+        assert_eq!((t.aid, t.sid, t.select_sub), (None, None, Some(1)));
+    }
