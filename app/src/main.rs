@@ -9,6 +9,7 @@
 //! drops backdrop results that arrive after the focus moved on.
 
 mod jellyfin;
+mod modeswitch;
 mod profiles;
 #[allow(dead_code)] // the Settings UI (later tasks) uses the rest of the API
 mod settings;
@@ -37,12 +38,14 @@ struct MpvOpts {
     passthrough: bool,
     aid: Option<String>,
     sid: Option<String>,
+    /// HDR source played with the 4K & HDR setting on: ask the compositor for HDR output.
+    hdr_hint: bool,
 }
 
 impl MpvOpts {
     fn from_settings() -> MpvOpts {
         let d = settings::current().display.clone();
-        MpvOpts { sub_scale: d.subtitle_scale, passthrough: d.audio_passthrough, aid: None, sid: None }
+        MpvOpts { sub_scale: d.subtitle_scale, passthrough: d.audio_passthrough, aid: None, sid: None, hdr_hint: false }
     }
 }
 
@@ -76,6 +79,10 @@ fn mpv_command(url: &str, start_s: f64, title: &str, opts: &MpvOpts) -> Command 
     }
     if let Some(s) = &opts.sid {
         c.arg(format!("--sid={s}"));
+    }
+    if opts.hdr_hint {
+        // mpv >= 0.38 (Pi: 0.40); a no-op where the compositor has no colour management
+        c.arg("--target-colorspace-hint=yes");
     }
     c.arg(url);
     c
@@ -1650,7 +1657,14 @@ fn main() {
                 "names": { "audio": plan.audio_names, "sub": plan.sub_names },
             });
             let _ = std::fs::write(NOW_FILE, now.to_string());
-            match mpv_command(&plan.url, start, &title, &MpvOpts { aid: plan.aid.clone(), sid: plan.sid.clone(), ..MpvOpts::from_settings() }).spawn() {
+            // display mode for this video, switched off the UI thread while mpv starts
+            let video = it.media_sources.first().and_then(|m| m.media_streams.iter().find(|s| s.kind == "Video"));
+            let direct = plan.session.is_none();
+            let video_h = video.and_then(|v| v.height).filter(|_| direct);
+            let fps = video.and_then(|v| v.real_frame_rate.or(v.average_frame_rate));
+            let hdr_hint = direct && lim.hdr && video.and_then(|v| v.video_range.as_deref()) == Some("HDR");
+            let mode = std::cell::Cell::new(Some(modeswitch::switch_for(video_h, fps, lim.hdr, lim.max_height)));
+            match mpv_command(&plan.url, start, &title, &MpvOpts { aid: plan.aid.clone(), sid: plan.sid.clone(), hdr_hint, ..MpvOpts::from_settings() }).spawn() {
                 Ok(child) => {
                     eprintln!("MPV_START id={} t={}ms", it.id, t0.elapsed().as_millis());
                     *player.borrow_mut() = Some(child);
@@ -1679,6 +1693,9 @@ fn main() {
                             }
                             *player.borrow_mut() = None;
                             exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(h) = mode.take() {
+                                modeswitch::restore(h);
+                            }
                             let _ = std::fs::remove_file(NOW_FILE);
                             eprintln!("MPV_EXIT t={}ms", t0.elapsed().as_millis());
                             if let Some(a) = weak.upgrade() {
@@ -1688,6 +1705,9 @@ fn main() {
                     });
                 }
                 Err(e) => {
+                    if let Some(h) = mode.take() {
+                        modeswitch::restore(h);
+                    }
                     let _ = std::fs::remove_file(NOW_FILE);
                     eprintln!("mpv spawn failed: {e}");
                     if let Some(a) = weak.upgrade() {
@@ -2057,9 +2077,9 @@ mod tests {
     #[test]
     fn mpv_gets_subtitle_scale_and_passthrough_only_when_set() {
         let args = |o: &MpvOpts| mpv_command("http://x/v", 0.0, "t", o).get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        let plain = args(&MpvOpts { sub_scale: 1.0, passthrough: false, aid: None, sid: None });
+        let plain = args(&MpvOpts { sub_scale: 1.0, passthrough: false, aid: None, sid: None, hdr_hint: false });
         assert!(!plain.iter().any(|a| a.starts_with("--sub-scale") || a.starts_with("--audio-spdif")), "{plain:?}");
-        let set = args(&MpvOpts { sub_scale: 1.25, passthrough: true, aid: Some("2".into()), sid: Some("3".into()) });
+        let set = args(&MpvOpts { sub_scale: 1.25, passthrough: true, aid: Some("2".into()), sid: Some("3".into()), hdr_hint: false });
         for want in ["--sub-scale=1.25", "--audio-spdif=ac3,eac3,dts,dts-hd,truehd", "--aid=2", "--sid=3"] {
             assert!(set.iter().any(|a| a == want), "{want} missing in {set:?}");
         }

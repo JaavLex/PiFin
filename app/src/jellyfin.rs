@@ -24,6 +24,10 @@ pub struct MediaStream {
     pub is_text_subtitle_stream: bool,
     pub title: Option<String>,
     pub height: Option<i32>,
+    pub real_frame_rate: Option<f64>,
+    pub average_frame_rate: Option<f64>,
+    /// "HDR" or "SDR" (video streams).
+    pub video_range: Option<String>,
     /// ISO 639 code of the track's language (display only).
     pub language: Option<String>,
 }
