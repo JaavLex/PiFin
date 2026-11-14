@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b12">
+<link rel="icon" href="/icon.svg">
+<title>PiFin Settings</title>
+<style>
+  :root {
+    --bg: #0b0b12; --card: #15151f; --card2: #1f1f2e; --line: #2a2a3c;
+    --text: #f2f2f7; --muted: #8e8ea6; --a1: #aa5cc3; --a2: #00a4dc; --bad: #ff6b6b;
+    --grad: linear-gradient(135deg, var(--a1), var(--a2));
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: max(10px, env(safe-area-inset-top)) 14px max(20px, env(safe-area-inset-bottom)); }
+  .app { max-width: 440px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+  header { display: flex; align-items: center; gap: 12px; }
+  header a { color: var(--text); text-decoration: none; display: grid; place-items: center; width: 40px; height: 40px;
+             border-radius: 12px; background: var(--card); border: 1px solid var(--line); }
+  header h1 { font-size: 20px; margin: 0; font-weight: 800; letter-spacing: -.3px; }
+  details { background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
+  summary { list-style: none; padding: 14px 16px; font-weight: 700; font-size: 16px; display: flex;
+            justify-content: space-between; align-items: center; cursor: pointer; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: ""; width: 8px; height: 8px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+                   transform: rotate(45deg); transition: transform .15s; margin-right: 4px; }
+  details[open] summary::after { transform: rotate(-135deg); }
+  .rows { border-top: 1px solid var(--line); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 16px;
+         border-bottom: 1px solid var(--line); min-height: 50px; }
+  .row:last-child { border-bottom: 0; }
+  .row.col { flex-direction: column; align-items: stretch; }
+  .lbl { font-size: 14px; }
+  .lbl small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .val { color: var(--muted); font-size: 14px; text-align: right; overflow-wrap: anywhere; }
+  .lock::after { content: " \1F512"; font-size: 12px; }
+  select, input { height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--card2);
+                  color: var(--text); padding: 0 10px; font-size: 14px; max-width: 60%; }
+  .row.col input, .line input { max-width: none; flex: 1; min-width: 0; }
+  .line { display: flex; gap: 8px; margin-top: 8px; }
+  button { height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--card2); color: var(--text);
+           font-size: 14px; font-weight: 650; padding: 0 14px; cursor: pointer; }
+  button.go { background: var(--grad); border: 0; }
+  button.danger { color: var(--bad); }
+  button:active { filter: brightness(1.3); }
+  .sw { position: relative; width: 50px; height: 30px; flex: none; }
+  .sw input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .sw span { position: absolute; inset: 0; border-radius: 15px; background: var(--card2); border: 1px solid var(--line); transition: background .15s; }
+  .sw span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%;
+                    background: var(--text); transition: transform .15s; }
+  .sw input:checked + span { background: var(--a2); }
+  .sw input:checked + span::after { transform: translateX(20px); }
+  .list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .list:empty { display: none; }
+  .item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 0; font-size: 14px; }
+  .item b { font-weight: 500; overflow-wrap: anywhere; }
+  .item .val { margin-left: auto; }
+  .note { color: #ffc861; font-size: 12px; }
+  .hide { display: none !important; }
+  .toast { position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+           background: var(--card2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 16px; font-size: 14px;
+           opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90vw; text-align: center; }
+  .toast.show { opacity: 1; }
+  .modal { position: fixed; inset: 0; background: #000a; display: grid; place-items: center; padding: 20px; }
+  .modal form { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; width: 100%;
+                max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+  .modal h2 { margin: 0; font-size: 17px; }
+  .modal input { max-width: none; font-size: 20px; letter-spacing: 4px; text-align: center; }
+  .modal .line { justify-content: flex-end; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <a href="/" aria-label="Back to the remote"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
+    <h1>Settings</h1>
+  </header>
+
+  <details id="secNet">
+    <summary>Network</summary>
+    <div class="rows">
+      <div class="row"><span class="lbl">Network</span><span class="val" id="nName">…</span></div>
+      <div class="row" id="nRadioRow"><span class="lbl">Radio</span><span class="val" id="nRadio"></span></div>
+      <div class="row" id="nSignalRow"><span class="lbl">Signal</span><span class="val" id="nSignal"></span></div>
+      <div class="row" id="nIpRow"><span class="lbl">Address</span><span class="val" id="nIp"></span></div>
+      <div class="row" id="nLimRow"><span class="lbl">Limits on this network</span>
+        <select id="nLim"><option value="same">Same as all networks</option><option value="custom">Custom</option></select></div>
+      <div class="row" id="nBrRow"><span class="lbl">Max bitrate here</span><select id="nBr" data-opts="bitrate"></select></div>
+      <div class="row" id="nHRow"><span class="lbl">Max resolution here</span><select id="nH" data-opts="height"></select></div>
+      <div class="row col"><div class="item"><span class="lbl">Saved networks</span><button id="savedBtn">Show</button></div>
+        <div class="list" id="savedList"></div></div>
+      <div class="row col"><div class="item"><span class="lbl">Add network</span><button id="scanBtn">Scan</button></div>
+        <div class="list" id="scanList"></div>
+        <div class="hide" id="joinBox">
+          <div class="line"><input id="joinName" placeholder="Network name" autocomplete="off" maxlength="32"></div>
+          <div class="line"><input id="joinPass" type="password" placeholder="Password" autocomplete="off" maxlength="63">
+            <button class="go" id="joinBtn">Join</button></div>
+        </div></div>
+    </div>
+  </details>
+
+  <details id="secPlay">
+    <summary>Playback</summary>
+    <div class="rows">
+      <div class="row"><span class="lbl">Max bitrate</span><select data-key="playback.max_bitrate" data-opts="bitrate"></select></div>
+      <div class="row"><span class="lbl">Max resolution</span><select data-key="playback.max_height" data-opts="height"></select></div>
+      <div class="row"><span class="lbl">4K &amp; HDR</span><label class="sw"><input type="checkbox" data-key="playback.hdr"><span></span></label></div>
+      <div class="row"><span class="lbl">Prefer original</span><label class="sw"><input type="checkbox" data-key="playback.prefer_original"><span></span></label></div>
+    </div>
+  </details>
+
+  <details id="secDisp">
+    <summary>Display &amp; audio</summary>
+    <div class="rows">
+      <div class="row"><span class="lbl">TV resolution<small class="note hide" id="restartNote">Restart needed</small></span>
+        <select data-key="display.output_max_height" data-opts="output"></select></div>
+      <div class="row"><span class="lbl">Subtitle size</span><select data-key="display.subtitle_scale" data-opts="subscale"></select></div>
+      <div class="row"><span class="lbl">Audio passthrough</span><label class="sw"><input type="checkbox" data-key="display.audio_passthrough"><span></span></label></div>
+      <div class="row"><span class="lbl">Audio language</span><select id="lAudio" data-lang="audio"><option value="">Any</option></select></div>
+      <div class="row"><span class="lbl">Subtitle language</span><select id="lSub" data-lang="subtitle"><option value="">Any</option></select></div>
+      <div class="row"><span class="lbl">Subtitles</span><select id="lMode" data-lang="mode" data-opts="modes"></select></div>
+    </div>
+  </details>
+
+  <details id="secSys">
+    <summary>System</summary>
+    <div class="rows">
+      <div class="row col"><span class="lbl sens">Jellyfin server</span>
+        <div class="line"><input id="url" type="url" inputmode="url" autocomplete="off" placeholder="http://host:8096"><button id="urlBtn">Save</button></div></div>
+      <div class="row col"><div class="item"><span class="lbl sens">Tailscale</span><span class="val" id="ts">…</span></div>
+        <div class="line"><input id="tsKey" type="password" autocomplete="off" placeholder="Auth key"><button id="tsBtn">Sign in</button></div></div>
+      <div class="row col"><span class="lbl sens">Setup hotspot password</span>
+        <div class="line"><input id="hp" type="password" autocomplete="new-password" placeholder="8 to 63 characters" maxlength="63"><button id="hpBtn">Save</button></div></div>
+      <div class="row col"><div class="item"><span class="lbl sens">PIN</span><span class="val" id="pinVal">Off</span></div>
+        <div class="line" id="pinNew"><input id="pin1" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="New PIN"><input id="pin2" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="Repeat"><button id="pinBtn">Set</button></div>
+        <div class="line hide" id="pinOld"><button id="pinChange">Change PIN</button><button id="pinRemove" class="danger">Remove PIN</button></div></div>
+      <div class="row"><span class="lbl">About</span><span class="val" id="about"></span></div>
+      <div class="row"><span class="lbl">Address</span><span class="val" id="aIp">—</span></div>
+      <div class="row" id="aTsRow"><span class="lbl">Tailscale address</span><span class="val" id="aTs"></span></div>
+      <div class="row"><span class="lbl">MAC (built-in)</span><span class="val" id="aMac">—</span></div>
+      <div class="row" id="aUsbRow"><span class="lbl">MAC (USB)</span><span class="val" id="aUsb"></span></div>
+      <div class="row"><span class="lbl">Restart PiFin</span><button id="rebootBtn">Restart</button></div>
+      <div class="row"><span class="lbl sens">Factory reset</span><button id="resetBtn" class="danger">Reset</button></div>
+    </div>
+  </details>
+</div>
+
+<div class="modal hide" id="modal">
+  <form id="pinForm">
+    <h2 id="pinTitle">Enter PIN</h2>
+    <input id="pinIn" type="password" inputmode="numeric" pattern="[0-9]*" minlength="4" maxlength="8" autocomplete="off">
+    <div class="line"><button type="button" id="pinCancel">Cancel</button><button class="go" type="submit">OK</button></div>
+  </form>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const OPTS = {
+  bitrate: [[0, "No limit"], [40000000, "40 Mbit/s"], [20000000, "20 Mbit/s"], [10000000, "10 Mbit/s"], [6000000, "6 Mbit/s"], [3000000, "3 Mbit/s"]],
+  height: [[2160, "4K"], [1080, "1080p"], [720, "720p"], [480, "480p"]],
+  output: [[2160, "4K"], [1080, "1080p"], [720, "720p"]],
+  subscale: [[0.8, "Small"], [1.0, "Normal"], [1.25, "Large"], [1.5, "Huge"]],
+  modes: [["Default", "Default"], ["Always", "Always"], ["OnlyForced", "Only forced"], ["None", "None"], ["Smart", "Smart"]],
+};
+const PIN_MSG = { pin_wrong: "Wrong PIN.", locked_out: "Too many wrong PINs. Try again in a minute." };
+let S = null;            // last "get" result: {settings, status}
+let toastTimer = 0;
+
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 3000);
+}
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.status === 403) { location.reload(); throw new Error("not paired"); }
+  return r.json();
+}
+
+// one daemon op; errors become a toast and null comes back
+async function op(name, extra = {}) {
+  try {
+    const j = await post("/api/settings", { op: name, ...extra });
+    if (j.ok) return j.result === undefined ? true : j.result;
+    toast(PIN_MSG[j.error] || j.message || "Something went wrong.");
+  } catch (e) {
+    if (e.message !== "not paired") toast("PiFin is not reachable.");
+  }
+  return null;
+}
+
+// the PIN modal: resolves with the digits, or null on Cancel
+function askPin(title = "Enter PIN") {
+  return new Promise(resolve => {
+    const m = $("modal"), f = $("pinForm"), inp = $("pinIn");
+    $("pinTitle").textContent = title; inp.value = "";
+    m.classList.remove("hide"); inp.focus();
+    const done = v => { m.classList.add("hide"); f.onsubmit = null; $("pinCancel").onclick = null; resolve(v); };
+    f.onsubmit = ev => {
+      ev.preventDefault();
+      if (!/^[0-9]{4,8}$/.test(inp.value)) { toast("The PIN has 4 to 8 digits."); return; }
+      done(inp.value);
+    };
+    $("pinCancel").onclick = () => done(null);
+  });
+}
+
+// a sensitive op: with a PIN set, ask for it first and send it along
+async function guarded(name, extra) {
+  if (S && S.settings.system.pin_set) {
+    const pin = await askPin();
+    if (pin === null) return null;
+    extra = { ...extra, pin };
+  }
+  return op(name, extra);
+}
+
+function fill(sel, list) {
+  sel.innerHTML = "";
+  for (const [v, label] of list) sel.add(new Option(label, String(v)));
+}
+
+function setSel(sel, v) {
+  if (document.activeElement === sel) return;
+  const s = String(v);
+  if (![...sel.options].some(o => o.value === s)) sel.add(new Option(s, s));
+  sel.value = s;
+}
+
+const show = (id, on) => $(id).classList.toggle("hide", !on);
+const signalWord = d => d >= -60 ? "strong" : d >= -70 ? "good" : d >= -80 ? "weak" : "very weak";
+
+function tsLabel(t) {
+  if (t.state === "connected") return t.name ? `Connected as ${t.name}` : "Connected";
+  return { signed_out: "Signed out", off: "Off", not_installed: "Not installed", "": "…" }[t.state || ""] || t.state;
+}
+
+function currentSsid() {
+  const w = S.status.wifi || {};
+  return w.state === "CONNECTED" && w.ssid ? w.ssid : null;
+}
+
+function render() {
+  const st = S.settings, w = S.status.wifi || {}, macs = S.status.macs || {}, ts = S.status.tailscale || {};
+  const ssid = currentSsid();
+  // Network
+  $("nName").textContent = w.state === "HOTSPOT" ? "Setup hotspot on" : (ssid || "Not connected");
+  show("nRadioRow", !!w.radio);
+  $("nRadio").textContent = w.radio === "usb" ? "USB adapter" : w.radio === "builtin" ? "Built-in" : (w.radio || "");
+  show("nSignalRow", w.signal_dbm != null);
+  if (w.signal_dbm != null) $("nSignal").textContent = `${w.signal_dbm} dBm · ${signalWord(w.signal_dbm)}`;
+  show("nIpRow", !!w.ip); $("nIp").textContent = w.ip || "";
+  const here = ssid ? st.networks[ssid] : null;
+  show("nLimRow", !!ssid);
+  setSel($("nLim"), here ? "custom" : "same");
+  show("nBrRow", !!here); show("nHRow", !!here);
+  if (here) {
+    setSel($("nBr"), here.max_bitrate ?? st.playback.max_bitrate);
+    setSel($("nH"), here.max_height ?? st.playback.max_height);
+  }
+  // Playback, Display & audio
+  for (const el of document.querySelectorAll("[data-key]")) {
+    const [sec, key] = el.dataset.key.split(".");
+    const v = st[sec][key];
+    if (el.type === "checkbox") el.checked = v === true; else setSel(el, v);
+  }
+  // System
+  const pin = st.system.pin_set;
+  for (const el of document.querySelectorAll(".sens")) el.classList.toggle("lock", pin);
+  const url = $("url");
+  if (document.activeElement !== url && !url.dataset.dirty) url.value = st.system.jellyfin_url || "";
+  $("ts").textContent = tsLabel(ts);
+  $("pinVal").textContent = pin ? "On" : "Off";
+  show("pinNew", !pin); show("pinOld", pin);
+  $("about").textContent = `PiFin ${S.status.version || ""}`.trim();
+  $("aIp").textContent = w.ip || "—";
+  show("aTsRow", !!ts.ip); $("aTs").textContent = ts.ip || "";
+  $("aMac").textContent = macs.builtin || "—";
+  show("aUsbRow", !!macs.usb); $("aUsb").textContent = macs.usb || "";
+}
+
+async function refresh() {
+  const r = await op("get");
+  if (r && r.settings) { S = r; render(); }
+}
+
+async function set(changes, sensitive = false) {
+  const r = sensitive ? await guarded("set", { changes }) : await op("set", { changes });
+  await refresh();
+  return r;
+}
+
+// ---- Network ----
+async function netLimits(limits) {
+  const ssid = currentSsid();
+  if (!ssid) return;
+  if (await op("network_set", { ssid, limits })) toast(`Limits saved for ${ssid}.`);
+  refresh();
+}
+$("nLim").onchange = e => {
+  const p = S.settings.playback;
+  netLimits(e.target.value === "custom" ? { max_bitrate: p.max_bitrate, max_height: p.max_height } : null);
+};
+$("nBr").onchange = () => netLimits({ ...S.settings.networks[currentSsid()], max_bitrate: Number($("nBr").value) });
+$("nH").onchange = () => netLimits({ ...S.settings.networks[currentSsid()], max_height: Number($("nH").value) });
+
+function itemRow(name, value, btnText, onClick, cls = "") {
+  const d = document.createElement("div"); d.className = "item";
+  const b = document.createElement("b"); b.textContent = name; d.append(b);
+  if (value) { const v = document.createElement("span"); v.className = "val"; v.textContent = value; d.append(v); }
+  if (btnText) { const k = document.createElement("button"); k.textContent = btnText; k.className = cls; k.onclick = onClick; d.append(k); }
+  return d;
+}
+
+async function loadSaved() {
+  const list = await op("wifi_list"), box = $("savedList");
+  if (!list) return;
+  box.innerHTML = "";
+  if (!list.length) { box.append(itemRow("No saved networks.")); return; }
+  for (const n of list) {
+    box.append(itemRow(n.ssid, "", "Forget", async () => {
+      if (!confirm(`Forget ${n.ssid}?\nPiFin won't join it again until you add it.`)) return;
+      if (await op("wifi_forget", { ssid: n.ssid }) !== null) toast(`Forgot ${n.ssid}.`);
+      loadSaved(); refresh();
+    }, "danger"));
+  }
+}
+$("savedBtn").onclick = loadSaved;
+
+function pickNetwork(ssid, secured) {
+  show("joinBox", true);
+  $("joinName").value = ssid; $("joinName").readOnly = ssid !== "";
+  show("joinPass", secured); $("joinPass").value = "";
+  (ssid === "" ? $("joinName") : secured ? $("joinPass") : $("joinBtn")).focus();
+}
+
+$("scanBtn").onclick = async () => {
+  const box = $("scanList");
+  box.innerHTML = ""; box.append(itemRow("Looking for networks…"));
+  const list = await op("wifi_scan");
+  box.innerHTML = "";
+  if (!list) return;
+  for (const n of list) {
+    const tag = n.saved ? "(saved)" : n.secured ? "" : "(open)";
+    box.append(itemRow(n.ssid, `${n.signal}% ${tag}`.trim(), "Choose", () => pickNetwork(n.ssid, n.secured)));
+  }
+  box.append(itemRow("Other network…", "", "Choose", () => pickNetwork("", true)));
+};
+
+$("joinBtn").onclick = async () => {
+  const ssid = $("joinName").value, psk = $("joinPass").classList.contains("hide") ? "" : $("joinPass").value;
+  if (ssid.length < 1 || ssid.length > 32) { toast("The network name needs 1 to 32 characters."); return; }
+  if (!confirm(`Join ${ssid}?`)) return;
+  toast(`Joining ${ssid}…`);
+  if (await op("wifi_add", { ssid, psk }) !== null) {
+    toast(`Joined ${ssid}.`);
+    show("joinBox", false); $("scanList").innerHTML = "";
+  }
+  refresh();
+};
+
+// ---- Playback, Display & audio: send "set" on every change ----
+for (const el of document.querySelectorAll("[data-key]")) {
+  el.onchange = async () => {
+    const key = el.dataset.key;
+    const v = el.type === "checkbox" ? el.checked : Number(el.value);
+    const r = await set({ [key]: v });
+    if (r && key === "display.output_max_height") show("restartNote", true);
+  };
+}
+
+// ---- languages (per Jellyfin user, through /api/langs) ----
+async function loadLangs() {
+  try {
+    const r = await fetch("/api/langs", { cache: "no-store" });
+    if (r.status === 403) { location.reload(); return; }
+    const j = await r.json();
+    if (!j.ok) { toast(j.message || "Jellyfin server not reachable."); return; }
+    const list = [["", "Any"], ...j.cultures];
+    if ($("lAudio").options.length <= 1) { fill($("lAudio"), list); fill($("lSub"), list); }
+    setSel($("lAudio"), j.audio); setSel($("lSub"), j.subtitle); setSel($("lMode"), j.mode);
+  } catch { toast("PiFin is not reachable."); }
+}
+for (const el of document.querySelectorAll("[data-lang]")) {
+  el.onchange = async () => {
+    try {
+      const j = await post("/api/langs", { audio: $("lAudio").value, subtitle: $("lSub").value, mode: $("lMode").value });
+      toast(j.ok ? `Saved for ${j.user}.` : (j.message || "Not saved."));
+    } catch (e) { if (e.message !== "not paired") toast("PiFin is not reachable."); }
+  };
+}
+$("secDisp").addEventListener("toggle", e => { if (e.target.open) loadLangs(); });
+
+// ---- System ----
+$("url").oninput = () => { $("url").dataset.dirty = "1"; };
+$("urlBtn").onclick = async () => {
+  if (await set({ "system.jellyfin_url": $("url").value.trim() }, true) !== null) {
+    delete $("url").dataset.dirty; toast("Saved.");
+  }
+};
+$("tsBtn").onclick = async () => {
+  const authkey = $("tsKey").value.trim();
+  if (!authkey) { toast("Paste a Tailscale auth key first."); return; }
+  toast("Signing in…");
+  if (await guarded("tailscale_login", { authkey }) !== null) { $("tsKey").value = ""; toast("Signed in."); }
+  refresh();
+};
+$("hpBtn").onclick = async () => {
+  if (await set({ "secrets.hotspot_pass": $("hp").value }, true) !== null) { $("hp").value = ""; toast("Saved."); }
+};
+$("pinBtn").onclick = async () => {
+  const a = $("pin1").value, b = $("pin2").value;
+  if (!/^[0-9]{4,8}$/.test(a)) { toast("The PIN has 4 to 8 digits."); return; }
+  if (a !== b) { toast("The PINs don't match."); return; }
+  if (await op("pin_set", { pin: a }) !== null) { $("pin1").value = $("pin2").value = ""; toast("PIN set."); }
+  refresh();
+};
+$("pinChange").onclick = async () => {
+  const old = await askPin("Current PIN");
+  if (old === null || await op("pin_check", { pin: old }) === null) return;
+  const a = await askPin("New PIN");
+  if (a === null) return;
+  const b = await askPin("Repeat PIN");
+  if (b === null) return;
+  if (a !== b) { toast("The PINs don't match."); return; }
+  if (await op("pin_set", { pin: a, old_pin: old }) !== null) toast("PIN changed.");
+  refresh();
+};
+$("pinRemove").onclick = async () => {
+  const pin = await askPin("Current PIN");
+  if (pin !== null && await op("pin_clear", { pin }) !== null) toast("PIN removed.");
+  refresh();
+};
+$("rebootBtn").onclick = async () => {
+  if (!confirm("Restart PiFin?\nThe TV goes dark for about 30 seconds.")) return;
+  if (await op("reboot") !== null) toast("Restarting…");
+};
+$("resetBtn").onclick = async () => {
+  if (!confirm("Factory reset?\nRemoves all settings, sign-ins and saved Wi-Fi networks, then restarts.")) return;
+  if (await guarded("factory_reset", {}) !== null) toast("Resetting…");
+};
+
+// ---- start ----
+for (const sel of document.querySelectorAll("[data-opts]")) fill(sel, OPTS[sel.dataset.opts]);
+refresh();
+setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 5000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+</script>
+</body>
+</html>

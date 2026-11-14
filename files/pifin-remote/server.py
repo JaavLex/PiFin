@@ -9,7 +9,12 @@ the PiFin app and the mpv it starts:
                        /tmp/pifin-now.json
   * search, posters -> the Jellyfin API with the app's login
   * open / play     -> commands to the app's socket (/tmp/pifin-app.sock)
+  * settings        -> the root settings daemon's socket (/run/pifin/settings.sock)
+Only paired phones get in: the TV's QR code opens /pair?t=<token>, which sets a
+cookie; every other page and /api/* call needs that cookie (D8).
 """
+import hmac
+import http.cookies
 import json
 import os
 import pathlib
@@ -26,7 +31,21 @@ from mpvplayer import Player
 PORT = 8080
 HERE = pathlib.Path(__file__).parent
 INDEX = (HERE / "index.html").read_bytes()
+SETTINGS_PAGE = (HERE / "settings.html").read_bytes()
 ICON = (HERE / "icon.svg").read_bytes()
+PAIR_TOKEN = os.environ.get("PIFIN_PAIR_TOKEN", "/var/lib/pifin/pair-token")
+SETTINGS_SOCK = os.environ.get("PIFIN_SETTINGS_SOCK", "/run/pifin/settings.sock")
+# what the phone may ask the daemon; pair_reset stays TV-only (it needs the TV in hand)
+SETTINGS_OPS = frozenset("get set network_set wifi_list wifi_scan wifi_add wifi_forget pin_set "
+                         "pin_clear pin_check tailscale_login reboot factory_reset".split())
+SUB_MODES = frozenset(("Default", "Always", "OnlyForced", "None", "Smart"))
+FORBIDDEN = (b'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+             b'<meta name="viewport" content="width=device-width, initial-scale=1"><title>PiFin</title></head>'
+             b'<body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0b12;'
+             b'color:#f2f2f7;font:17px system-ui,sans-serif;padding:24px;box-sizing:border-box;text-align:center">'
+             b'<p>Scan the QR code on the TV (Settings > System > Phone remote).</p></body></html>')
+PAIRED = (b'<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/">'
+          b'<title>PiFin</title></head><body style="background:#0b0b12"></body></html>')
 AUTH = os.environ.get("PIFIN_AUTH", "/home/pifin/.config/pifin/auth.json")
 NOW = "/tmp/pifin-now.json"
 APP_SOCK = "/tmp/pifin-app.sock"
@@ -83,20 +102,115 @@ def now_playing():
     return st
 
 
+# ------------------------------------------------------------- pairing -----
+_token = {"key": None, "value": None}
+
+
+def pair_token():
+    """The current pairing token, re-read when the file changes (Re-pair on the TV)."""
+    try:
+        st = os.stat(PAIR_TOKEN)
+        key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        if key != _token["key"]:
+            _token["value"] = pathlib.Path(PAIR_TOKEN).read_text().strip() or None
+            _token["key"] = key
+    except OSError:
+        return None
+    return _token["value"]
+
+
+def token_ok(given):
+    """Constant-time check of a token from the QR link or the cookie."""
+    token = pair_token()
+    return bool(token and given) and hmac.compare_digest(given.encode(), token.encode())
+
+
+# ------------------------------------------------------------ settings ------
+def daemon(req):
+    """One request to the settings daemon; its JSON reply line comes back as is."""
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(40)   # tailscale_login and wifi_add take up to ~30 s
+            s.connect(SETTINGS_SOCK)
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n") and len(buf) < 4 * 1024 * 1024:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except socket.timeout:
+        buf = b""
+    except OSError:
+        return json.dumps({"ok": False, "error": "failed", "message": "Settings service not running."}).encode()
+    return buf.strip() or json.dumps({"ok": False, "error": "failed",
+                                      "message": "Settings service did not answer."}).encode()
+
+
 # ------------------------------------------------------------ Jellyfin ------
 def auth():
     return json.loads(pathlib.Path(AUTH).read_text())
 
 
-def api(path, query=None, raw=False):
+def _request(path, query=None, data=None):
     a = auth()
     url = a["server"].rstrip("/") + path + ("?" + urllib.parse.urlencode(query) if query else "")
-    req = urllib.request.Request(url, headers={
-        "Authorization": f'MediaBrowser Client="PiFin Remote", Device="Raspberry Pi", '
-                         f'DeviceId="{a["device_id"]}", Version="1", Token="{a["token"]}"'})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    headers = {"Authorization": f'MediaBrowser Client="PiFin Remote", Device="Raspberry Pi", '
+                                f'DeviceId="{a["device_id"]}", Version="1", Token="{a["token"]}"'}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(data).encode()
+    return urllib.request.Request(url, data=data, headers=headers)
+
+
+def api(path, query=None, raw=False):
+    with urllib.request.urlopen(_request(path, query), timeout=10) as r:
         body = r.read(8 * 1024 * 1024)
         return (body, r.headers.get("Content-Type", "image/jpeg")) if raw else json.loads(body)
+
+
+def post_api(path, obj, query=None):
+    with urllib.request.urlopen(_request(path, query, obj), timeout=10) as r:
+        r.read(1024 * 1024)
+
+
+_cultures = []
+
+
+def cultures():
+    """The server's languages as [code, name], by name, no duplicates (cached)."""
+    if not _cultures:
+        seen = {}
+        for c in api("/Localization/Cultures"):
+            code, name = c.get("ThreeLetterISOLanguageName"), c.get("DisplayName")
+            if code and name and code not in seen:
+                seen[code] = name
+        _cultures.extend(sorted(([k, v] for k, v in seen.items()), key=lambda kv: kv[1].lower()))
+    return _cultures
+
+
+def langs():
+    """The active user's language keys (D7), read from their Jellyfin Configuration."""
+    me = api("/Users/Me")
+    cfg = me.get("Configuration") or {}
+    return {"ok": True, "user": me.get("Name", ""), "audio": cfg.get("AudioLanguagePreference") or "",
+            "subtitle": cfg.get("SubtitleLanguagePreference") or "", "mode": cfg.get("SubtitleMode") or "Default",
+            "cultures": cultures()}
+
+
+def set_langs(data):
+    """Write the three keys into the full Configuration (the server replaces it whole)."""
+    audio, sub, mode = data.get("audio"), data.get("subtitle"), data.get("mode")
+    for code in (audio, sub):
+        if not isinstance(code, str) or len(code) > 8 or not all(ch.isalnum() or ch == "-" for ch in code):
+            return {"ok": False, "error": "invalid_value", "message": "Unknown language."}
+    if mode not in SUB_MODES:
+        return {"ok": False, "error": "invalid_value", "message": "Unknown subtitle mode."}
+    me = api("/Users/Me")
+    cfg = me.get("Configuration") or {}
+    cfg.update(AudioLanguagePreference=audio, SubtitleLanguagePreference=sub, SubtitleMode=mode)
+    post_api("/Users/Configuration", cfg, {"userId": me["Id"]})
+    return {"ok": True, "user": me.get("Name", "")}
 
 
 def search(text):
@@ -129,16 +243,39 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, code=200, body=b"", ctype="application/json", cache=False):
+    def reply(self, code=200, body=b"", ctype="application/json", cache=False, headers=()):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
     def json(self, obj, code=200):
         self.reply(code, json.dumps(obj).encode())
+
+    def paired(self):
+        """The request carries the pifin cookie and it equals the current token."""
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie") or "")
+        except http.cookies.CookieError:
+            return False
+        morsel = jar.get("pifin")
+        return morsel is not None and token_ok(morsel.value)
+
+    def forbidden(self):
+        # the request body (if any) is not read: close so it can't be taken for the next request
+        self.close_connection = True
+        self.reply(403, FORBIDDEN, "text/html; charset=utf-8", headers=[("Connection", "close")])
+
+    def body(self, limit=64 * 1024):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > limit:
+            raise ValueError("request too large")
+        return json.loads(self.rfile.read(n) or b"{}")
 
     def seen(self):
         # first contact: the TV hides its "phone remote" hint
@@ -147,9 +284,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path)
+        if path.path == "/pair":
+            t = urllib.parse.parse_qs(path.query).get("t", [""])[0]
+            if not token_ok(t):
+                return self.forbidden()
+            # 200 + meta refresh rather than a redirect: some phone browsers drop a
+            # cookie set on a 302 when the QR scanner hands the link over
+            cookie = f"pifin={pair_token()}; HttpOnly; SameSite=Strict; Max-Age=31536000; Path=/"
+            return self.reply(200, PAIRED, "text/html; charset=utf-8", headers=[("Set-Cookie", cookie)])
+        if path.path not in ("/manifest.webmanifest", "/icon.svg") and not self.paired():
+            return self.forbidden()
         if path.path in ("/", "/index.html"):
             self.seen()
             return self.reply(200, INDEX, "text/html; charset=utf-8")
+        if path.path == "/settings":
+            return self.reply(200, SETTINGS_PAGE, "text/html; charset=utf-8")
+        if path.path == "/api/langs":
+            try:
+                return self.json(langs())
+            except Exception:
+                return self.json({"ok": False, "error": "failed", "message": "Jellyfin server not reachable."})
         if path.path == "/manifest.webmanifest":
             m = {"name": "PiFin Remote", "short_name": "PiFin", "start_url": "/", "display": "standalone",
                  "background_color": "#0b0b12", "theme_color": "#0b0b12",
@@ -176,10 +330,31 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self.paired():
+            return self.forbidden()
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/settings":
+            try:
+                data = self.body()
+            except ValueError:
+                data = None
+            if not isinstance(data, dict) or data.get("op") not in SETTINGS_OPS:
+                return self.json({"ok": False, "error": "bad_request", "message": "Unknown op."}, 400)
+            return self.reply(200, daemon(data))
+        if path == "/api/langs":
+            try:
+                data = self.body()
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+            except ValueError:
+                return self.json({"ok": False, "error": "bad_request", "message": "Expected a JSON object."}, 400)
+            try:
+                return self.json(set_langs(data))
+            except Exception:
+                return self.json({"ok": False, "error": "failed", "message": "Jellyfin server not reachable."})
         self.seen()
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            data = json.loads(self.rfile.read(n) or b"{}")
+            data = self.body(1024 * 1024)
             action = data.get("action", "")
             if mpv_alive():
                 result = player.action(action, data)

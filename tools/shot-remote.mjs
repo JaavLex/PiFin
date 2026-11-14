@@ -14,6 +14,8 @@ const ROOT = path.join(HERE, "..");
 const REMOTE = path.join(ROOT, "files", "pifin-remote");
 const OUT = path.join(ROOT, "docs", "screenshots");
 const INDEX = fs.readFileSync(path.join(REMOTE, "index.html"));
+const SETTINGS = fs.readFileSync(path.join(REMOTE, "settings.html"));
+const TOKEN = "0".repeat(32);        // fake pairing token; the mock checks the cookie like server.py
 const ICON = fs.readFileSync(path.join(REMOTE, "icon.svg"));
 
 const SHOW = "The Last Lighthouse";   // invented show
@@ -43,6 +45,25 @@ const PLAYING = {
   },
 };
 
+// settings daemon "get" with made-up values (documentation addresses, fake MACs)
+const GET = {
+  settings: {
+    version: 1,
+    playback: { max_bitrate: 0, max_height: 1080, hdr: false, prefer_original: true },
+    networks: { "Harbor Cafe": { max_bitrate: 6000000, max_height: 720 } },
+    display: { output_max_height: 1080, subtitle_scale: 1.0, audio_passthrough: false },
+    system: { jellyfin_url: "http://jellyfin.example:8096", hotspot_ssid: "PiFin-setup", pin_set: true },
+  },
+  status: {
+    wifi: { state: "CONNECTED", ssid: "Harbor Cafe", radio: "usb", iface: "wlan1", signal_dbm: -58, ip: "192.0.2.10" },
+    macs: { builtin: "02:00:00:00:00:01", usb: "02:00:00:00:00:02" },
+    tailscale: { state: "connected", name: "pifin", ip: "100.64.0.10" },
+    version: "0.1.0",
+  },
+};
+const LANGS = { ok: true, user: "Robin", audio: "eng", subtitle: "", mode: "Smart",
+  cultures: [["eng", "English"], ["fra", "French"], ["deu", "German"], ["spa", "Spanish"]] };
+
 let mode = "idle";
 
 const server = http.createServer((req, res) => {
@@ -51,8 +72,21 @@ const server = http.createServer((req, res) => {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
     res.end(body);
   };
-  if (req.method === "POST") return send(JSON.stringify({ ok: true, result: "ok" }));
+  const open = url === "/icon.svg" || url === "/manifest.webmanifest";
+  if (!open && !(req.headers.cookie || "").includes(`pifin=${TOKEN}`)) return send("paired phones only", "text/plain", 403);
+  if (req.method === "POST" && url === "/api/settings") {
+    let body = "";
+    req.on("data", c => { body += c; });
+    req.on("end", () => {
+      const { op } = JSON.parse(body || "{}");
+      send(JSON.stringify({ ok: true, result: op === "get" ? GET : op === "wifi_list" ? [] : true }));
+    });
+    return;
+  }
+  if (req.method === "POST") return send(JSON.stringify({ ok: true, result: "ok", user: "Robin" }));
   if (url === "/" || url === "/index.html") return send(INDEX, "text/html; charset=utf-8");
+  if (url === "/settings") return send(SETTINGS, "text/html; charset=utf-8");
+  if (url === "/api/langs") return send(JSON.stringify(LANGS));
   if (url === "/api/status") return send(JSON.stringify(mode === "idle" ? IDLE : PLAYING));
   if (url.startsWith("/api/art/")) {
     return send(poster("#2b3f6b", "#0f766e", SHOW, `S2:E4  ${EPISODE}`), "image/svg+xml");
@@ -77,17 +111,27 @@ try {
 await fs.promises.mkdir(OUT, { recursive: true });
 await new Promise(r => server.listen(0, "127.0.0.1", r));
 const base = `http://127.0.0.1:${server.address().port}`;
-const browser = await chromium.launch();
+// CHROMIUM: a browser binary to use when Playwright's own download doesn't match its version
+const browser = await chromium.launch({ executablePath: process.env.CHROMIUM || undefined });
 
-for (const shot of ["idle", "playing"]) {
+for (const shot of ["idle", "playing", "settings"]) {
   mode = shot;
   const ctx = await browser.newContext({
     viewport: { width: 390, height: 844 },   // a mid-size phone
     deviceScaleFactor: 2, isMobile: true, hasTouch: true, reducedMotion: "reduce",
   });
+  // what /pair?t=<token> leaves in a paired phone
+  await ctx.addCookies([{ name: "pifin", value: TOKEN, url: base, httpOnly: true, sameSite: "Strict" }]);
   const page = await ctx.newPage();
-  await page.goto(base, { waitUntil: "load" });
-  await page.waitForSelector("#dot.on");     // first /api/status came back
+  if (shot === "settings") {
+    await page.goto(base + "/settings", { waitUntil: "load" });
+    await page.evaluate(() => { for (const d of document.querySelectorAll("details")) d.open = true; });
+    await page.waitForFunction(() => document.getElementById("nName").textContent !== "…"
+      && document.getElementById("lAudio").options.length > 1);
+  } else {
+    await page.goto(base, { waitUntil: "load" });
+    await page.waitForSelector("#dot.on");   // first /api/status came back
+  }
   if (shot === "playing") {
     await page.waitForSelector("#np.show");
     await page.waitForFunction(() => {
@@ -97,7 +141,7 @@ for (const shot of ["idle", "playing"]) {
   }
   await page.waitForTimeout(250);            // let the last paint settle
   const file = path.join(OUT, `remote-${shot}.png`);
-  await page.screenshot({ path: file, fullPage: false });
+  await page.screenshot({ path: file, fullPage: shot === "settings" });
   console.log("wrote", path.relative(ROOT, file));
   await ctx.close();
 }

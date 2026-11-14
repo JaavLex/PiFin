@@ -36,6 +36,7 @@ INSTALL = [
     ("90-pifin-usb-wifi.rules", "/etc/udev/rules.d/90-pifin-usb-wifi.rules", "0644"),
     ("pifin-remote/server.py", "/opt/pifin-remote/server.py", "0755"),
     ("pifin-remote/index.html", "/opt/pifin-remote/index.html", "0644"),
+    ("pifin-remote/settings.html", "/opt/pifin-remote/settings.html", "0644"),
     ("pifin-remote/icon.svg", "/opt/pifin-remote/icon.svg", "0644"),
     ("pifin-remote/mpvplayer.py", "/opt/pifin-remote/mpvplayer.py", "0644"),
     ("pifin-remote/mpv-input.conf", "/opt/pifin-remote/mpv-input.conf", "0644"),
