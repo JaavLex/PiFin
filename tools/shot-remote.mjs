@@ -57,7 +57,7 @@ const GET = {
   status: {
     wifi: { state: "CONNECTED", ssid: "Harbor Cafe", radio: "usb", iface: "wlan1", signal_dbm: -58, ip: "192.0.2.10" },
     macs: { builtin: "02:00:00:00:00:01", usb: "02:00:00:00:00:02" },
-    tailscale: { state: "connected", name: "pifin", ip: "100.64.0.10" },
+    tailscale: { state: "connected", name: "pifin", ip: "100.x.y.z" },
     version: "0.1.0",
   },
 };
