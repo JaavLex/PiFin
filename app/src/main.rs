@@ -1592,7 +1592,20 @@ fn main() {
                         let c = client.clone();
                         std::thread::spawn(move || c.link_rate())
                     });
+                    let defaults = it.defaults.is_none().then(|| {
+                        let (c, id) = (client.clone(), it.id.clone());
+                        std::thread::spawn(move || c.playback_defaults(&id))
+                    });
                     let full = if it.media_sources.is_empty() { client.item(&it.id) } else { Ok(it) };
+                    let full = full.map(|mut f| {
+                        if let Some(d) = defaults {
+                            // no answer: the old behaviour (mpv's / the file's own choice)
+                            let d = d.join().ok().and_then(|r| r.map_err(|e| eprintln!("PLAYBACK_DEFAULTS: {e}")).ok());
+                            // (-1, -1) matches no stream, so `tracks` leaves everything to mpv
+                            f.defaults = Some(d.unwrap_or((Some(-1), Some(-1))));
+                        }
+                        f
+                    });
                     if let Some(p) = probe {
                         let rate = p.join().ok().flatten().unwrap_or(0);
                         eprintln!("LINK_MBPS={:.1}", rate as f64 / 1e6);
@@ -1606,20 +1619,7 @@ fn main() {
                             app.set_starting(false);
                             app.set_status("Couldn't load this item from the server".into());
                             return;
-                    let defaults = it.defaults.is_none().then(|| {
-                        let (c, id) = (client.clone(), it.id.clone());
-                        std::thread::spawn(move || c.playback_defaults(&id))
-                    });
                         };
-                    let full = full.map(|mut f| {
-                        if let Some(d) = defaults {
-                            // no answer: the old behaviour (mpv's / the file's own choice)
-                            let d = d.join().ok().and_then(|r| r.map_err(|e| eprintln!("PLAYBACK_DEFAULTS: {e}")).ok());
-                            // (-1, -1) matches no stream, so `tracks` leaves everything to mpv
-                            f.defaults = Some(d.unwrap_or((Some(-1), Some(-1))));
-                        }
-                        f
-                    });
                         if !app.get_starting() {
                             return; // Back pressed while the server answered
                         }
@@ -2065,7 +2065,6 @@ mod tests {
         }
     }
 
-}
     #[test]
     fn default_tracks_become_mpv_track_numbers() {
         let st = |index, kind: &str, ext: bool| jellyfin::MediaStream {
@@ -2099,3 +2098,5 @@ mod tests {
         assert_eq!(remote_url("192.0.2.5", Some(t)), format!("http://192.0.2.5:8080/pair?t={t}"));
         assert_eq!(remote_url("192.0.2.5", None), "http://192.0.2.5:8080");
     }
+
+}
