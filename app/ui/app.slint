@@ -208,6 +208,8 @@ export component App inherits Window {
     in property <string> wifi-error;
     in property <image> wifi-qr;
     in property <bool> wifi-has-qr: false;
+    in property <bool> wifi-pickable: false;   // the hotspot screen: OK picks a network here
+    callback wifi-pick();
 
     // playback starting: shown from Play until mpv's first frame covers the app
     in property <bool> starting: false;
@@ -851,6 +853,7 @@ export component App inherits Window {
             }
             if (root.wifi-show) {
                 if (event.text == Key.Escape || event.text == Key.Backspace) { root.cancel(); }
+                if (root.wifi-pickable && (event.text == Key.Return || event.text == " ")) { root.wifi-pick(); }
                 return accept;
             }
             if (root.search-mode && (root.kb-active || root.rows.length == 0)) {

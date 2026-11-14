@@ -831,7 +831,6 @@ struct WifiState {
     time: u64,
 }
 
-const WIFI_FILE: &str = "/run/pifin/wifi.json";
 const NOW_FILE: &str = "/tmp/pifin-now.json";
 const APP_SOCK: &str = "/tmp/pifin-app.sock";
 
@@ -896,9 +895,11 @@ fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Im
             app.set_wifi_text(format!(
                 "1.  Scan the code with your phone to join the network \"{}\" (password: {}).\n\n\
                  2.  A page opens: pick your Wi-Fi and enter its password. If it doesn't open, go to http://10.41.0.1\n\n\
-                 3.  PiFin connects and comes back here by itself.",
+                 3.  PiFin connects and comes back here by itself.\n\n\
+                 Or press OK to pick a network with the TV remote.",
                 w.ap_ssid, w.ap_pass
             ).into());
+            app.set_wifi_pickable(true);
             app.set_wifi_error(if w.failed.is_empty() { "".into() } else {
                 format!("Couldn't connect to \"{}\". Check the password and try again.", w.failed).into()
             });
@@ -912,6 +913,7 @@ fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Im
         "CONNECTING" if age >= 8 || showing => {
             app.set_wifi_title(if w.ssid.is_empty() { "Connecting…".into() } else { format!("Connecting to \"{}\"…", w.ssid).into() });
             app.set_wifi_text("This takes a few seconds. If the setup screen comes back, the password was probably wrong.".into());
+            app.set_wifi_pickable(false);
             app.set_wifi_error("".into());
             app.set_wifi_has_qr(false);
             app.set_wifi_show(true);
@@ -1361,6 +1363,7 @@ fn main() {
         // the address at startup is the baseline: only a change after start restarts us
         let mut seen_url = settings::current().system.jellyfin_url.clone();
         let mut qr_cache: Option<(String, slint::Image)> = None;
+        let wifi_file = settings::paths().wifi; // PIFIN_WIFI_FILE overrides, for tests
         wifi_timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
             let Some(app) = weak.upgrade() else { return };
             // the server address was changed (phone or TV): restart into the new one
@@ -1370,7 +1373,7 @@ fn main() {
                 eprintln!("SERVER address changed: restarting");
                 profiles::restart(&["--user", &auth.user_id]);
             }
-            let Ok(text) = std::fs::read_to_string(WIFI_FILE) else { return };
+            let Ok(text) = std::fs::read_to_string(&wifi_file) else { return };
             let Ok(w) = serde_json::from_str::<WifiState>(&text) else { return };
             if apply_wifi(&app, &w, &mut qr_cache) {
                 eprintln!("WIFI back: reloading home");
@@ -1850,7 +1853,17 @@ fn main() {
             }
         });
     }
-    settings_ui::install(&app);
+    {
+        // Test connection's server side; its result also serves the next Play
+        let client = client.clone();
+        settings_ui::install(&app, Arc::new(move || {
+            let rate = client.server_test();
+            if let (Some(r), Ok(mut l)) = (rate, LINK.lock()) {
+                *l = Some((Instant::now(), r));
+            }
+            rate
+        }));
+    }
     {
         let weak = app.as_weak();
         app.on_open_settings(move || {

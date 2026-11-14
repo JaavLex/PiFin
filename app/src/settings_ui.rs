@@ -3,8 +3,10 @@
 //! overlays (list picker, PIN pad, text entry, confirmation) and sends every change
 //! through the settings daemon on a worker thread.
 //!
-//! Sections: rows come from `build_rows`; Task 5 fills Network, Task 6 adds the language
-//! rows to Display & audio.
+//! Sections: rows come from `build_rows`; the Network section lives in `net`
+//! (settings_ui/net.rs), Task 6 adds the language rows to Display & audio.
+
+mod net;
 
 use crate::settings::{self, DaemonError, Settings};
 use crate::{App, SettingRow};
@@ -16,6 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 pub const SECTIONS: [&str; 4] = ["Network", "Playback", "Display & audio", "System"];
+const NETWORK: usize = 0;
 const PLAYBACK: usize = 1;
 const DISPLAY: usize = 2;
 const SYSTEM: usize = 3;
@@ -49,6 +52,12 @@ static CHOICES: [Choice; 4] = [
 ];
 
 fn choice(key: &str) -> Option<&'static Choice> {
+    // the per-network choices offer the Playback values
+    let key = match key {
+        "net.max_bitrate" => "playback.max_bitrate",
+        "net.max_height" => "playback.max_height",
+        k => k,
+    };
     CHOICES.iter().find(|c| c.key == key)
 }
 
@@ -78,8 +87,9 @@ pub fn picker_top(len: usize, sel: usize) -> usize {
     sel.saturating_sub(4).min(len.saturating_sub(PICKER_ROWS))
 }
 
-/// The stored value of a choice or toggle key, as JSON.
-fn stored(s: &Settings, key: &str) -> Option<Value> {
+/// The stored value of a choice or toggle key, as JSON. The "here" keys are the current
+/// Wi-Fi network's effective limits.
+fn stored(s: &Settings, ssid: Option<&str>, key: &str) -> Option<Value> {
     Some(match key {
         "playback.max_bitrate" => json!(s.playback.max_bitrate),
         "playback.max_height" => json!(s.playback.max_height),
@@ -88,6 +98,8 @@ fn stored(s: &Settings, key: &str) -> Option<Value> {
         "display.output_max_height" => json!(s.display.output_max_height),
         "display.subtitle_scale" => json!(s.display.subtitle_scale as f64),
         "display.audio_passthrough" => json!(s.display.audio_passthrough),
+        "net.max_bitrate" => json!(settings::effective(s, ssid).max_bitrate),
+        "net.max_height" => json!(settings::effective(s, ssid).max_height),
         _ => return None,
     })
 }
@@ -106,6 +118,11 @@ pub struct Status {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct WifiStatus {
+    pub state: String,
+    pub ssid: String,
+    /// "usb" | "builtin"
+    pub radio: Option<String>,
+    pub signal_dbm: Option<i32>,
     pub ip: Option<String>,
 }
 
@@ -157,10 +174,12 @@ pub struct View<'a> {
     pub status: &'a Status,
     /// A TV resolution change was saved: offer "Restart now".
     pub restart_offered: bool,
+    pub net: &'a net::NetState,
 }
 
 pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
-    let val = |key: &str| v.pending.get(key).cloned().or_else(|| stored(v.settings, key)).unwrap_or(Value::Null);
+    let ssid = net::ssid(&v.status.wifi);
+    let val = |key: &str| v.pending.get(key).cloned().or_else(|| stored(v.settings, ssid, key)).unwrap_or(Value::Null);
     let choice_row = |key: &str, label: &str| row(key, "choice", label, value_label(key, val(key).as_f64().unwrap_or(0.0)), false);
     let toggle_row = |key: &str, label: &str| row(key, "toggle", label, if val(key).as_bool() == Some(true) { "On" } else { "Off" }, false);
     // D3: with a PIN set, every sensitive row shows the lock
@@ -205,7 +224,8 @@ pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
             r.push(row("system.factory", "action", "Factory reset", "", pin));
             r
         }
-        _ => vec![], // Network: Task 5
+        NETWORK => net::rows(v, &choice_row),
+        _ => vec![],
     }
 }
 
@@ -346,19 +366,26 @@ enum PadFor {
 enum PickFor {
     Choice(&'static str),
     PinMenu,
+    Saved,
+    Scan,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum TeFor {
     Url,
     Tailscale,
     Hotspot,
+    WifiName,
+    /// `open_ok`: an empty password joins an open network ("Other network…" only).
+    WifiPass { ssid: String, open_ok: bool },
 }
 
 #[derive(Clone, Debug)]
 enum ConfirmFor {
     Reboot,
     Factory(Option<String>),
+    Forget { ssid: String, current: bool },
+    Join(String),
 }
 
 #[derive(Default)]
@@ -382,6 +409,7 @@ struct Ui {
     /// A PIN check is out: the pad waits for its answer.
     busy: bool,
     message: String,
+    net: net::NetState,
 }
 
 thread_local! {
@@ -396,7 +424,8 @@ fn error_text(e: &DaemonError) -> String {
 fn sync(app: &App, u: &Ui) {
     let s = settings::current();
     let section = app.get_settings_section().clamp(0, SECTIONS.len() as i32 - 1) as usize;
-    let rows = build_rows(section, &View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered });
+    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net };
+    let rows = build_rows(section, &view);
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
     app.set_settings_row(valid_focus(&kinds, app.get_settings_row()));
     let model: Vec<SettingRow> = rows
@@ -432,13 +461,14 @@ fn sync(app: &App, u: &Ui) {
             app.set_te_keys(ModelRc::new(VecModel::from(keys)));
         }
         Overlay::Confirm(purpose) => {
-            let (title, text, yes) = match purpose {
-                ConfirmFor::Reboot => ("Restart PiFin?", "The TV goes dark for about 30 seconds.", "Restart"),
+            let (title, text, yes): (String, String, String) = match purpose {
+                ConfirmFor::Reboot => ("Restart PiFin?".into(), "The TV goes dark for about 30 seconds.".into(), "Restart".into()),
                 ConfirmFor::Factory(_) => (
-                    "Factory reset?",
-                    "Removes all settings, sign-ins and saved Wi-Fi networks, then restarts.",
-                    "Reset",
+                    "Factory reset?".into(),
+                    "Removes all settings, sign-ins and saved Wi-Fi networks, then restarts.".into(),
+                    "Reset".into(),
                 ),
+                ConfirmFor::Forget { .. } | ConfirmFor::Join(_) => net::confirm_text(purpose),
             };
             app.set_confirm_title(title.into());
             app.set_confirm_text(text.into());
@@ -505,7 +535,7 @@ fn refresh_status(app: &App) {
 
 fn step(app: &App, u: &mut Ui, key: &str, delta: i32) {
     let s = settings::current();
-    let cur = u.pending.get(key).cloned().or_else(|| stored(&s, key));
+    let cur = u.pending.get(key).cloned().or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
     let new = match choice(key) {
         Some(c) => {
             let idx = cur.as_ref().and_then(|v| v.as_f64()).and_then(|v| c.index_of(v)).unwrap_or(0);
@@ -525,8 +555,9 @@ fn step(app: &App, u: &mut Ui, key: &str, delta: i32) {
 fn set_pending(app: &App, u: &mut Ui, key: &str, value: Value) {
     u.pending.insert(key.to_string(), value);
     let weak = app.as_weak();
-    let k = key.to_string();
-    u.timers.entry(key.to_string()).or_default().start(slint::TimerMode::SingleShot, SEND_DELAY, move || {
+    // both per-network choices go out in one network_set
+    let k = if net::NET_CHOICES.contains(&key) { net::LIMITS_TIMER.to_string() } else { key.to_string() };
+    u.timers.entry(k.clone()).or_default().start(slint::TimerMode::SingleShot, SEND_DELAY, move || {
         if let Some(app) = weak.upgrade() {
             with_ui(&app, |app, u| send_pending(app, u, &k));
         }
@@ -534,6 +565,9 @@ fn set_pending(app: &App, u: &mut Ui, key: &str, value: Value) {
 }
 
 fn send_pending(app: &App, u: &mut Ui, key: &str) {
+    if key == net::LIMITS_TIMER {
+        return net::send_limits(app, u);
+    }
     let Some(value) = u.pending.get(key).cloned() else { return };
     let mut changes = serde_json::Map::new();
     changes.insert(key.to_string(), value.clone());
@@ -559,11 +593,12 @@ fn send_pending(app: &App, u: &mut Ui, key: &str) {
 fn activate(app: &App, u: &mut Ui, key: &str) {
     if let Some(c) = choice(key) {
         let s = settings::current();
-        let cur = u.pending.get(key).cloned().or_else(|| stored(&s, key));
+        let cur = u.pending.get(key).cloned().or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
         let sel = cur.and_then(|v| v.as_f64()).and_then(|v| c.index_of(v)).unwrap_or(0);
         let title = app.get_settings_rows().iter().find(|r| r.key == key).map(|r| r.label.to_string()).unwrap_or_default();
         let items = c.labels.iter().map(|l| l.to_string()).collect();
-        open_overlay(app, u, Overlay::Picker { title, items, sel, purpose: PickFor::Choice(c.key) });
+        let key = net::NET_CHOICES.iter().copied().find(|k| *k == key).unwrap_or(c.key);
+        open_overlay(app, u, Overlay::Picker { title, items, sel, purpose: PickFor::Choice(key) });
         return;
     }
     match key {
@@ -579,6 +614,7 @@ fn activate(app: &App, u: &mut Ui, key: &str) {
         "system.pin" => open_pad(app, u, "New PIN", PadFor::NewPin { old: None }),
         "system.pair" => u.message = "Coming soon".into(),
         "system.reboot" => open_overlay(app, u, Overlay::Confirm(ConfirmFor::Reboot)),
+        k if k.starts_with("net.") => net::activate(app, u, k),
         _ => {}
     }
 }
@@ -609,7 +645,7 @@ fn after_gate(app: &App, u: &mut Ui, g: Gated, pin: Option<String>) {
 }
 
 fn picker_ok(app: &App, u: &mut Ui) {
-    let Overlay::Picker { sel, purpose, .. } = std::mem::take(&mut u.overlay) else { return };
+    let Overlay::Picker { sel, purpose, items, .. } = std::mem::take(&mut u.overlay) else { return };
     match purpose {
         PickFor::Choice(key) => {
             if let Some(c) = choice(key) {
@@ -618,6 +654,7 @@ fn picker_ok(app: &App, u: &mut Ui) {
         }
         PickFor::PinMenu if sel == 0 => open_pad(app, u, "Current PIN", PadFor::CurrentForChange),
         PickFor::PinMenu => open_pad(app, u, "Current PIN", PadFor::CurrentForRemove),
+        PickFor::Saved | PickFor::Scan => net::picked(app, u, purpose, sel, &items),
     }
 }
 
@@ -702,7 +739,7 @@ fn pad_key(app: &App, u: &mut Ui, key: &str) {
 
 fn te_key(app: &App, u: &mut Ui, key: &str) {
     let Overlay::Text { entry, purpose, pin, .. } = &mut u.overlay else { return };
-    let (purpose, pin) = (*purpose, pin.clone());
+    let (purpose, pin) = (purpose.clone(), pin.clone());
     let value = match entry.press(key) {
         TeAction::None => return,
         TeAction::Cancel => {
@@ -728,6 +765,7 @@ fn te_key(app: &App, u: &mut Ui, key: &str) {
                 }
             });
         }
+        TeFor::WifiName | TeFor::WifiPass { .. } => net::text_done(app, u, purpose, value),
         TeFor::Tailscale => {
             u.overlay = Overlay::None;
             u.message = "Signing in…".into();
@@ -752,6 +790,7 @@ fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
     let (op, args) = match purpose {
         ConfirmFor::Reboot => ("reboot", json!({})),
         ConfirmFor::Factory(pin) => ("factory_reset", with_pin(json!({}), pin)),
+        ConfirmFor::Forget { .. } | ConfirmFor::Join(_) => return net::confirmed(app, u, purpose),
     };
     u.message = "Restarting…".into();
     send(app, op, args, SHORT, |_, u, res| {
@@ -765,20 +804,32 @@ fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
 
 /// Open the screen on Playback with the focus on the section list.
 pub fn open(app: &App) {
+    open_at(app, PLAYBACK);
+}
+
+fn open_at(app: &App, section: usize) {
     UI.with(|cell| {
         let mut u = cell.borrow_mut();
         u.overlay = Overlay::None;
         u.message.clear();
+        net::reset(&mut u);
     });
-    app.set_settings_section(PLAYBACK as i32);
+    app.set_settings_section(section as i32);
     app.set_settings_row(-1);
     app.set_settings_show(true);
-    with_ui(app, |_, _| {});
-    refresh_status(app);
+    with_ui(app, |app, u| {
+        if section == NETWORK {
+            net::section_opened(app, u);
+        } else {
+            refresh_status(app);
+        }
+    });
 }
 
-/// Register the Settings callbacks (the gear's `open-settings` is wired by main).
-pub fn install(app: &App) {
+/// Register the Settings callbacks (the gear's `open-settings` is wired by main) and the
+/// Wi-Fi setup screen's OK. `server_probe` measures the Jellyfin server for Test connection.
+pub fn install(app: &App, server_probe: net::Probe) {
+    UI.with(|cell| cell.borrow_mut().net.probe = Some(server_probe));
     let sections: Vec<SharedString> = SECTIONS.iter().map(|s| SharedString::from(*s)).collect();
     app.set_settings_sections(ModelRc::new(VecModel::from(sections)));
 
@@ -791,12 +842,28 @@ pub fn install(app: &App) {
             }
         }
     }
-    let close = on(app, |app, _, ()| app.set_settings_show(false));
+    let close = on(app, |app, u, ()| {
+        net::section_left(u);
+        app.set_settings_show(false);
+    });
     app.on_settings_close(move || close(()));
-    app.on_settings_section_changed(on(app, |app, u, _section: i32| {
+    app.on_settings_section_changed(on(app, |app, u, section: i32| {
         app.set_settings_row(-1);
         u.message.clear();
+        if section == NETWORK as i32 {
+            net::section_opened(app, u);
+        } else {
+            net::section_left(u);
+        }
     }));
+    // OK on the Wi-Fi setup screen (hotspot): Settings > Network, straight into Add network
+    let weak = app.as_weak();
+    app.on_wifi_pick(move || {
+        if let Some(app) = weak.upgrade() {
+            open_at(&app, NETWORK);
+            with_ui(&app, net::start_add);
+        }
+    });
     app.on_settings_move(on(app, |app, _, dir: i32| {
         let rows = app.get_settings_rows();
         let kinds: Vec<SharedString> = rows.iter().map(|r| r.kind).collect();
@@ -862,7 +929,7 @@ mod tests {
             macs: Macs { builtin: Some("aa".into()), usb: Some("bb".into()) },
             ..Default::default()
         };
-        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false })
+        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default() })
     }
 
     #[test]
