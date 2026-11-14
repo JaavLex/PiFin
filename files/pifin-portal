@@ -1,0 +1,280 @@
+#!/usr/bin/python3
+"""PiFin: hotel login pages (captive portals).
+
+NetworkManager checks the connectivity once a minute (pifin-connectivity.conf).
+When the Wi-Fi PiFin joined answers with a login page instead of the check text,
+NM reports "portal" and the dispatcher (pifin-portal-dispatch) starts
+pifin-portal.service, which runs `pifin-portal run`:
+
+  - with a USB Wi-Fi adapter (the link) and the built-in radio resting, it opens
+    the "PiFin-login" hotspot on the built-in radio. NM's shared mode gives the
+    phone DHCP, DNS and NAT; the firewall forwards hotspot -> link only. The phone
+    sees the hotel's page, and logging in authorizes the Pi's MAC (NAT).
+  - without an adapter there is no second radio: the TV shows the Pi's MAC
+    address, to register at reception.
+
+It tells the app through /run/pifin/wifi.json (state PORTAL). When NM reports
+"full" (or the link is gone) the dispatcher stops the service and `pifin-portal
+down` (ExecStopPost, so also on a crash) removes the hotspot and the forward
+rules, rests the built-in radio again and gives the app back state CONNECTED.
+After 15 minutes the hotspot closes by itself and the TV keeps the MAC screen.
+
+Python stdlib only. Usage: pifin-portal event <NM-STATE> | run | down
+"""
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+UNIT = "pifin-portal.service"
+AP_CON = "pifin-login"          # in-memory NM profile (save no): a reboot never keeps it
+AP_SSID = "PiFin-login"
+AP_ADDR = "10.43.0.1/24"         # comitup's setup hotspot is 10.41.0.1, NM's default 10.42
+TIMEOUT = 15 * 60
+SYS_NET = "/sys/class/net"
+WIFI_JSON = "/run/pifin/wifi.json"
+SECRETS = "/etc/pifin/secrets.env"
+FWD_SAVE = "/run/pifin/portal-ip-forward"
+PASS_FILE = "/run/pifin/portal-pass"
+IP_FORWARD = "/proc/sys/net/ipv4/ip_forward"
+WIFI_SELECT = "/usr/local/sbin/pifin-wifi-select"
+PORTAL_KEYS = ("portal_ssid", "portal_pass", "mac", "hotspot", "expired")
+
+
+def log(msg):
+    print(f"pifin-portal: {msg}", file=sys.stderr, flush=True)
+
+
+def sh(*args, check=True):
+    """Run a command; the tests replace this."""
+    return subprocess.run(args, check=check, capture_output=True, text=True)
+
+
+# ---- decisions (pure) ------------------------------------------------------
+
+def event_action(state):
+    """What a connectivity change means for the service: start, stop or nothing.
+    LIMITED and UNKNOWN are ignored: a portal page can flap through them."""
+    return {"PORTAL": "start", "FULL": "stop", "NONE": "stop"}.get(state.upper())
+
+
+def plan(usb, builtin):
+    """hotspot when a USB adapter carries the link and a built-in radio is free."""
+    return "hotspot" if usb and builtin else "mac"
+
+
+def radios(sysnet=None):
+    """(usb, builtin): the first Wi-Fi interface on USB and the first other one.
+    Told apart by bus, like pifin-wifi-select (names can swap between boots)."""
+    sysnet = sysnet or SYS_NET
+    usb = builtin = ""
+    for name in sorted(os.listdir(sysnet)):
+        d = os.path.join(sysnet, name)
+        if not os.path.isdir(os.path.join(d, "wireless")):
+            continue
+        if "/usb" in os.path.realpath(os.path.join(d, "device")):
+            usb = usb or name
+        else:
+            builtin = builtin or name
+    return usb, builtin
+
+
+def nft_rules(ap, link):
+    """Firewall while the hotspot is up: DHCP/DNS from the hotspot to the Pi, and
+    forwarding hotspot -> link only (never to tailscale0 or anything else); back
+    from the link only for connections the phone opened."""
+    t = "inet pifin"
+    return "\n".join([
+        f"flush chain {t} portal_in",
+        f"flush chain {t} portal_fwd",
+        f'add rule {t} portal_in iifname "{ap}" udp dport {{ 53, 67 }} accept',
+        f'add rule {t} portal_in iifname "{ap}" tcp dport 53 accept',
+        f'add rule {t} portal_fwd iifname "{ap}" oifname "{link}" accept',
+        f'add rule {t} portal_fwd iifname "{link}" oifname "{ap}" ct state established,related accept',
+        "",
+    ])
+
+
+NFT_CLEAR = "flush chain inet pifin portal_in\nflush chain inet pifin portal_fwd\n"
+
+
+def portal_status(cur, mode, mac, ap_pass="", expired=False):
+    """wifi.json while a login page is in the way (keeps the comitup fields)."""
+    new = {k: v for k, v in cur.items() if k not in PORTAL_KEYS}
+    new.update(state="PORTAL", mac=mac, hotspot=mode == "hotspot", expired=expired,
+               portal_ssid=AP_SSID if mode == "hotspot" else "",
+               portal_pass=ap_pass if mode == "hotspot" else "", time=int(time.time()))
+    return new
+
+
+def after_portal(cur):
+    """wifi.json once the portal is gone: CONNECTED again, unless comitup has
+    published something newer (then that stays)."""
+    if cur.get("state") != "PORTAL":
+        return None
+    new = {k: v for k, v in cur.items() if k not in PORTAL_KEYS}
+    new.update(state="CONNECTED", time=int(time.time()))
+    return new
+
+
+# ---- system ----------------------------------------------------------------
+
+def read_json(path=None):
+    try:
+        with open(path or WIFI_JSON) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(data, path=None):
+    path = path or WIFI_JSON
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o640)
+    group = env_value("PIFIN_USER") or "pifin"
+    try:
+        import grp
+        os.chown(tmp, -1, grp.getgrnam(group).gr_gid)
+    except (KeyError, OSError):
+        pass
+    os.replace(tmp, path)
+
+
+def env_value(key, path=None):
+    """A value from secrets.env (shell-quoted KEY=value lines), never logged."""
+    try:
+        with open(path or SECRETS) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key:
+                    return (shlex.split(v) or [""])[0]
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def mac_of(iface):
+    try:
+        with open(os.path.join(SYS_NET, iface, "address")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def nft(text):
+    """Load nft commands; the tests replace this."""
+    return subprocess.run(["nft", "-f", "-"], input=text, check=True,
+                          capture_output=True, text=True)
+
+
+def hotspot_up(ap, link, password):
+    os.makedirs(os.path.dirname(FWD_SAVE), exist_ok=True)
+    try:  # NM's shared mode turns forwarding on; down puts it back
+        with open(IP_FORWARD) as f, open(FWD_SAVE, "w") as s:
+            s.write(f.read())
+    except OSError:
+        pass
+    sh("nmcli", "device", "set", ap, "managed", "yes")
+    sh("nmcli", "connection", "delete", AP_CON, check=False)
+    sh("nmcli", "connection", "add", "save", "no", "type", "wifi", "ifname", ap,
+       "con-name", AP_CON, "autoconnect", "no", "ssid", AP_SSID,
+       "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+       "ipv4.method", "shared", "ipv4.addresses", AP_ADDR, "ipv6.method", "disabled",
+       "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
+       "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp", "wifi-sec.pmf", "disable")
+    nft(nft_rules(ap, link))
+    # the password goes through a 0600 file, never the command line (ps)
+    pw = PASS_FILE
+    fd = os.open(pw, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"802-11-wireless-security.psk:{password}\n")
+    try:
+        sh("nmcli", "--wait", "30", "connection", "up", AP_CON, "passwd-file", pw)
+    finally:
+        os.unlink(pw)
+
+
+def hotspot_down(rest_builtin):
+    """Remove everything the hotspot added; safe to run any number of times."""
+    try:
+        nft(NFT_CLEAR)
+    except (OSError, subprocess.CalledProcessError):
+        pass  # no pifin table (firewall stopped): nothing to clear
+    sh("nmcli", "connection", "down", AP_CON, check=False)
+    sh("nmcli", "connection", "delete", AP_CON, check=False)
+    try:
+        with open(FWD_SAVE) as s:
+            saved = s.read().strip()
+        if saved == "0":
+            with open(IP_FORWARD, "w") as f:
+                f.write("0\n")
+        os.unlink(FWD_SAVE)
+    except OSError:
+        pass
+    if rest_builtin:
+        sh(WIFI_SELECT, check=False)  # unmanaged + link down again, like at boot
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_event(state):
+    action = event_action(state)
+    if action:
+        sh("systemctl", "--no-block", action, UNIT, check=False)
+    return action
+
+
+def cmd_run(sleep=time.sleep, pause=signal.pause):
+    usb, builtin = radios()
+    mode = plan(usb, builtin)
+    link = usb or builtin
+    mac = mac_of(link)
+    password = env_value("HOTSPOT_PASS")
+    if mode == "hotspot" and len(password) >= 8:
+        try:
+            hotspot_up(builtin, usb, password)
+            log(f"login hotspot {AP_SSID} up on {builtin}, forwarding to {usb}")
+        except (OSError, subprocess.CalledProcessError) as e:
+            log(f"login hotspot failed ({getattr(e, 'stderr', '') or e}); showing the MAC")
+            hotspot_down(True)
+            mode = "mac"
+    else:
+        mode = "mac"
+    write_json(portal_status(read_json(), mode, mac, password))
+    if mode == "hotspot":
+        sleep(TIMEOUT)
+        log("no login after 15 min: login hotspot closed")
+        hotspot_down(True)
+        write_json(portal_status(read_json(), "mac", mac, expired=True))
+    pause()  # until the dispatcher stops us (connectivity full or gone)
+
+
+def cmd_down():
+    usb, builtin = radios()
+    hotspot_down(rest_builtin=bool(usb and builtin))
+    new = after_portal(read_json())
+    if new is not None:
+        write_json(new)
+
+
+def main(argv):
+    if argv[:1] == ["event"] and len(argv) == 2:
+        cmd_event(argv[1])
+    elif argv == ["run"]:
+        cmd_run()
+    elif argv == ["down"]:
+        cmd_down()
+    else:
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

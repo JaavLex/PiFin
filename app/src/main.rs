@@ -960,6 +960,42 @@ struct WifiState {
     ssid: String,
     failed: String,
     time: u64,
+    // state PORTAL (pifin-portal): the Wi-Fi wants a browser login
+    portal_ssid: String,
+    portal_pass: String,
+    mac: String,
+    hotspot: bool,
+    expired: bool,
+}
+
+/// What the TV shows on a hotel login page: title, steps, and the hotspot to put in
+/// the QR code (none without a second radio: then the MAC is registered at reception).
+fn portal_screen(w: &WifiState) -> (String, String, Option<(String, String)>) {
+    let title = "This Wi-Fi needs a login".to_string();
+    if w.hotspot && !w.portal_ssid.is_empty() {
+        let text = format!(
+            "\"{}\" shows a login page (terms, room number) before the internet works.\n\n\
+             1.  Scan the code with your phone to join the network \"{}\" (password: {}).\n\n\
+             2.  The hotel's page opens on your phone. Accept it or log in as you would for the phone.\n\n\
+             3.  PiFin carries on by itself and the \"{}\" network closes.",
+            w.ssid, w.portal_ssid, w.portal_pass, w.portal_ssid
+        );
+        return (title, text, Some((w.portal_ssid.clone(), w.portal_pass.clone())));
+    }
+    let mac = if w.mac.is_empty() { "unknown" } else { &w.mac };
+    let first = if w.expired {
+        "The PiFin-login network closed after 15 minutes without a login."
+    } else {
+        "PiFin can't open this page by itself, and a USB Wi-Fi adapter is needed to pass it on to your phone."
+    };
+    let text = format!(
+        "\"{}\" shows a login page (terms, room number) before the internet works.\n\n\
+         {first}\n\n\
+         Ask reception to register this device address (MAC): {mac}\n\n\
+         PiFin carries on by itself once it is registered.",
+        w.ssid
+    );
+    (title, text, None)
 }
 
 const NOW_FILE: &str = "/tmp/pifin-now.json";
@@ -1061,6 +1097,26 @@ fn apply_wifi(app: &App, w: &WifiState, qr_cache: &mut Option<(String, slint::Im
             app.set_wifi_pickable(false);
             app.set_wifi_error("".into());
             app.set_wifi_has_qr(false);
+            app.set_wifi_show(true);
+            false
+        }
+        "PORTAL" => {
+            let (title, text, qr) = portal_screen(w);
+            app.set_wifi_title(title.into());
+            app.set_wifi_text(text.into());
+            app.set_wifi_pickable(false);
+            app.set_wifi_error("".into());
+            app.set_wifi_has_qr(false);
+            if let Some((ssid, pass)) = qr {
+                let key = format!("{ssid}\n{pass}");
+                if qr_cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                    *qr_cache = wifi_qr(&ssid, &pass).map(|i| (key, i));
+                }
+                if let Some((_, img)) = qr_cache {
+                    app.set_wifi_qr(img.clone());
+                    app.set_wifi_has_qr(true);
+                }
+            }
             app.set_wifi_show(true);
             false
         }
@@ -2101,6 +2157,30 @@ mod tests {
         assert!(plan(&auth(), &item(12_000_000), 0, &none()).url.contains("static=true"));
         let p = plan(&auth(), &item(30_000_000), 0, &none());
         assert!(p.url.contains("VideoBitrate=9616000") && p.note.is_empty(), "{}", p.url);
+    }
+
+    #[test]
+    fn portal_state_maps_to_the_login_screen() {
+        // the JSON pifin-portal writes, comitup's fields kept
+        let w: WifiState = serde_json::from_str(
+            r#"{"state":"PORTAL","ssid":"Hotel","ap_ssid":"PiFin-setup","ap_pass":"x","time":1,
+                "portal_ssid":"PiFin-login","portal_pass":"secret12","mac":"00:c0:ca:00:00:02",
+                "hotspot":true,"expired":false}"#).unwrap();
+        let (title, text, qr) = portal_screen(&w);
+        assert_eq!(title, "This Wi-Fi needs a login");
+        assert_eq!(qr, Some(("PiFin-login".to_string(), "secret12".to_string())));
+        assert!(text.contains("\"Hotel\"") && text.contains("PiFin carries on by itself"), "{text}");
+        assert!(!text.contains("00:c0:ca"), "{text}");
+        // no adapter: no QR, the MAC to register at reception
+        let w = WifiState { hotspot: false, portal_ssid: String::new(), portal_pass: String::new(), ..w };
+        let (_, text, qr) = portal_screen(&w);
+        assert_eq!(qr, None);
+        assert!(text.contains("reception") && text.contains("00:c0:ca:00:00:02"), "{text}");
+        assert!(!text.contains("closed after 15 minutes"), "{text}");
+        // the hotspot timed out: MAC screen, saying why
+        let (_, text, qr) = portal_screen(&WifiState { expired: true, ..w });
+        assert_eq!(qr, None);
+        assert!(text.contains("closed after 15 minutes") && text.contains("00:c0:ca:00:00:02"), "{text}");
     }
 
     #[test]

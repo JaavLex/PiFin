@@ -178,6 +178,12 @@ for u in $(nmcli -t -f UUID,TYPE con show | sed -n 's/:802-11-wireless$//p'); do
   nmcli con modify "$u" connection.interface-name "" 802-11-wireless.mtu 0 || true
 done
 
+step "Wi-Fi: notice hotel login pages (captive portals)"
+# NM checks the connectivity once a minute (92-pifin-connectivity.conf); its
+# dispatcher hook starts pifin-portal.service on a login page (no unit to enable).
+chmod 0755 /etc/NetworkManager/dispatcher.d/90-pifin-portal 2>/dev/null || true
+nmcli general reload conf || true
+
 step "Security: firewall, SSH keys only, services without root"
 # The Pi joins networks you don't control and is a member of your tailnet.
 # pifin-firewall: see the script; the tailnet ACL in the README is the real fence.

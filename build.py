@@ -53,6 +53,10 @@ INSTALL = [
     ("99-pifin-uinput.rules", "/etc/udev/rules.d/99-pifin-uinput.rules", "0644"),
     ("pifin-settingsd", "/usr/local/sbin/pifin-settingsd", "0755"),
     ("pifin-settingsd.service", "/etc/systemd/system/pifin-settingsd.service", "0644"),
+    ("pifin-portal", "/usr/local/sbin/pifin-portal", "0755"),
+    ("pifin-portal.service", "/etc/systemd/system/pifin-portal.service", "0644"),
+    ("pifin-portal-dispatch", "/etc/NetworkManager/dispatcher.d/90-pifin-portal", "0755"),
+    ("pifin-connectivity.conf", "/etc/NetworkManager/conf.d/92-pifin-connectivity.conf", "0644"),
 ]
 # Config the Pi needs at run time -> /etc/pifin/secrets.env (0600, sourced by root only)
 DEVICE_KEYS = ["PIFIN_HOSTNAME", "PIFIN_USER", "WIFI_COUNTRY", "HOTSPOT_SSID",

@@ -16,7 +16,9 @@ echo "== syntax =="
 python3 -m py_compile build.py files/*.py files/pifin-remote/*.py \
   && ok "python compiles" || bad "python compiles"
 python3 -m py_compile files/pifin-settingsd && ok "pifin-settingsd compiles" || bad "pifin-settingsd compiles"
-for f in files/pifin-setup.sh files/pifin-comitup-callback files/pifin-wifi-select files/pifin-wifi-watchdog; do
+python3 -m py_compile files/pifin-portal && ok "pifin-portal compiles" || bad "pifin-portal compiles"
+for f in files/pifin-setup.sh files/pifin-comitup-callback files/pifin-wifi-select files/pifin-wifi-watchdog \
+         files/pifin-portal-dispatch files/pifin-firewall; do
   bash -n "$f" && ok "bash -n $(basename "$f")" || bad "bash -n $(basename "$f")"
 done
 if command -v node >/dev/null; then
@@ -60,7 +62,7 @@ eq("user name", user["name"], "testuser")
 eq("password hashed", user["passwd"][:3], "$6$")
 eq("ssh key installed", user["ssh_authorized_keys"], [os.environ["WANT"]])
 wf = {f["path"]: f for f in u["write_files"]}
-eq("file count", len(wf), 30)  # 27 installed + secrets.env + display.conf + app.conf
+eq("file count", len(wf), 34)  # 31 installed + secrets.env + display.conf + app.conf
 eq("display.conf", wf["/etc/pifin/display.conf"]["content"], "MAX_HEIGHT=1080\n")
 eq("app.conf", wf["/etc/pifin/app.conf"]["content"], "JELLYFIN_URL=http://jellyfin.example:8096\n")
 eq("display.conf mode", wf["/etc/pifin/display.conf"]["permissions"], "0644")
@@ -190,6 +192,13 @@ if python3 tools/test_remote_pairing.py > "$D/pairing.log" 2>&1; then
   ok "phone remote pairing tests"
 else
   tail -20 "$D/pairing.log"; bad "phone remote pairing tests"
+fi
+
+echo "== G: hotel login pages (captive portal) =="
+if python3 tools/test_portal.py > "$D/portal.log" 2>&1; then
+  ok "captive portal tests"
+else
+  tail -20 "$D/portal.log"; bad "captive portal tests"
 fi
 
 echo

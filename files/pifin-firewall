@@ -9,7 +9,9 @@
 #  - out over Tailscale: only the Jellyfin port(s), MagicDNS and ping. Even if
 #         the tailnet policy allows more, nothing on the Pi can open your other
 #         devices or your home LAN through the tailnet.
-#  - no forwarding.
+#  - no forwarding, except while pifin-portal runs the hotel-login hotspot: it
+#         fills portal_in/portal_fwd (hotspot -> Wi-Fi link only) and empties
+#         them when it stops. Reloading this script empties them too.
 # A tailnet ACL (README, Security) is the real boundary: root on the Pi could
 # remove this table. This one also covers a tailnet left at "allow all".
 set -eu
@@ -31,6 +33,10 @@ nft -f - <<NFT
 table inet pifin
 delete table inet pifin
 table inet pifin {
+  chain portal_in {
+  }
+  chain portal_fwd {
+  }
   chain input {
     type filter hook input priority filter - 10; policy drop;
     iif lo accept
@@ -45,10 +51,12 @@ table inet pifin {
     udp dport 67 accept                            # setup hotspot: DHCP server
     ip daddr 10.41.0.1 tcp dport { 53, 80 } accept # setup hotspot: DNS, Wi-Fi page
     ip daddr 10.41.0.1 udp dport 53 accept
+    jump portal_in                                 # hotel-login hotspot (pifin-portal)
     counter comment "dropped in"
   }
   chain forward {
     type filter hook forward priority filter - 10; policy drop;
+    jump portal_fwd                                # empty unless pifin-portal runs
   }
   chain output {
     type filter hook output priority filter - 10; policy accept;
