@@ -773,7 +773,7 @@ fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
     let audio_br: i64 = if target < 6_000_000 { 256_000 } else { 384_000 };
     let video_br = (target - audio_br).max(1_200_000);
     let width = (if video_br < 3_500_000 { 1280 } else { 1920 }).min(width_for_height(max_height));
-    eprintln!("TRANSCODE id={} video={video_br} audio={audio_br} width={width} max_height={max_height}", it.id);
+    eprintln!("TRANSCODE id={} video={video_br} audio={audio_br} width={width} max_height={max_height} subs={} burn_in={:?}", it.id, text_subs.len(), burn_in(&streams, it.defaults));
     // only the link is named: no note when just the user's limits caused the conversion
     let note = if bitrate > link_direct_max && (link_target < MAX_TRANSCODE_BITRATE || bitrate <= MAX_DIRECT_BITRATE) {
         format!("lower quality for this connection (≈{} Mbit/s)", (link + 500_000) / 1_000_000)
@@ -784,9 +784,10 @@ fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
         url: format!(
             "{server}/Videos/{}/master.m3u8?MediaSourceId={msid}&DeviceId={}&PlaySessionId={session}&ApiKey={token}\
              &VideoCodec=h264&AudioCodec=aac&VideoBitrate={video_br}&AudioBitrate={audio_br}&MaxAudioChannels=6\
-             &TranscodingMaxAudioChannels=6&MaxWidth={width}&MaxHeight={max_height}&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
+             &TranscodingMaxAudioChannels=6&MaxWidth={width}&MaxHeight={max_height}&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}{}",
             it.id, auth.device_id,
-            audio.map(|a| format!("&AudioStreamIndex={}", a.index)).unwrap_or_default()
+            audio.map(|a| format!("&AudioStreamIndex={}", a.index)).unwrap_or_default(),
+            burn_in(&streams, it.defaults)
         ),
         note,
         subs: text_subs.iter().map(|s| sub_url(s)).collect(),
@@ -809,21 +810,97 @@ fn mpv_send(args: &[&str]) -> bool {
 
 /// External/extracted subtitles are added once playback runs: the server may take
 /// a while to extract them from a big file, and that must not delay the picture.
-fn spawn_sub_loader(subs: Vec<(String, String)>, select: Option<usize>) {
+/// The first extraction of an embedded subtitle can take minutes on a big file, longer
+/// than mpv's network timeout, so the app downloads each one itself (long timeout) to a
+/// local file and adds that; the URL is the fallback.
+fn spawn_sub_loader(subs: Vec<(String, String)>, select: Option<usize>, exited: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
     if subs.is_empty() {
         return;
     }
     std::thread::spawn(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(Duration::from_secs(600)))
+            .build()
+            .into();
+        let tag = std::process::id();
+        let mut sources = Vec::new();
+        for (i, (url, title)) in subs.into_iter().enumerate() {
+            if exited.load(Ordering::Relaxed) {
+                return;
+            }
+            let path = format!("/tmp/pifin-sub-{tag}-{i}.{}", sub_ext(&url));
+            let t0 = Instant::now();
+            let got = agent.get(&url).call().map_err(|e| e.to_string()).and_then(|mut r| {
+                r.body_mut().with_config().limit(32 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())
+            });
+            let src = match got.and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+                Ok(()) => {
+                    eprintln!("SUB_FETCH {i} ok {}ms", t0.elapsed().as_millis());
+                    path
+                }
+                Err(e) => {
+                    eprintln!("SUB_FETCH {i} failed ({e}) {}", redact(&url));
+                    url
+                }
+            };
+            sources.push((src, title));
+        }
         for _ in 0..60 {
-            if mpv_get("time-pos").is_some() {
+            if exited.load(Ordering::Relaxed) || mpv_get("time-pos").is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        for (i, (url, title)) in subs.into_iter().enumerate() {
-            mpv_send(&["sub-add", &url, if select == Some(i) { "select" } else { "auto" }, &title]);
+        for (i, (src, title)) in sources.into_iter().enumerate() {
+            if exited.load(Ordering::Relaxed) {
+                return;
+            }
+            mpv_send(&["sub-add", &src, if select == Some(i) { "select" } else { "auto" }, &title]);
         }
     });
+}
+
+/// File extension for a subtitle URL (`.../Stream.srt?...` -> "srt").
+fn sub_ext(url: &str) -> &str {
+    let path = url.split('?').next().unwrap_or(url);
+    match path.rsplit_once('.') {
+        Some((_, e)) if !e.is_empty() && !e.contains('/') => e,
+        _ => "srt",
+    }
+}
+
+/// A URL with its token hidden, for logs.
+fn redact(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(p) = rest.find(['?', '&']) {
+        out.push_str(&rest[..=p]);
+        rest = &rest[p + 1..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        let (param, tail) = rest.split_at(end);
+        match param.split_once('=') {
+            Some((k, _)) if k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("apikey") => {
+                out.push_str(k);
+                out.push_str("=REDACTED");
+            }
+            _ => out.push_str(param),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Burn-in request for the default subtitle when it is image-based (PGS, DVD, DVB): those
+/// cannot be added as text files, so the server draws them into the converted picture.
+fn burn_in(streams: &[&jellyfin::MediaStream], defaults: Option<(Option<i32>, Option<i32>)>) -> String {
+    let Some(i) = defaults.and_then(|d| d.1) else { return String::new() };
+    match streams.iter().find(|s| s.kind == "Subtitle" && s.index == i) {
+        Some(s) if !s.is_text_subtitle_stream => format!("&SubtitleStreamIndex={i}&SubtitleMethod=Encode"),
+        _ => String::new(),
+    }
 }
 
 /// Background reporter for one playback: Start, Progress every 10 s, then Stopped +
@@ -1671,7 +1748,7 @@ fn main() {
                     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     spawn_reporter(client.clone(), it.clone(), plan.session.clone(), exited.clone(), weak.clone());
                     let sub_titles = plan.sub_names.iter().skip(plan.sub_names.len() - plan.subs.len()).cloned();
-                    spawn_sub_loader(plan.subs.iter().cloned().zip(sub_titles).collect(), plan.select_sub);
+                    spawn_sub_loader(plan.subs.iter().cloned().zip(sub_titles).collect(), plan.select_sub, exited.clone());
                     let weak = weak.clone();
                     let player = player.clone();
                     let poll_w = Rc::downgrade(&poll);
@@ -2110,6 +2187,35 @@ mod tests {
         // converted: every text subtitle is a file, the default one is selected
         let t = tracks(&s, Some((Some(2), Some(4))), true);
         assert_eq!((t.aid, t.sid, t.select_sub), (None, None, Some(1)));
+    }
+
+    #[test]
+    fn converted_stream_burns_in_only_an_image_default_subtitle() {
+        let st = |index, text: bool| jellyfin::MediaStream { index, kind: "Subtitle".into(), is_text_subtitle_stream: text, ..Default::default() };
+        // like the Vikings file: S2, S3 subrip; S4, S5 PGS
+        let all = [st(2, true), st(3, true), st(4, false), st(5, false)];
+        let s: Vec<&jellyfin::MediaStream> = all.iter().collect();
+        assert_eq!(burn_in(&s, Some((Some(1), Some(2)))), "");
+        assert_eq!(burn_in(&s, Some((Some(1), Some(5)))), "&SubtitleStreamIndex=5&SubtitleMethod=Encode");
+        assert_eq!(burn_in(&s, Some((Some(1), None))), "");
+        assert_eq!(burn_in(&s, None), "");
+        // converted: text subtitles become files numbered in order; the default is selected
+        let t = tracks(&s, Some((Some(1), Some(3))), true);
+        assert_eq!((t.sid, t.select_sub), (None, Some(1)));
+        // an image default is burnt in, no text file selected
+        assert_eq!(tracks(&s, Some((Some(1), Some(4))), true).select_sub, None);
+    }
+
+    #[test]
+    fn subtitle_urls_lose_their_token_in_logs() {
+        let u = "http://s:8096/Videos/x/y/Subtitles/2/0/Stream.srt?ApiKey=SECRET&a=1&api_key=SECRET2";
+        let r = redact(u);
+        assert!(!r.contains("SECRET"), "{r}");
+        assert_eq!(r, "http://s:8096/Videos/x/y/Subtitles/2/0/Stream.srt?ApiKey=REDACTED&a=1&api_key=REDACTED");
+        assert_eq!(redact("http://s/a?b=1"), "http://s/a?b=1");
+        assert_eq!(sub_ext(u), "srt");
+        assert_eq!(sub_ext("http://s/Stream.vtt?api_key=1.2"), "vtt");
+        assert_eq!(sub_ext("http://s.lan/x"), "srt");
     }
 
     #[test]
