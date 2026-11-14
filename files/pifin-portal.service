@@ -1,0 +1,10 @@
+[Unit]
+Description=PiFin hotel login helper (captive portal)
+# started and stopped by the NetworkManager dispatcher (pifin-portal-dispatch)
+After=NetworkManager.service pifin-firewall.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pifin-portal run
+# always: removes the hotspot and its forward rules, even after a crash
+ExecStopPost=/usr/local/sbin/pifin-portal down

@@ -42,6 +42,11 @@ progress goes back to the server, so you pick up at home where you stopped at th
   volume, tracks, search. The TV remote works too (HDMI-CEC).
 - **Wi-Fi setup at a new place:** with no known network the Pi opens a hotspot and shows a QR
   code on the TV; pick the local Wi-Fi on your phone and it carries on by itself.
+- **Hotel login pages:** when the Wi-Fi wants a browser login, the TV says so with a QR code.
+  With a USB Wi-Fi adapter, the built-in radio opens a short-lived "PiFin-login" hotspot: your
+  phone joins it, the hotel's page opens, and accepting it lets PiFin online too; the hotspot
+  then closes by itself (after 15 min at most). Without an adapter the TV shows the Pi's MAC
+  address to register at reception.
 - **Fast:** ~20 s from power-on to the home screen (the last session's home shows at once
   while the server is asked again), ~120 MB for the app, idle CPU near zero.
 
@@ -133,7 +138,8 @@ The Pi joins networks you don't control and is a member of your tailnet, so a st
 compromised Pi must not become a way into your home. What PiFin does on the Pi:
 
 - **Firewall:** inbound, only SSH, the phone remote (local network only), mDNS, DHCP,
-  Tailscale and the setup hotspot. Over Tailscale it can only reach the Jellyfin port, not
+  Tailscale and the setup hotspot. No forwarding, except phone -> hotel Wi-Fi while the
+  hotel-login hotspot is open (never into the tailnet). Over Tailscale it can only reach the Jellyfin port, not
   your other devices or your home LAN. It never accepts subnet routes.
 - **SSH:** keys only once `SSH_PUBKEY` is set (passwords stay on otherwise, so you aren't
   locked out); no root login.

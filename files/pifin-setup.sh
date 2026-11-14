@@ -176,6 +176,12 @@ EOF
   done
   live && systemctl daemon-reload
 
+  step "Wi-Fi: notice hotel login pages (captive portals)"
+  # NM checks the connectivity once a minute (92-pifin-connectivity.conf); its
+  # dispatcher hook starts pifin-portal.service on a login page (no unit to enable).
+  chmod 0755 /etc/NetworkManager/dispatcher.d/90-pifin-portal 2>/dev/null || true
+  live && { nmcli general reload conf || true; }
+
   step "Security: firewall, services without root"
   # The Pi joins networks you don't control and is a member of your tailnet.
   # pifin-firewall: see the script; the tailnet ACL in the README is the real fence.

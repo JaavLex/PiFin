@@ -30,3 +30,7 @@ pifin-settingsd /usr/local/sbin/pifin-settingsd 0755
 pifin-settingsd.service /etc/systemd/system/pifin-settingsd.service 0644
 pifin-update /usr/local/sbin/pifin-update 0755
 pifin-update@.service /etc/systemd/system/pifin-update@.service 0644
+pifin-portal /usr/local/sbin/pifin-portal 0755
+pifin-portal.service /etc/systemd/system/pifin-portal.service 0644
+pifin-portal-dispatch /etc/NetworkManager/dispatcher.d/90-pifin-portal 0755
+pifin-connectivity.conf /etc/NetworkManager/conf.d/92-pifin-connectivity.conf 0644

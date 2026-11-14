@@ -21,9 +21,10 @@ done
 EXCL=(":!tools/check-leaks.sh")
 if git grep --cached -q -I -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" \
    ; then
-  hits=$(git grep --cached -I -l -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" | while read -r f; do git grep --cached -h -oE '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- "$f" | grep -qvxE '10\.41\.0\.1|100\.100\.100\.100' && echo "$f"; done || true)
-  # 10.41.0.1 is comitup's standard hotspot address and 100.100.100.100 Tailscale's
-  # MagicDNS resolver (the same on every tailnet): neither is one of yours
+  hits=$(git grep --cached -I -l -E -e '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- . "${EXCL[@]}" | while read -r f; do git grep --cached -h -oE '\b(192\.168|10\.[0-9]+|100\.[0-9]+)\.[0-9]+\.[0-9]+\b' -- "$f" | grep -qvxE '10\.4[13]\.0\.1|100\.100\.100\.100' && echo "$f"; done || true)
+  # 10.41.0.1 is comitup's standard hotspot address, 10.43.0.1 PiFin's hotel-login
+  # hotspot (pifin-portal) and 100.100.100.100 Tailscale's MagicDNS resolver (the same
+  # on every tailnet): none is one of yours
   if [ -n "$hits" ]; then echo "LEAK: a private IP address in:"; echo "$hits"; fail=1; fi
 fi
 if [ -r .leakwords ]; then

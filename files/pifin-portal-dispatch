@@ -1,0 +1,6 @@
+#!/bin/sh
+# PiFin: NetworkManager dispatcher hook. NM's connectivity check (once a minute,
+# pifin-connectivity.conf) found a hotel login page (PORTAL) or the internet
+# again (FULL): pifin-portal starts or stops the login helper. No polling.
+[ "$2" = connectivity-change ] || exit 0
+exec /usr/local/sbin/pifin-portal event "$CONNECTIVITY_STATE"
