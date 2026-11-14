@@ -1,7 +1,7 @@
 //! Minimal blocking Jellyfin client: only the calls the UI needs, small responses.
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Auth {
@@ -129,6 +129,36 @@ impl Client {
             env!("CARGO_PKG_VERSION"),
             self.auth.token
         )
+    }
+
+    /// Throughput from the server in bit/s, measured on Jellyfin's bitrate test:
+    /// reads for up to 2 s after the first byte, so the server's own latency
+    /// doesn't count. None when the server doesn't start answering within 3 s.
+    pub fn link_rate(&self) -> Option<u64> {
+        use std::io::Read;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(3)))
+            .timeout_global(Some(Duration::from_secs(6)))
+            .build()
+            .into();
+        let url = format!("{}/Playback/BitrateTest?size=4000000", self.auth.server.trim_end_matches('/'));
+        let t0 = Instant::now();
+        let mut r = agent.get(&url).header("Authorization", &self.header()).call().ok()?;
+        let mut body = r.body_mut().as_reader();
+        let mut buf = vec![0u8; 64 * 1024];
+        if body.read(&mut buf).ok()? == 0 || t0.elapsed() > Duration::from_secs(3) {
+            return None;
+        }
+        let t1 = Instant::now();
+        let mut n = 0u64;
+        while t1.elapsed() < Duration::from_secs(2) {
+            match body.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => n += k as u64,
+            }
+        }
+        let secs = t1.elapsed().as_secs_f64();
+        (n >= 64 * 1024 && secs > 0.02).then(|| (n as f64 * 8.0 / secs) as u64)
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, String> {

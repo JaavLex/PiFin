@@ -573,6 +573,28 @@ fn mpv_get(prop: &str) -> Option<serde_json::Value> {
 /// Files above this bitrate are converted by the server instead of played directly:
 /// the Pi's Wi-Fi can't keep up with Blu-ray remuxes (30+ Mbit/s).
 const MAX_DIRECT_BITRATE: i64 = 16_000_000;
+/// Converted streams: at most this bitrate (video + audio).
+const MAX_TRANSCODE_BITRATE: i64 = 10_000_000;
+
+/// Last measured throughput from the server (bit/s, 0 = unknown) and when. Measured
+/// when Play is pressed (a minute's result is reused), so a weak hotel or home
+/// Wi-Fi gets a stream it can carry instead of freezing every few seconds.
+static LINK: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+
+fn link_bps() -> Option<u64> {
+    LINK.lock().ok()?.filter(|(t, _)| t.elapsed() < Duration::from_secs(60)).map(|(_, b)| b)
+}
+
+/// (largest file bitrate played directly, bitrate of a converted stream) for a link.
+/// Direct play may use 80% of the link (it reads ahead in bursts); a converted stream
+/// gets 60%, since Wi-Fi swings by half from one minute to the next.
+fn bitrate_budget(link: u64) -> (i64, i64) {
+    if link == 0 {
+        return (MAX_DIRECT_BITRATE, MAX_TRANSCODE_BITRATE);
+    }
+    let l = link as f64;
+    (((l * 0.8) as i64).min(MAX_DIRECT_BITRATE), ((l * 0.6) as i64).clamp(1_500_000, MAX_TRANSCODE_BITRATE))
+}
 
 /// How to play an item: the URL, extra subtitle files, and the track names the
 /// phone remote shows (in mpv's order).
@@ -582,9 +604,11 @@ struct Plan {
     session: Option<String>,
     audio_names: Vec<String>,
     sub_names: Vec<String>,
+    /// shown while starting when the connection forced a lower quality
+    note: String,
 }
 
-fn plan(auth: &Auth, it: &Item) -> Plan {
+fn plan(auth: &Auth, it: &Item, link: u64) -> Plan {
     let server = auth.server.trim_end_matches('/');
     let token = &auth.token;
     let ms = it.media_sources.first();
@@ -593,7 +617,9 @@ fn plan(auth: &Auth, it: &Item) -> Plan {
     let name = |s: &jellyfin::MediaStream| s.display_title.clone().or(s.title.clone()).unwrap_or_else(|| format!("Track {}", s.index));
     let sub_url = |s: &jellyfin::MediaStream| format!("{server}/Videos/{}/{msid}/Subtitles/{}/0/Stream.srt?ApiKey={token}", it.id, s.index);
     let bitrate = ms.and_then(|m| m.bitrate).unwrap_or(0);
-    if bitrate <= MAX_DIRECT_BITRATE {
+    let (direct_max, target) = bitrate_budget(link);
+    eprintln!("PLAN id={} source_bitrate={bitrate} link={link} direct_max={direct_max} target={target}", it.id);
+    if bitrate <= direct_max {
         // direct play: internal tracks in file order, then external text subs
         let audio_names = streams.iter().filter(|s| s.kind == "Audio" && !s.is_external).map(|s| name(s)).collect();
         let mut sub_names: Vec<String> = streams.iter().filter(|s| s.kind == "Subtitle" && !s.is_external).map(|s| name(s)).collect();
@@ -605,21 +631,33 @@ fn plan(auth: &Auth, it: &Item) -> Plan {
             session: None,
             audio_names,
             sub_names,
+            note: String::new(),
         };
     }
     // converted by the server (hardware encoder on the server side), HLS so seeking works
     let session = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default().trim().replace('-', "");
     let audio = streams.iter().find(|s| s.kind == "Audio" && s.is_default).or(streams.iter().find(|s| s.kind == "Audio"));
     let text_subs: Vec<&&jellyfin::MediaStream> = streams.iter().filter(|s| s.kind == "Subtitle" && s.is_text_subtitle_stream).collect();
-    eprintln!("TRANSCODE id={} source_bitrate={}", it.id, bitrate);
+    // a weak link gets a lighter stream: less audio, and 720p below ~3.5 Mbit/s
+    // (sharper than a starved 1080p)
+    let audio_br: i64 = if target < 6_000_000 { 256_000 } else { 384_000 };
+    let video_br = (target - audio_br).max(1_200_000);
+    let width = if video_br < 3_500_000 { 1280 } else { 1920 };
+    eprintln!("TRANSCODE id={} video={video_br} audio={audio_br} width={width}", it.id);
+    let note = if target < MAX_TRANSCODE_BITRATE || bitrate <= MAX_DIRECT_BITRATE {
+        format!("lower quality for this connection (≈{} Mbit/s)", (link + 500_000) / 1_000_000)
+    } else {
+        String::new()
+    };
     Plan {
         url: format!(
             "{server}/Videos/{}/master.m3u8?MediaSourceId={msid}&DeviceId={}&PlaySessionId={session}&ApiKey={token}\
-             &VideoCodec=h264&AudioCodec=aac&VideoBitrate=10000000&AudioBitrate=384000&MaxAudioChannels=6\
-             &TranscodingMaxAudioChannels=6&MaxWidth=1920&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
+             &VideoCodec=h264&AudioCodec=aac&VideoBitrate={video_br}&AudioBitrate={audio_br}&MaxAudioChannels=6\
+             &TranscodingMaxAudioChannels=6&MaxWidth={width}&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=True{}",
             it.id, auth.device_id,
             audio.map(|a| format!("&AudioStreamIndex={}", a.index)).unwrap_or_default()
         ),
+        note,
         subs: text_subs.iter().map(|s| sub_url(s)).collect(),
         session: Some(session),
         audio_names: audio.map(|a| vec![format!("{} (converted)", name(a))]).unwrap_or_default(),
@@ -1376,6 +1414,7 @@ fn main() {
                 app.set_starting_title(shown.into());
                 if !app.get_starting() {
                     app.set_starting_slow(false);
+                    app.set_starting_note("".into());
                     app.set_starting(true);
                     start_gen.set(start_gen.get() + 1);
                     let (gen, start_gen, weak) = (start_gen.get(), start_gen.clone(), weak.clone());
@@ -1386,13 +1425,26 @@ fn main() {
                     });
                 }
             }
-            // list items carry no media info: fetch the full item first, then come back here
-            if it.media_sources.is_empty() {
+            // list items carry no media info: fetch the full item first, and measure
+            // the link meanwhile (unless measured a minute ago), then come back here
+            let need_link = link_bps().is_none();
+            if it.media_sources.is_empty() || need_link {
                 let client = client.clone();
                 let weak = weak.clone();
-                let id = it.id.clone();
+                let it = it.clone();
                 std::thread::spawn(move || {
-                    let full = client.item(&id);
+                    let probe = need_link.then(|| {
+                        let c = client.clone();
+                        std::thread::spawn(move || c.link_rate())
+                    });
+                    let full = if it.media_sources.is_empty() { client.item(&it.id) } else { Ok(it) };
+                    if let Some(p) = probe {
+                        let rate = p.join().ok().flatten().unwrap_or(0);
+                        eprintln!("LINK_MBPS={:.1}", rate as f64 / 1e6);
+                        if let Ok(mut l) = LINK.lock() {
+                            *l = Some((Instant::now(), rate));
+                        }
+                    }
                     let _ = slint::invoke_from_event_loop(move || {
                         let Some(app) = weak.upgrade() else { return };
                         let Ok(full) = full else {
@@ -1412,7 +1464,10 @@ fn main() {
                 });
                 return;
             }
-            let plan = plan(&auth, &it);
+            let plan = plan(&auth, &it, link_bps().unwrap_or(0));
+            if let Some(a) = weak.upgrade() {
+                a.set_starting_note(plan.note.clone().into());
+            }
             let start = it.user_data.as_ref().map(|u| u.playback_position_ticks as f64 / 1e7).unwrap_or(0.0);
             let title = match (&it.series_name, it.parent_index_number, it.index_number) {
                 (Some(s), Some(se), Some(ep)) => format!("{s} - S{se}E{ep} - {}", it.name),
@@ -1721,4 +1776,43 @@ fn main() {
     });
 
     app.run().expect("event loop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jellyfin::MediaSource;
+
+    fn item(bitrate: i64) -> Item {
+        Item { id: "i1".into(), media_sources: vec![MediaSource { id: "m1".into(), bitrate: Some(bitrate), ..Default::default() }], ..Default::default() }
+    }
+    fn auth() -> Auth {
+        Auth { server: "http://jf:8096".into(), user_id: "u".into(), token: "t".into(), device_id: "d".into() }
+    }
+
+    #[test]
+    fn budget_follows_the_link() {
+        assert_eq!(bitrate_budget(0), (MAX_DIRECT_BITRATE, MAX_TRANSCODE_BITRATE)); // unknown: as before
+        assert_eq!(bitrate_budget(7_400_000), (5_920_000, 4_440_000));
+        assert_eq!(bitrate_budget(100_000_000), (MAX_DIRECT_BITRATE, MAX_TRANSCODE_BITRATE));
+        assert_eq!(bitrate_budget(1_000_000), (800_000, 1_500_000)); // floor for converted streams
+    }
+
+    #[test]
+    fn weak_link_converts_to_a_stream_it_can_carry() {
+        // the LOTR case: 10 Mbit/s conversion on a ~7 Mbit/s Wi-Fi froze every 10-20 s
+        let p = plan(&auth(), &item(30_000_000), 7_400_000);
+        assert!(p.url.contains("master.m3u8") && p.url.contains("VideoBitrate=4184000") && p.url.contains("MaxWidth=1920"), "{}", p.url);
+        assert!(!p.note.is_empty());
+        // very weak: 720p
+        let p = plan(&auth(), &item(30_000_000), 4_000_000);
+        assert!(p.url.contains("VideoBitrate=2144000") && p.url.contains("MaxWidth=1280"), "{}", p.url);
+        // a light file still plays directly; one too heavy for this link is converted
+        assert!(plan(&auth(), &item(5_000_000), 7_400_000).url.contains("static=true"));
+        assert!(plan(&auth(), &item(7_000_000), 7_400_000).url.contains("master.m3u8"));
+        // unknown link: the old rule (direct up to 16 Mbit/s, else 10 Mbit/s, no note)
+        assert!(plan(&auth(), &item(12_000_000), 0).url.contains("static=true"));
+        let p = plan(&auth(), &item(30_000_000), 0);
+        assert!(p.url.contains("VideoBitrate=9616000") && p.note.is_empty(), "{}", p.url);
+    }
 }

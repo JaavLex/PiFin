@@ -139,6 +139,7 @@ export component App inherits Window {
     in property <bool> starting: false;
     in property <string> starting-title;
     in property <bool> starting-slow: false;
+    in property <string> starting-note;   // e.g. lower quality for a weak connection
     callback cancel-start();
 
     // "Who's watching?": saved users plus an "Add user" card (id "add")
@@ -395,7 +396,9 @@ export component App inherits Window {
         Text {
             y: parent.height / 2 + 52px; width: parent.width;
             horizontal-alignment: center;
-            text: root.starting-slow ? "Still buffering: the connection to the server is slow  ·  Back to cancel" : "Starting…  ·  Back to cancel";
+            text: root.starting-slow ? "Still buffering: the connection to the server is slow  ·  Back to cancel"
+                : root.starting-note != "" ? "Starting, " + root.starting-note + "  ·  Back to cancel"
+                : "Starting…  ·  Back to cancel";
             font-size: 16px; color: #8e8ea6;
         }
     }
