@@ -402,6 +402,8 @@ enum Overlay {
     // `pin`: the PIN checked for this one op, dropped with the overlay
     Text { title: String, entry: TextEntry, purpose: TeFor, pin: Option<String> },
     Confirm(ConfirmFor),
+    /// The phone-remote panel: QR code with the token, the address as text, a note.
+    Pair { qr: Option<slint::Image>, url: String, note: String },
 }
 
 #[derive(Default)]
@@ -445,8 +447,17 @@ fn sync(app: &App, u: &Ui) {
     app.set_pad_show(matches!(u.overlay, Overlay::Pad { .. }));
     app.set_te_show(matches!(u.overlay, Overlay::Text { .. }));
     app.set_confirm_show(matches!(u.overlay, Overlay::Confirm(_)));
+    app.set_pair_show(matches!(u.overlay, Overlay::Pair { .. }));
     match &u.overlay {
         Overlay::None => {}
+        Overlay::Pair { qr, url, note } => {
+            app.set_pair_has_qr(qr.is_some());
+            if let Some(img) = qr {
+                app.set_pair_qr(img.clone());
+            }
+            app.set_pair_url(url.into());
+            app.set_pair_note(note.into());
+        }
         Overlay::Picker { title, items, sel, .. } => {
             let top = picker_top(items.len(), *sel);
             let window: Vec<SharedString> = items.iter().skip(top).take(PICKER_ROWS).map(|s| s.into()).collect();
@@ -488,6 +499,7 @@ fn open_overlay(app: &App, u: &mut Ui, ov: Overlay) {
     app.set_pad_focus(0);
     app.set_te_focus(0);
     app.set_confirm_focus(0);
+    app.set_pair_focus(0);
     u.overlay = ov;
 }
 
@@ -621,7 +633,7 @@ fn activate(app: &App, u: &mut Ui, key: &str) {
             open_overlay(app, u, Overlay::Picker { title: "PIN".into(), items, sel: 0, purpose: PickFor::PinMenu });
         }
         "system.pin" => open_pad(app, u, "New PIN", PadFor::NewPin { old: None }),
-        "system.pair" => u.message = "Coming soon".into(),
+        "system.pair" => open_overlay(app, u, pair_overlay(String::new())),
         "system.reboot" => open_overlay(app, u, Overlay::Confirm(ConfirmFor::Reboot)),
         k if k.starts_with("net.") => net::activate(app, u, k),
         k if k.starts_with("lang.") => lang::activate(app, u, k),
@@ -793,6 +805,46 @@ fn te_key(app: &App, u: &mut Ui, key: &str) {
     }
 }
 
+/// What the phone-remote panel shows: (QR payload, address text). The token stays in the
+/// QR code; the text shows the address only.
+fn pair_texts(host: &str, token: Option<&str>) -> (String, String) {
+    (crate::remote_url(host, token), crate::remote_url(host, None))
+}
+
+/// The panel with the token read from the file now (a Re-pair replaces it).
+fn pair_overlay(note: String) -> Overlay {
+    match crate::remote_host() {
+        Some(host) => {
+            let (qr, url) = pair_texts(&host, settings::pair_token().as_deref());
+            Overlay::Pair { qr: crate::qr_image(&qr), url, note }
+        }
+        None => Overlay::Pair { qr: None, url: "No network address yet.".into(), note },
+    }
+}
+
+/// `again`: the Re-pair button; otherwise Back closes the panel.
+fn pair_done(app: &App, u: &mut Ui, again: bool) {
+    if !again {
+        u.overlay = Overlay::None;
+        return;
+    }
+    if u.busy {
+        return;
+    }
+    u.busy = true;
+    send(app, "pair_reset", json!({}), SHORT, |_, u, res| {
+        u.busy = false;
+        if !matches!(u.overlay, Overlay::Pair { .. }) {
+            return; // closed meanwhile
+        }
+        u.overlay = match res {
+            Ok(_) => pair_overlay("Other phones are logged out.".into()),
+            Err(e) => pair_overlay(error_text(&e).trim_start_matches('!').to_string()),
+        };
+    });
+}
+
+
 fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
     let Overlay::Confirm(purpose) = std::mem::take(&mut u.overlay) else { return };
     if !yes {
@@ -906,6 +958,7 @@ pub fn install(app: &App, server_probe: net::Probe, client: std::sync::Arc<crate
     app.on_pad_key(on(app, |app, u, key: SharedString| pad_key(app, u, &key)));
     app.on_te_key(on(app, |app, u, key: SharedString| te_key(app, u, &key)));
     app.on_confirm_done(on(app, confirm_done));
+    app.on_pair_done(on(app, pair_done));
 }
 
 #[cfg(test)]
@@ -952,6 +1005,23 @@ mod tests {
         };
         build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default(), lang: &lang::LangState::default() })
     }
+
+    #[test]
+    fn pair_panel_follows_the_token_file_after_a_reset() {
+        let path = std::env::temp_dir().join(format!("pifin-pair-{}", std::process::id()));
+        let (a, b) = ("0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+        std::fs::write(&path, format!("{a}\n")).unwrap();
+        let (qr, url) = pair_texts("192.0.2.7", settings::read_pair_token(&path).as_deref());
+        assert_eq!(qr, format!("http://192.0.2.7:8080/pair?t={a}"));
+        assert_eq!(url, "http://192.0.2.7:8080");
+        // pair_reset replaces the file; the panel reads it again
+        std::fs::write(&path, format!("{b}\n")).unwrap();
+        let (qr, url) = pair_texts("192.0.2.7", settings::read_pair_token(&path).as_deref());
+        assert_eq!(qr, format!("http://192.0.2.7:8080/pair?t={b}"));
+        assert!(!url.contains(b), "the text shows the address only");
+        std::fs::remove_file(&path).ok();
+    }
+
 
     #[test]
     fn a_pin_locks_every_sensitive_row_and_only_those() {

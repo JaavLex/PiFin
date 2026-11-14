@@ -144,7 +144,12 @@ pub fn effective(s: &Settings, ssid: Option<&str>) -> Playback {
 
 /// The pairing token the phone page needs: 32 hex chars, else None.
 pub fn pair_token() -> Option<String> {
-    let t = std::fs::read_to_string(paths().pair_token).ok()?;
+    read_pair_token(std::path::Path::new(&paths().pair_token))
+}
+
+/// `pair_token` for an explicit file (tests inject one).
+pub fn read_pair_token(path: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(path).ok()?;
     let t = t.trim();
     (t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_string())
 }

@@ -193,6 +193,14 @@ export component App inherits Window {
     in property <string> confirm-yes;
     in-out property <int> confirm-focus: 0;
     callback confirm-done(bool);
+    // phone remote panel (Settings > System): QR with the token, address, [Back] [Re-pair]
+    in property <bool> pair-show: false;
+    in property <image> pair-qr;
+    in property <bool> pair-has-qr: false;
+    in property <string> pair-url;
+    in property <string> pair-note;
+    in-out property <int> pair-focus: 0;
+    callback pair-done(bool);
     // text entry over the rows area
     in property <bool> te-show: false;
     in property <string> te-title;
@@ -763,11 +771,66 @@ export component App inherits Window {
         }
     }
 
+    if root.pair-show: Rectangle {
+        background: #0b0b12a0;
+        Rectangle {
+            width: 640px; height: 360px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 16px;
+            background: #161826f0;
+            Text {
+                x: 28px; y: 28px;
+                text: "Phone remote";
+                font-size: 24px; font-weight: 700;
+                color: #f2f2f7;
+            }
+            Rectangle {
+                x: 28px; y: 76px; width: 200px; height: 200px;
+                background: white;
+                border-radius: 8px;
+                Image { x: 8px; y: 8px; width: 184px; height: 184px; source: root.pair-qr; image-rendering: pixelated; visible: root.pair-has-qr; }
+            }
+            Text {
+                x: 252px; y: 76px; width: parent.width - 280px;
+                text: "Scan with your phone to pair it:\n" + root.pair-url;
+                font-size: 17px;
+                color: #b4b4c8;
+                wrap: word-wrap;
+            }
+            Text {
+                x: 252px; y: 190px; width: parent.width - 280px;
+                text: root.pair-note;
+                font-size: 17px;
+                color: #f2f2f7;
+                wrap: word-wrap;
+            }
+            for b[i] in ["Back", "Re-pair"]: Rectangle {
+                property <bool> focused: i == root.pair-focus;
+                x: parent.width - 28px - (2 - i) * 162px + 12px; y: parent.height - 28px - 48px;
+                width: 150px; height: 48px;
+                border-radius: 24px;
+                background: focused ? #f2f2f7 : #1a1c2b;
+                Text {
+                    text: b;
+                    font-size: 18px; font-weight: 600;
+                    color: focused ? #0b0b12 : #c8c8d8;
+                }
+            }
+        }
+    }
+
     forward-focus: keys;
     keys := FocusScope {
         key-pressed(event) => {
             if (root.starting) {
                 if (event.text == Key.Escape || event.text == Key.Backspace) { root.cancel-start(); }
+                return accept;
+            }
+            if (root.pair-show) {
+                if (event.text == Key.LeftArrow) { root.pair-focus = 0; }
+                if (event.text == Key.RightArrow) { root.pair-focus = 1; }
+                if (event.text == Key.Return || event.text == " ") { root.pair-done(root.pair-focus == 1); }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.pair-done(false); }
                 return accept;
             }
             if (root.confirm-show) {
