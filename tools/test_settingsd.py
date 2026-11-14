@@ -5,6 +5,7 @@ Run: python3 tools/test_settingsd.py"""
 import glob
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 
@@ -396,6 +398,290 @@ class T15Status(Base):
         self.write("/run/pifin/wifi.json", json.dumps({"state": 5, "ssid": ["x"]}))
         w = self.ok({"op": "get"})["status"]["wifi"]
         self.assertEqual((w["state"], w["ssid"]), ("unknown", ""))
+
+
+FIX = HERE / "tools/fixtures/settingsd"
+HOME_UUID = "00000000-0000-4000-8000-000000000001"
+OFFICE_UUID = "00000000-0000-4000-8000-000000000006"
+PSK = "s3cret wifi pass"
+KEY = "tskey-auth-kAbCdEf123456-XyZ"
+SCAN = ("nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan", "yes")
+
+
+class FixtureBase(Base):
+    """The daemon's own demo runner on the captured Pi outputs, every call recorded."""
+
+    def setUp(self):
+        super().setUp()
+        saved = {n: getattr(sd, n) for n in ("COMITUP_CONNECT", "SPAWN", "SLEEP", "TAILSCALE_PRESENT")}
+        self.addCleanup(lambda: [setattr(sd, n, v) for n, v in saved.items()])
+        self.fixture = sd.fixture_runner(str(FIX))
+        self.overrides = {}  # argv prefix tuple -> (rc, out)
+        self.calls = []
+        sd.RUN = self.fix_run
+        self.joins = []
+        self.connects = []
+        sd.COMITUP_CONNECT = lambda ssid, psk: self.connects.append((ssid, psk))
+        sd.SPAWN = lambda fn: self.joins.append(sd.spawn(fn))
+        sd.SLEEP = lambda s: None
+
+    def fix_run(self, argv, timeout=10):
+        self.calls.append(list(argv))
+        for prefix, answer in self.overrides.items():
+            if tuple(argv[:len(prefix)]) == prefix:
+                return answer
+        return self.fixture(argv, timeout)
+
+    def join(self):
+        for t in self.joins:
+            t.join(5)
+            self.assertFalse(t.is_alive())
+
+    def set_pin(self, pin="1234"):
+        self.ok({"op": "pin_set", "pin": pin})
+
+    def install_tailscale(self):
+        os.makedirs(self.path("/usr/bin"), exist_ok=True)
+        open(self.path("/usr/bin/tailscale"), "w").close()
+
+
+class T16WifiList(FixtureBase):
+    def test_hotspot_profiles_are_dropped(self):
+        nets = self.ok({"op": "wifi_list"})
+        self.assertEqual(nets, [{"ssid": "Example-Home", "uuid": HOME_UUID, "priority": 0},
+                                {"ssid": "Example-Office", "uuid": OFFICE_UUID, "priority": 0}])
+
+
+class T17WifiScan(FixtureBase):
+    def test_dedupe_sort_saved_secured(self):
+        out = self.fixture(list(SCAN))[1] + "Example-Cafe:31:--\n"
+        self.overrides[SCAN] = (0, out)
+        nets = self.ok({"op": "wifi_scan"})
+        self.assertEqual(nets, [
+            {"ssid": "Example-Home", "signal": 58, "secured": True, "saved": True},
+            {"ssid": "Example-Library", "signal": 45, "secured": True, "saved": False},
+            {"ssid": "Example-Cafe", "signal": 31, "secured": False, "saved": False},
+        ])
+
+    def test_rescan_failure_retries_without_rescan(self):
+        self.overrides[SCAN] = (1, "")
+        nets = self.ok({"op": "wifi_scan"})
+        self.assertEqual([n["ssid"] for n in nets], ["Example-Home", "Example-Library"])
+        self.assertEqual(self.calls[-1][-2:], ["--rescan", "no"])
+
+    def test_hotspot_state_uses_comitup_list(self):
+        self.write("/run/pifin/wifi.json", json.dumps({"state": "HOTSPOT", "ssid": ""}))
+        aps = [{"ssid": "Example-Office", "strength": "40", "security": "encrypted"},
+               {"ssid": "Example-Cafe", "strength": "71", "security": "unencrypted"}]
+        self.overrides[("busctl", "--json=short")] = (0, json.dumps({"type": "aa{ss}", "data": [aps]}))
+        nets = self.ok({"op": "wifi_scan"})
+        self.assertEqual(nets, [
+            {"ssid": "Example-Cafe", "signal": 71, "secured": False, "saved": False},
+            {"ssid": "Example-Office", "signal": 40, "secured": True, "saved": True},
+        ])
+        self.assertFalse(any("wifi" in c and "list" in c for c in self.calls))
+
+
+class T18Unescape(FixtureBase):
+    def test_escaped_colon_in_ssid(self):
+        self.overrides[("nmcli", "-g", "802-11-wireless.mode,802-11-wireless.ssid", "con", "show",
+                        HOME_UUID)] = (0, "infrastructure\nMy\\:Net\n")
+        self.overrides[SCAN] = (0, "My\\:Net:60:WPA2\nBack\\\\slash:20:\n")
+        self.assertEqual(self.ok({"op": "wifi_list"})[0]["ssid"], "My:Net")
+        nets = self.ok({"op": "wifi_scan"})
+        self.assertEqual([(n["ssid"], n["saved"]) for n in nets],
+                         [("My:Net", True), ("Back\\slash", False)])
+
+
+class T19WifiAdd(FixtureBase):
+    def test_psk_goes_to_comitup_never_to_argv(self):
+        self.assertEqual(self.ok({"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK}),
+                         {"connecting": True})
+        self.assertEqual(self.connects, [("Example-Cafe", PSK)])
+        self.assertFalse(any(PSK in " ".join(c) for c in self.calls), self.calls)
+        self.ok({"op": "wifi_add", "ssid": "Example-Open", "psk": ""})
+        self.assertEqual(self.connects[-1], ("Example-Open", ""))
+
+    def test_bad_psk_refused_before_comitup(self):
+        self.err({"op": "wifi_add", "ssid": "Example-Cafe", "psk": "7chars!"}, "invalid_value")
+        self.err({"op": "wifi_add", "ssid": "", "psk": PSK}, "invalid_value")
+        self.assertEqual(self.connects, [])
+
+    def test_without_dbus_module_fails_cleanly(self):
+        sd.COMITUP_CONNECT = sd._dbus_connect
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"dbus": None}), mock.patch.object(sys, "stderr", err):
+            r = self.err({"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK}, "failed")
+        self.assertEqual(r["message"], "Couldn't start joining the network.")
+        self.assertNotIn(PSK, err.getvalue())
+
+    def test_dbus_call_shape_with_a_fake_module(self):
+        seen = []
+        fake = types.ModuleType("dbus")
+        fake.DBusException = type("DBusException", (Exception,), {})
+
+        class Iface:
+            def __init__(self, obj, name):
+                seen.append(("iface", obj, name))
+
+            def connect(self, ssid, psk, timeout):
+                seen.append(("connect", ssid, psk, timeout))
+                if ssid == "Example-Bad":
+                    raise fake.DBusException(f"no {ssid} {psk}")
+
+        fake.Interface = Iface
+        fake.SystemBus = lambda: types.SimpleNamespace(get_object=lambda n, p: ("obj", n, p))
+        sd.COMITUP_CONNECT = sd._dbus_connect
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"dbus": fake}), mock.patch.object(sys, "stderr", err):
+            self.ok({"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK})
+            r = self.err({"op": "wifi_add", "ssid": "Example-Bad", "psk": PSK}, "failed")
+        bus = ("obj", "com.github.davesteele.comitup", "/com/github/davesteele/comitup")
+        self.assertEqual(seen[:2], [("iface", bus, "com.github.davesteele.comitup"),
+                                    ("connect", "Example-Cafe", PSK, 10)])
+        self.assertNotIn(PSK, err.getvalue() + json.dumps(r))
+        self.assertEqual(r["message"], sd.JOIN_FAILED)
+
+
+class T20WifiForget(FixtureBase):
+    def test_delete_by_uuid_and_drop_limits(self):
+        self.ok({"op": "network_set", "ssid": "Example-Office", "limits": {"max_height": 720}})
+        self.ok({"op": "network_set", "ssid": "Example-Home", "limits": {"hdr": True}})
+        s = self.ok({"op": "wifi_forget", "ssid": "Example-Office"})["settings"]
+        self.assertIn(["nmcli", "con", "delete", "uuid", OFFICE_UUID], self.calls)
+        self.assertEqual(sum(1 for c in self.calls if "delete" in c), 1)
+        self.assertEqual(s["networks"], {"Example-Home": {"hdr": True}})
+        self.assertEqual(self.settings()["networks"], {"Example-Home": {"hdr": True}})
+        self.err({"op": "wifi_forget", "ssid": "Example-Library"}, "invalid_value")
+
+
+class T21TailscaleLogin(FixtureBase):
+    def test_pin_gate_and_key_never_logged(self):
+        self.install_tailscale()
+        self.set_pin()
+        self.calls.clear()
+        self.err({"op": "tailscale_login", "authkey": KEY}, "pin_required")
+        self.assertEqual(self.calls, [])
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertIsNone(self.ok({"op": "tailscale_login", "authkey": KEY, "pin": "1234"}))
+            up = [c for c in self.calls if c[:2] == ["tailscale", "up"]]
+            self.assertEqual(len(up), 1)
+            self.assertIn("--authkey=" + KEY, up[0])  # the accepted argv exposure
+            self.overrides[("tailscale", "up")] = (1, "")
+            r = self.err({"op": "tailscale_login", "authkey": KEY, "pin": "1234"}, "failed")
+            self.assertEqual(r["message"], "Tailscale sign-in failed. Check the key.")
+        self.assertIn("tailscale up failed", err.getvalue())
+        self.assertNotIn(KEY, err.getvalue())
+        self.assertNotIn(KEY, json.dumps(r))
+        self.err({"op": "tailscale_login", "authkey": "tskey-short", "pin": "1234"}, "invalid_value")
+
+    def test_not_installed(self):
+        r = self.err({"op": "tailscale_login", "authkey": KEY}, "failed")
+        self.assertEqual(r["message"], "Tailscale isn't installed on this PiFin.")
+
+
+class T22Status(FixtureBase):
+    def test_status_from_fixtures(self):
+        net = self.path("/sys/class/net")
+        devs = self.path("/sys/devices/platform")
+        layout = {"wlan1": (f"{devs}/scb/usb1/1-1/1-1.3/1-1.3:1.0", "02:00:00:00:00:02", True),
+                  "wlan0": (f"{devs}/soc/mmc1/mmc1:0001/mmc1:0001:1", "02:00:00:00:00:01", True),
+                  "eth0": (f"{devs}/scb/eth0", "02:00:00:00:00:03", False)}
+        for name, (dev, mac, wireless) in layout.items():
+            os.makedirs(dev)
+            os.makedirs(f"{net}/{name}")
+            os.symlink(dev, f"{net}/{name}/device")
+            self.write(f"/sys/class/net/{name}/address", mac + "\n")
+            if wireless:
+                os.makedirs(f"{net}/{name}/wireless")
+        os.makedirs(self.path("/proc/net"))
+        shutil.copy(FIX / "proc-net-wireless.txt", self.path("/proc/net/wireless"))
+        self.install_tailscale()
+        st = self.ok({"op": "get"})["status"]
+        self.assertEqual(st["wifi"], {"state": "CONNECTED", "ssid": "HomeNet", "radio": "usb",
+                                      "iface": "wlan1", "signal_dbm": -68, "ip": "192.0.2.10"})
+        self.assertEqual(st["macs"], {"builtin": "02:00:00:00:00:01", "usb": "02:00:00:00:00:02"})
+        self.assertEqual(st["tailscale"], {"state": "connected", "name": "pifin", "ip": "192.0.2.100"})
+
+    def test_missing_sources_give_null(self):
+        st = self.ok({"op": "get"})["status"]  # no /sys, no /proc, no tailscale binary
+        self.assertEqual((st["wifi"]["radio"], st["wifi"]["signal_dbm"]), (None, None))
+        self.assertEqual(st["macs"], {"builtin": None, "usb": None})
+        self.assertEqual(st["tailscale"], {"state": "not_installed", "name": None, "ip": None})
+
+
+class T23Reboot(FixtureBase):
+    def test_reboot_after_reply(self):
+        self.assertEqual(sd.handle({"op": "reboot"}), {"ok": True, "result": None})
+        self.join()
+        self.assertEqual(self.calls[-1], ["systemctl", "reboot"])
+
+    def test_factory_reset(self):
+        self.set_pin()
+        self.err({"op": "factory_reset"}, "pin_required")
+        self.assertEqual(self.joins, [])
+        self.calls.clear()
+        self.assertIsNone(self.ok({"op": "factory_reset", "pin": "1234"}))
+        self.join()
+        for f in ("settings.json", "secrets.json", "pair-token"):
+            self.assertFalse(os.path.exists(self.path(f"/var/lib/pifin/{f}")), f)
+        self.assertFalse(os.path.exists(self.path(f"/home/{USER}/.config/pifin/auth.json")))
+        deleted = {c[4] for c in self.calls if c[:4] == ["nmcli", "con", "delete", "uuid"]}
+        self.assertEqual(deleted, {HOME_UUID, OFFICE_UUID})
+        self.assertEqual(self.calls[-1], ["systemctl", "reboot"])
+
+    def test_factory_reset_does_not_follow_a_symlinked_dir(self):
+        d = self.path(f"/home/{USER}/.config/pifin")
+        os.rename(d, d + "-real")
+        os.symlink(d + "-real", d)
+        self.ok({"op": "factory_reset"})
+        self.join()
+        self.assertTrue(os.path.exists(d + "-real/auth.json"))
+        self.assertEqual(self.calls[-1], ["systemctl", "reboot"])
+
+
+class T24Demo(unittest.TestCase):
+    def test_demo_daemon_answers_from_fixtures(self):
+        root = tempfile.mkdtemp(prefix="sd")
+        self.addCleanup(shutil.rmtree, root, True)
+        env = dict(os.environ, PIFIN_ROOT=root, PATH="/nonexistent")  # no real command can run
+        p = subprocess.Popen([sys.executable, str(HERE / "files/pifin-settingsd"), "--demo", str(FIX)],
+                             env=env, stderr=subprocess.DEVNULL)
+        self.addCleanup(p.wait, 5)
+        self.addCleanup(p.terminate)
+        sock_path = root + "/run/pifin/settings.sock"
+        for _ in range(100):
+            if os.path.exists(sock_path):
+                break
+            threading.Event().wait(0.05)
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(5)
+        c.connect(sock_path)
+        self.addCleanup(c.close)
+        f = c.makefile("rwb")
+        self.addCleanup(f.close)
+
+        def ask(op):
+            f.write(json.dumps({"op": op}).encode() + b"\n")
+            f.flush()
+            r = json.loads(f.readline())
+            self.assertTrue(r["ok"], r)
+            return r["result"]
+
+        st = ask("get")["status"]
+        self.assertEqual(st["tailscale"]["state"], "connected")
+        self.assertEqual((st["wifi"]["iface"], st["wifi"]["ip"]), ("wlan1", "192.0.2.10"))
+        self.assertEqual([n["ssid"] for n in ask("wifi_list")], ["Example-Home", "Example-Office"])
+        self.assertEqual(ask("wifi_scan")[0], {"ssid": "Example-Home", "signal": 58,
+                                               "secured": True, "saved": True})
+
+    def test_demo_refuses_without_pifin_root(self):
+        env = {k: v for k, v in os.environ.items() if k != "PIFIN_ROOT"}
+        r = subprocess.run([sys.executable, str(HERE / "files/pifin-settingsd"), "--demo", str(FIX)],
+                           env=env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PIFIN_ROOT", r.stderr)
 
 
 if __name__ == "__main__":

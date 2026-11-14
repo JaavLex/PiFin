@@ -1,0 +1,11 @@
+:64:WPA2
+:62:WPA2
+Example-Home:58:WPA2 WPA3
+Example-Home:50:WPA2 WPA3
+:50:WPA2
+:50:WPA2
+Example-Library:45:WPA2
+Example-Home:42:WPA2 WPA3
+Example-Home:27:WPA2 WPA3
+:25:WPA2
+

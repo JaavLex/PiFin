@@ -21,6 +21,7 @@ import pwd
 import re
 import secrets
 import shlex
+import socket
 import socketserver
 import stat
 import subprocess
@@ -39,6 +40,9 @@ DISPLAY_CONF = "/etc/pifin/display.conf"
 SECRETS_ENV = "/etc/pifin/secrets.env"
 COMITUP_CONF = "/etc/comitup.conf"
 PIFIN_BIN = "/usr/local/bin/pifin"
+TAILSCALE = "/usr/bin/tailscale"
+COMITUP = ["com.github.davesteele.comitup", "/com/github/davesteele/comitup",
+           "com.github.davesteele.comitup"]
 
 MAX_LINE = 64 * 1024
 IDLE_TIMEOUT = 30
@@ -74,6 +78,24 @@ def run(argv, timeout=10):
 
 RUN = run
 NOW = time.monotonic
+SLEEP = time.sleep
+
+
+def spawn(fn):
+    """Run fn in a daemon thread (after the reply). Tests replace SPAWN to join it."""
+    t = threading.Thread(target=fn, daemon=True)
+    t.start()
+    return t
+
+
+SPAWN = spawn
+
+
+def tailscale_present():
+    return os.path.exists(P(TAILSCALE))
+
+
+TAILSCALE_PRESENT = tailscale_present
 
 
 # ---- validation -----------------------------------------------------------
@@ -684,18 +706,134 @@ def text_or(v, default):
     return v if isinstance(v, str) and v else default
 
 
-def status():
+def wifi_json():
     try:
         wifi = load_json(P(WIFI_JSON))
-        if not isinstance(wifi, dict):
-            wifi = {}
     except (OSError, ValueError):
-        wifi = {}
+        return {}
+    return wifi if isinstance(wifi, dict) else {}
+
+
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+UUID_RE = re.compile(r"^[0-9A-Fa-f-]{36}$")
+
+
+def nm_split(line):
+    """Fields of one `nmcli -t` line: `:` separates, `\\:` and `\\\\` are escapes."""
+    fields, cur, i = [], [], 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if c == ":":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    fields.append("".join(cur))
+    return fields
+
+
+def nm_unescape(value):
+    return re.sub(r"\\(.)", r"\1", value)
+
+
+def wifi_iface():
+    """First connected Wi-Fi device, or None."""
+    _, out = RUN(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev"])
+    for line in out.splitlines():
+        f = nm_split(line)
+        if len(f) == 3 and f[1] == "wifi" and f[2] == "connected" and IFACE_RE.match(f[0]):
+            return f[0]
+    return None
+
+
+def bus_of(netdir):
+    """'usb' or 'builtin' for a /sys/class/net/<iface> dir, None if it has no device."""
+    dev = os.path.join(netdir, "device")
+    if not os.path.exists(dev):
+        return None
+    return "usb" if "/usb" in os.path.realpath(dev) else "builtin"
+
+
+def signal_dbm(iface):
+    for line in (read_text(P("/proc/net/wireless")) or "").splitlines():
+        cols = line.split()
+        # face | status | link | level | noise ...: the level column is the dBm value
+        if len(cols) > 3 and cols[0] == iface + ":":
+            try:
+                return int(float(cols[3].rstrip(".")))
+            except ValueError:
+                return None
+    return None
+
+
+def iface_ip(iface):
+    _, out = RUN(["nmcli", "-g", "IP4.ADDRESS", "dev", "show", iface])
+    line = out.splitlines()[0] if out.strip() else ""
+    ip = line.split("|")[0].strip().split("/")[0]
+    return ip or None
+
+
+def wifi_macs():
+    macs = {"builtin": None, "usb": None}
+    base = P("/sys/class/net")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return macs
+    for name in names:
+        d = os.path.join(base, name)
+        if not os.path.isdir(os.path.join(d, "wireless")):
+            continue
+        bus = bus_of(d)
+        mac = (read_text(os.path.join(d, "address")) or "").strip().lower()
+        if bus and MAC_RE.match(mac) and macs[bus] is None:
+            macs[bus] = mac
+    return macs
+
+
+TS_STATES = {"Running": "connected", "NeedsLogin": "signed_out", "Stopped": "off"}
+
+
+def tailscale_status():
+    st = {"state": "not_installed", "name": None, "ip": None}
+    if not TAILSCALE_PRESENT():
+        return st
+    st["state"] = "unknown"
+    _, out = RUN(["tailscale", "status", "--json"], timeout=5)
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return st
+    if not isinstance(doc, dict):
+        return st
+    backend = doc.get("BackendState")
+    if isinstance(backend, str) and backend:
+        st["state"] = TS_STATES.get(backend, backend.lower())
+    me = doc.get("Self") if isinstance(doc.get("Self"), dict) else {}
+    st["name"] = text_or(me.get("HostName"), None)
+    ips = me.get("TailscaleIPs") if isinstance(me.get("TailscaleIPs"), list) else []
+    st["ip"] = next((ip for ip in ips if isinstance(ip, str) and "." in ip), None)
+    return st
+
+
+def status():
+    """Every source is optional: a missing one gives null, never an error."""
+    wifi = wifi_json()
+    iface = wifi_iface()
     return {
         "wifi": {"state": text_or(wifi.get("state"), "unknown"), "ssid": text_or(wifi.get("ssid"), ""),
-                 "radio": None, "iface": None, "signal_dbm": None, "ip": None},
-        "macs": {"builtin": None, "usb": None},
-        "tailscale": {"state": "unknown", "name": None, "ip": None},
+                 "radio": bus_of(P(f"/sys/class/net/{iface}")) if iface else None,
+                 "iface": iface,
+                 "signal_dbm": signal_dbm(iface) if iface else None,
+                 "ip": iface_ip(iface) if iface else None},
+        "macs": wifi_macs(),
+        "tailscale": tailscale_status(),
         "version": VERSION,
     }
 
@@ -789,7 +927,219 @@ def op_pair_reset(req):
     return {"token": write_pair_token()}
 
 
-# op -> (function, needs the store lock). Task 2 adds the system ops here.
+# ---- network and system ops -----------------------------------------------
+
+CLIENT_PSK_MSG = "A Wi-Fi password must be 8 to 63 plain characters (letters, digits, symbols, spaces)."
+JOIN_FAILED = "Couldn't start joining the network."
+AUTHKEY_RE = re.compile(r"^tskey-[A-Za-z0-9-]{10,200}$")
+
+
+def wifi_profiles():
+    """Saved Wi-Fi client profiles: [{"ssid", "uuid", "priority"}], hotspots left out."""
+    rc, out = RUN(["nmcli", "-t", "-f", "NAME,UUID,TYPE,AUTOCONNECT-PRIORITY", "con", "show"])
+    if rc != 0:
+        raise Invalid("failed", "Couldn't read the saved networks.")
+    profiles = []
+    for line in out.splitlines():
+        f = nm_split(line)
+        if len(f) != 4 or f[2] != "802-11-wireless" or not UUID_RE.match(f[1]):
+            continue
+        rc, detail = RUN(["nmcli", "-g", "802-11-wireless.mode,802-11-wireless.ssid", "con", "show", f[1]])
+        lines = detail.split("\n")
+        if rc != 0 or len(lines) < 2:
+            continue
+        mode, ssid = nm_unescape(lines[0]), nm_unescape(lines[1])
+        if mode in ("ap", "adhoc", "mesh") or not ssid:
+            continue
+        try:
+            priority = int(f[3])
+        except ValueError:
+            priority = 0
+        profiles.append({"ssid": ssid, "uuid": f[1], "priority": priority})
+    return profiles
+
+
+def op_wifi_list(req):
+    return wifi_profiles()
+
+
+def scan_entries():
+    """(ssid, signal 0-100, secured) of nearby networks."""
+    if wifi_json().get("state") == "HOTSPOT":
+        # the radio is busy being the hotspot: ask comitup for its last scan
+        rc, out = RUN(["busctl", "--json=short", "call", "--system", *COMITUP, "access_points"],
+                      timeout=15)
+        try:
+            data = json.loads(out)["data"][0] if rc == 0 else None
+        except (ValueError, KeyError, IndexError, TypeError):
+            data = None
+        if not isinstance(data, list):
+            raise Invalid("failed", "Couldn't scan for networks.")
+        for ap in data:
+            if not isinstance(ap, dict):
+                continue
+            try:
+                signal = int(float(ap.get("strength", "0")))
+            except (TypeError, ValueError):
+                signal = 0
+            yield str(ap.get("ssid", "")), signal, ap.get("security") != "unencrypted"
+        return
+    cmd = ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan"]
+    rc, out = RUN(cmd + ["yes"], timeout=15)
+    if rc != 0:
+        rc, out = RUN(cmd + ["no"], timeout=15)
+    if rc != 0:
+        raise Invalid("failed", "Couldn't scan for networks.")
+    for line in out.splitlines():
+        f = nm_split(line)
+        if len(f) != 3:
+            continue
+        try:
+            signal = int(f[1])
+        except ValueError:
+            signal = 0
+        yield f[0], signal, f[2] not in ("", "--")
+
+
+def op_wifi_scan(req):
+    try:
+        saved = {p["ssid"] for p in wifi_profiles()}
+    except Invalid:
+        saved = set()
+    best = {}
+    for ssid, signal, secured in scan_entries():
+        if not ssid:
+            continue
+        signal = max(0, min(100, signal))
+        if ssid not in best or signal > best[ssid]["signal"]:
+            best[ssid] = {"ssid": ssid, "signal": signal, "secured": secured, "saved": ssid in saved}
+    return sorted(best.values(), key=lambda n: -n["signal"])
+
+
+def _dbus_connect(ssid, psk):
+    """comitup's D-Bus connect(ssid, password). Not busctl: the password must never be
+    on a process argv (/proc/<pid>/cmdline is world-readable)."""
+    try:
+        import dbus  # python3-dbus comes with comitup; imported here so tests need no dbus
+    except ImportError:
+        log("wifi_add: python3-dbus is missing")
+        raise Invalid("failed", JOIN_FAILED) from None
+    try:
+        obj = dbus.SystemBus().get_object(COMITUP[0], COMITUP[1])
+        dbus.Interface(obj, COMITUP[2]).connect(ssid, psk, timeout=10)
+    except dbus.DBusException as e:
+        # the exception name only: its text could quote the arguments
+        log(f"wifi_add: comitup connect failed ({type(e).__name__})")
+        raise Invalid("failed", JOIN_FAILED) from None
+
+
+COMITUP_CONNECT = _dbus_connect
+
+
+def op_wifi_add(req):
+    ssid, psk = req.get("ssid"), req.get("psk")
+    check_ssid(ssid)
+    if psk is None:
+        psk = ""
+    if psk != "" and not is_psk(psk):
+        raise Invalid("invalid_value", CLIENT_PSK_MSG)
+    COMITUP_CONNECT(ssid, psk)
+    return {"connecting": True}
+
+
+def op_wifi_forget(req):
+    ssid = req.get("ssid")
+    check_ssid(ssid)
+    matches = [p for p in wifi_profiles() if p["ssid"] == ssid]
+    if not matches:
+        raise Invalid("invalid_value", "No saved network with that name.")
+    for p in matches:
+        rc, _ = RUN(["nmcli", "con", "delete", "uuid", p["uuid"]])
+        if rc != 0:
+            raise Invalid("failed", "Couldn't forget that network.")
+    doc = load_settings()
+    if ssid in doc["networks"]:
+        new = copy.deepcopy(doc)
+        del new["networks"][ssid]
+        validate(new)
+        write_settings(new)
+        doc = new
+    return {"settings": doc}
+
+
+def op_tailscale_login(req):
+    pin_gate(req.get("pin"))
+    key = req.get("authkey")
+    if not isinstance(key, str) or not AUTHKEY_RE.match(key):
+        raise Invalid("invalid_value", "That doesn't look like a Tailscale auth key (tskey-...).")
+    if not TAILSCALE_PRESENT():
+        raise Invalid("failed", "Tailscale isn't installed on this PiFin.")
+    # The key is on this argv, visible in /proc for up to 30 s: accepted, the tailscale CLI
+    # has no stdin or file option for it. It is never stored and never logged.
+    rc, _ = RUN(["tailscale", "up", "--reset", "--authkey=" + key,
+                 "--hostname=" + socket.gethostname(), "--accept-routes=false"], timeout=30)
+    if rc != 0:
+        log(f"tailscale up failed (exit {rc})")
+        raise Invalid("failed", "Tailscale sign-in failed. Check the key.")
+    return None
+
+
+def reboot_later():
+    SLEEP(1)  # let the reply reach the caller first
+    RUN(["systemctl", "reboot"])
+
+
+def op_reboot(req):
+    SPAWN(reboot_later)
+    return None
+
+
+def unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def remove_auth_json():
+    """Delete auth.json without following a symlinked directory (the pifin user owns it)."""
+    d, base = os.path.split(auth_path())
+    try:
+        dfd = open_dir(d, user_uid())
+    except FileNotFoundError:
+        return
+    try:
+        os.unlink(base, dir_fd=dfd)  # a symlink here is removed itself, never its target
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def factory_reset_now():
+    with LOCK:
+        try:
+            for p in wifi_profiles():
+                RUN(["nmcli", "con", "delete", "uuid", p["uuid"]])
+        except Invalid:
+            log("factory reset: saved networks not readable, kept")
+        for path in (SETTINGS, SECRETS, PAIR_TOKEN):
+            unlink_quiet(P(path))
+        try:
+            remove_auth_json()
+        except (OSError, Unsafe) as e:
+            log(f"factory reset: auth.json not removed ({type(e).__name__})")
+        log("factory reset done, rebooting")
+        RUN(["systemctl", "reboot"])
+
+
+def op_factory_reset(req):
+    pin_gate(req.get("pin"))
+    SPAWN(factory_reset_now)
+    return None
+
+
+# op -> (function, needs the store lock)
 OPS = {
     "get": (op_get, False),
     "set": (op_set, True),
@@ -798,6 +1148,13 @@ OPS = {
     "pin_clear": (op_pin_clear, True),
     "pin_check": (op_pin_check, True),
     "pair_reset": (op_pair_reset, True),
+    "wifi_list": (op_wifi_list, False),
+    "wifi_scan": (op_wifi_scan, False),
+    "wifi_add": (op_wifi_add, True),
+    "wifi_forget": (op_wifi_forget, True),
+    "tailscale_login": (op_tailscale_login, True),
+    "reboot": (op_reboot, False),
+    "factory_reset": (op_factory_reset, True),
 }
 LOCK = threading.Lock()
 
@@ -881,8 +1238,61 @@ def make_server():
     return server
 
 
+# ---- demo mode ------------------------------------------------------------
+
+def fixture_runner(fdir):
+    """A RUN that answers from captured command outputs in fdir and runs nothing.
+    Commands that change something (delete, up, reboot, restart) succeed and do nothing."""
+    def text(name):
+        return read_text(os.path.join(fdir, name)) or ""
+
+    wireless = []
+    for line in text("con-show.txt").splitlines():
+        f = nm_split(line)
+        if len(f) == 4 and f[2] == "802-11-wireless":
+            wireless.append(f[1])
+    table = [
+        (["nmcli", "-t", "-f", "NAME,UUID,TYPE,AUTOCONNECT-PRIORITY", "con", "show"], "con-show.txt"),
+        (["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"], "wifi-list.txt"),
+        (["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev"], "dev-status.txt"),
+        (["nmcli", "-g", "IP4.ADDRESS", "dev", "show"], "ip4.txt"),
+        (["tailscale", "status", "--json"], "tailscale-status.json"),
+        (["busctl", "--json=short", "call", "--system", *COMITUP, "access_points"], "comitup-aps.json"),
+        (["busctl", "call", "--system", *COMITUP, "state"], "comitup-state.txt"),
+    ]
+    mode_cmd = ["nmcli", "-g", "802-11-wireless.mode,802-11-wireless.ssid", "con", "show"]
+
+    def runner(argv, timeout=10):
+        argv = [os.path.basename(argv[0])] + list(argv[1:])
+        if any(word in argv for word in ("delete", "up", "reboot", "restart")):
+            return 0, ""
+        if argv[:5] == mode_cmd and len(argv) == 6 and argv[5] in wireless:
+            return 0, text(f"con-mode-{wireless.index(argv[5]) + 1}.txt")
+        if argv == [os.path.basename(PIFIN_BIN), "--version"]:
+            return 0, "pifin demo\n"
+        for prefix, name in table:
+            if argv[:len(prefix)] == prefix:
+                return 0, text(name)
+        return 1, ""
+    return runner
+
+
+def use_demo(fdir):
+    global RUN, COMITUP_CONNECT, TAILSCALE_PRESENT
+    RUN = fixture_runner(fdir)
+    COMITUP_CONNECT = lambda ssid, psk: None  # noqa: E731 -- no dbus import in demo mode
+    TAILSCALE_PRESENT = lambda: os.path.exists(os.path.join(fdir, "tailscale-status.json"))  # noqa: E731
+
+
 def main():
     os.umask(0o077)  # the socket stays private until its chmod
+    if len(sys.argv) == 3 and sys.argv[1] == "--demo":
+        if not root():
+            sys.exit("pifin-settingsd: --demo needs PIFIN_ROOT (a scratch directory for the store)")
+        use_demo(sys.argv[2])
+        log(f"demo mode: answers from {sys.argv[2]}, runs no command")
+    elif len(sys.argv) != 1:
+        sys.exit("usage: pifin-settingsd [--demo <fixture dir>]")
     init()
     server = make_server()
     log("listening")

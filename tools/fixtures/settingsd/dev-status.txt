@@ -1,0 +1,5 @@
+wlan1:wifi:connected
+tailscale0:tun:connected (externally)
+lo:loopback:connected (externally)
+eth0:ethernet:unavailable
+wlan0:wifi:unmanaged

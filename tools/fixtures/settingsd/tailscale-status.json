@@ -1,0 +1,23 @@
+{
+  "Version": "1.104.5-t788384763-gd9218e278",
+  "BackendState": "Running",
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "192.0.2.100",
+    "2001:db8::100"
+  ],
+  "Self": {
+    "ID": "n0000000001",
+    "HostName": "pifin",
+    "DNSName": "pifin.example.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": [
+      "192.0.2.100",
+      "2001:db8::100"
+    ],
+    "Online": true
+  },
+  "MagicDNSSuffix": "example.ts.net",
+  "Peer": {},
+  "User": {}
+}
