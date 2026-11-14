@@ -89,7 +89,7 @@ pub struct Settings {
 }
 
 /// Last parse: (mtime of the file it came from, value). `None` mtime = file missing.
-type Cache = Option<(Option<SystemTime>, Arc<Settings>)>;
+type Cache = Option<(Option<(SystemTime, u64)>, Arc<Settings>)>;
 static CACHE: Mutex<Cache> = Mutex::new(None);
 
 /// The settings, re-read only when the file's mtime changed. A missing file gives the
@@ -99,7 +99,8 @@ pub fn current() -> Arc<Settings> {
 }
 
 fn load_cached(cache: &Mutex<Cache>, path: &str) -> Arc<Settings> {
-    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    // mtime plus length: two writes within the timestamp granularity rarely keep both
+    let mtime = std::fs::metadata(path).and_then(|m| Ok((m.modified()?, m.len()))).ok();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((seen, value)) = guard.as_ref() {
         if *seen == mtime {

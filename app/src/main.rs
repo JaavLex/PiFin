@@ -671,6 +671,19 @@ fn width_for_height(h: i32) -> i32 {
 }
 
 
+/// True once per distinct new `jellyfin_url` (seen after startup) that differs from the
+/// running server and while no player runs. `seen` is updated only when it fires, so a
+/// URL the daemon could not apply to auth.json cannot restart the app in a loop.
+fn server_changed(seen: &mut String, url: &str, server: &str, idle: bool) -> bool {
+    let norm = |s: &str| s.trim_end_matches('/').to_string();
+    if url.is_empty() || !idle || norm(url) == norm(seen) || norm(url) == norm(server) {
+        return false;
+    }
+    *seen = url.to_string();
+    true
+}
+
+
 fn plan(auth: &Auth, it: &Item, link: u64, lim: &settings::Playback) -> Plan {
     let server = auth.server.trim_end_matches('/');
     let token = &auth.token;
@@ -1344,13 +1357,15 @@ fn main() {
         let load_home = load_home.clone();
         let player = player.clone();
         let auth = auth.clone();
+        // the address at startup is the baseline: only a change after start restarts us
+        let mut seen_url = settings::current().system.jellyfin_url.clone();
         let mut qr_cache: Option<(String, slint::Image)> = None;
         wifi_timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
             let Some(app) = weak.upgrade() else { return };
             // the server address was changed (phone or TV): restart into the new one
             // (the daemon has already rewritten auth.json)
             let url = settings::current().system.jellyfin_url.clone();
-            if !url.is_empty() && url.trim_end_matches('/') != auth.server.trim_end_matches('/') && player.borrow().is_none() {
+            if server_changed(&mut seen_url, &url, &auth.server, player.borrow().is_none()) {
                 eprintln!("SERVER address changed: restarting");
                 profiles::restart(&["--user", &auth.user_id]);
             }
@@ -1891,6 +1906,23 @@ mod tests {
         let p = plan(&auth(), &item(30_000_000), 0, &none());
         assert!(p.url.contains("VideoBitrate=9616000") && p.note.is_empty(), "{}", p.url);
     }
+
+    #[test]
+    fn server_change_restarts_once_per_new_url() {
+        let mut seen = "http://a:8096".to_string();
+        // same address as at startup (even with a mismatching auth.json): no restart
+        assert!(!server_changed(&mut seen, "http://a:8096/", "http://old:8096", true));
+        // changed while a player runs: wait
+        assert!(!server_changed(&mut seen, "http://b:8096", "http://a:8096", false));
+        // changed and idle: restart once
+        assert!(server_changed(&mut seen, "http://b:8096", "http://a:8096", true));
+        // the daemon never rewrote auth.json: still the same url, no loop
+        assert!(!server_changed(&mut seen, "http://b:8096", "http://a:8096", true));
+        // another new value fires again; one already applied does not
+        assert!(server_changed(&mut seen, "http://c:8096", "http://a:8096", true));
+        assert!(!server_changed(&mut seen, "http://c:8096", "http://c:8096/", true));
+    }
+
 
     fn none() -> settings::Playback {
         settings::Playback::default()
