@@ -272,9 +272,15 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(403, FORBIDDEN, "text/html; charset=utf-8", headers=[("Connection", "close")])
 
     def body(self, limit=64 * 1024):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > limit:
-            raise ValueError("request too large")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if not 0 <= n <= limit:
+            # rfile.read(-1) would block until the client hangs up; the body stays unread,
+            # so the connection must not be reused
+            self.close_connection = True
+            raise ValueError("bad Content-Length")
         return json.loads(self.rfile.read(n) or b"{}")
 
     def seen(self):
@@ -290,7 +296,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.forbidden()
             # 200 + meta refresh rather than a redirect: some phone browsers drop a
             # cookie set on a 302 when the QR scanner hands the link over
-            cookie = f"pifin={pair_token()}; HttpOnly; SameSite=Strict; Max-Age=31536000; Path=/"
+            # from the token just validated: a second read could see a newer or missing file
+            cookie = f"pifin={t}; HttpOnly; SameSite=Strict; Max-Age=31536000; Path=/"
             return self.reply(200, PAIRED, "text/html; charset=utf-8", headers=[("Set-Cookie", cookie)])
         if path.path not in ("/manifest.webmanifest", "/icon.svg") and not self.paired():
             return self.forbidden()
@@ -355,6 +362,9 @@ class Handler(BaseHTTPRequestHandler):
         self.seen()
         try:
             data = self.body(1024 * 1024)
+        except ValueError:
+            return self.json({"ok": False, "error": "bad_request"}, 400)
+        try:
             action = data.get("action", "")
             if mpv_alive():
                 result = player.action(action, data)

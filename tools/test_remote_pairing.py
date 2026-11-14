@@ -12,6 +12,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from http.server import ThreadingHTTPServer
 
 sys.dont_write_bytecode = True
@@ -144,6 +145,30 @@ class Pairing(unittest.TestCase):
             self.assertEqual(code, 400, op)
             self.assertEqual(json.loads(body)["error"], "bad_request")
         self.assertEqual(fake.requests, [{"op": "get"}])
+
+    def raw_post(self, path, length):
+        c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=3)
+        c.putrequest("POST", path)
+        c.putheader("Cookie", f"pifin={GOOD}")
+        c.putheader("Content-Length", length)
+        c.endheaders()
+        r = c.getresponse()  # times out if the server waits for a body that never comes
+        out = r.status
+        r.read()
+        c.close()
+        return out
+
+    def test_bad_content_length_is_refused(self):
+        for length in ("-1", "abc"):
+            self.assertEqual(self.raw_post("/api/action", length), 400, length)
+            self.assertEqual(self.raw_post("/api/settings", length), 400, length)
+
+    def test_pair_cookie_is_the_validated_token(self):
+        reads = iter([GOOD] + ["f" * 32] * 10)  # the file changes right after the check
+        with mock.patch.object(server, "pair_token", lambda: next(reads)):
+            code, cookie, _ = self.req("GET", "/pair?t=" + GOOD)
+        self.assertEqual(code, 200)
+        self.assertIn(f"pifin={GOOD};", cookie)
 
     def test_settings_service_missing(self):
         code, _, body = self.req("POST", "/api/settings", cookie=GOOD, body={"op": "get"})
