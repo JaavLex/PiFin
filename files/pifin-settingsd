@@ -22,9 +22,9 @@ import re
 import secrets
 import shlex
 import socketserver
+import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -120,6 +120,17 @@ def check_ssid(v):
         raise Invalid("invalid_value", SSID_MSG)
 
 
+def is_hotspot_ssid(v):
+    # written unquoted as `ap_name: <v>`: comitup would strip edge spaces and quotes
+    return is_ssid(v) and v == v.strip() and v[0] not in "'\"#"
+
+
+def check_hotspot_ssid(v):
+    if not is_hotspot_ssid(v):
+        raise Invalid("invalid_value", "The hotspot name must be 1 to 32 bytes, without "
+                      "spaces at either end and not starting with a quote or #.")
+
+
 def is_url(v):
     return isinstance(v, str) and bool(URL_RE.match(v))
 
@@ -159,7 +170,7 @@ FIELDS = {
     },
     "system": {
         "jellyfin_url": check_url_or_empty,
-        "hotspot_ssid": check_ssid,
+        "hotspot_ssid": check_hotspot_ssid,
         "pin_set": boolean("pin_set"),
     },
 }
@@ -219,26 +230,84 @@ def chown(path, uid, gid):
     os.chown(path, -1 if uid is None else uid, -1 if gid is None else gid)
 
 
-def write_atomic(path, text, mode, uid=None, gid=None):
-    """tmp file in the same dir, fsync, chmod, chown, rename over the target."""
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+class Unsafe(Exception):
+    """A file or directory the daemon refuses to touch (symlink, wrong owner, ...)."""
+
+
+def open_dir(d, owner=None):
+    """fd of directory d, its last component not a symlink; owner: required uid."""
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    if owner is not None and os.fstat(fd).st_uid != owner:
+        os.close(fd)
+        raise Unsafe(f"{d} is not owned by the PiFin user")
+    return fd
+
+
+def write_atomic(path, text, mode, uid=None, gid=None, owner=None):
+    """tmp file in the same dir, fsync, chmod, chown, rename over the target.
+
+    Everything goes through file descriptors (fchmod/fchown, renameat), never a path
+    that could be swapped for a symlink: auth.json lives in a dir the pifin user can
+    write. owner = uid the directory must belong to (user dirs), None = no check.
+    """
+    d, base = os.path.split(path)
+    if owner is None:
+        os.makedirs(d, exist_ok=True)
+    dfd = open_dir(d, owner)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, mode)
-        if uid is not None or gid is not None:
-            chown(tmp, uid, gid)
-        os.replace(tmp, path)
-    except BaseException:
+        for _ in range(10):
+            tmp = f".{base}.{secrets.token_hex(6)}"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             0o600, dir_fd=dfd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise Unsafe(f"no free temp name in {d}")
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fchmod(f.fileno(), mode)
+                if (uid is not None or gid is not None) and not root():  # tests: unprivileged
+                    os.fchown(f.fileno(), -1 if uid is None else uid, -1 if gid is None else gid)
+                os.fsync(f.fileno())
+            os.replace(tmp, base, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+
+
+def read_user_json(path, uid):
+    """JSON from a file in a user-writable dir: no symlink (file or dir), a regular
+    file owned by uid, at most 1 MiB. None if it does not exist. Raises Unsafe."""
+    d, base = os.path.split(path)
+    try:
+        dfd = open_dir(d, uid)
+    except FileNotFoundError:
+        return None
+    except OSError as e:  # ELOOP: the dir is a symlink
+        raise Unsafe(f"{d} is not a plain directory") from e
+    try:
+        try:
+            fd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise Unsafe(f"{path} is not a plain file") from e
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+                raise Unsafe(f"{path} is not a plain file owned by the PiFin user")
+            return json.loads(f.read(1 << 20))
+    finally:
+        os.close(dfd)
 
 
 def read_text(path):
@@ -311,6 +380,20 @@ def group_id():
     return user_ids()[1]
 
 
+def user_uid():
+    """uid that must own the files in the user's dirs (tests: whoever runs them)."""
+    if root():
+        return os.getuid()
+    return pwd.getpwnam(user_name()).pw_uid
+
+
+def load_auth():
+    """auth.json as a dict, None if missing. Raises Unsafe (symlink, foreign owner,
+    not a regular file): the pifin user controls that directory."""
+    auth = read_user_json(auth_path(), user_uid())
+    return auth if isinstance(auth, dict) else None
+
+
 def dump(doc):
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
@@ -352,6 +435,12 @@ def first(candidates, ok, default):
     return default
 
 
+def legacy_psk(env=None, com=None):
+    env = parse_env(P(SECRETS_ENV)) if env is None else env
+    com = parse_comitup(P(COMITUP_CONF)) if com is None else com
+    return first([env.get("HOTSPOT_PASS"), com.get("ap_password")], is_psk, "")
+
+
 def migrate():
     """Build settings.json (and secrets.json if missing) from the legacy files."""
     app = parse_env(P(APP_CONF))
@@ -359,13 +448,16 @@ def migrate():
     disp = parse_env(P(DISPLAY_CONF))
     com = parse_comitup(P(COMITUP_CONF))
     try:
-        auth = load_json(auth_path())
-        server = auth.get("server") if isinstance(auth, dict) else None
+        auth = load_auth()
+        server = auth.get("server") if auth else None
+    except Unsafe as e:
+        log(f"auth.json ignored: {e}")
+        server = None
     except (OSError, ValueError):
         server = None
     url = first([app.get("JELLYFIN_URL"), env.get("JELLYFIN_URL"), server], is_url, "")
-    ssid = first([com.get("ap_name"), env.get("HOTSPOT_SSID")], is_ssid, "PiFin-setup")
-    psk = first([env.get("HOTSPOT_PASS"), com.get("ap_password")], is_psk, "")
+    ssid = first([com.get("ap_name"), env.get("HOTSPOT_SSID")], is_hotspot_ssid, "PiFin-setup")
+    psk = legacy_psk(env, com)
     try:
         height = int(disp.get("MAX_HEIGHT", ""))
     except ValueError:
@@ -424,7 +516,7 @@ def init():
         if os.path.exists(P(SECRETS)):
             os.replace(P(SECRETS), f"{P(SECRETS)}.bad-{int(time.time())}")
             log("secrets.json was invalid, recreated (the PIN is cleared)")
-        sec = {"pin_hash": None, "hotspot_pass": ""}
+        sec = {"pin_hash": None, "hotspot_pass": legacy_psk()}
         write_secrets(sec)
     pin_set = sec["pin_hash"] is not None
     if doc["system"]["pin_set"] != pin_set:
@@ -535,7 +627,7 @@ def set_comitup_lines(path, values):
     # In place, not tmp + rename: the unit makes /etc read-only except this one file
     # (ReadWritePaths=/etc/comitup.conf), so no temp file can be created next to it.
     data = ("\n".join(out) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         view = memoryview(data)
         while view:
@@ -546,20 +638,27 @@ def set_comitup_lines(path, values):
         os.close(fd)
 
 
-def sync_jellyfin_url(url):
-    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
-    path = auth_path()
+def preflight_auth():
+    """Read auth.json before anything is written. None = nothing to update (no
+    sign-in yet, or unreadable JSON). Unsafe file -> `failed`, nothing changes."""
     try:
-        auth = load_json(path)
-    except FileNotFoundError:
-        auth = None  # nobody signed in yet
+        return load_auth()
+    except Unsafe as e:
+        log(f"refused to touch auth.json: {e}")
+        raise Invalid("failed", "The sign-in file is not a plain file owned by the PiFin "
+                      "user; nothing was changed.") from e
     except (OSError, ValueError):
         log("auth.json unreadable, server address not updated there")
-        auth = None
-    if isinstance(auth, dict):
+        return None
+
+
+def sync_jellyfin_url(url, auth):
+    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
+    if auth is not None:
         auth["server"] = url
         uid, gid = user_ids()
-        write_atomic(path, json.dumps(auth, indent=2) + "\n", 0o600, uid, gid)
+        write_atomic(auth_path(), json.dumps(auth, indent=2) + "\n", 0o600, uid, gid,
+                     owner=user_uid())
     RUN(["systemctl", "restart", "pifin-firewall"])
 
 
@@ -581,6 +680,10 @@ def sync_hotspot(psk=None, ssid=None):
 
 # ---- ops ------------------------------------------------------------------
 
+def text_or(v, default):
+    return v if isinstance(v, str) and v else default
+
+
 def status():
     try:
         wifi = load_json(P(WIFI_JSON))
@@ -589,7 +692,7 @@ def status():
     except (OSError, ValueError):
         wifi = {}
     return {
-        "wifi": {"state": wifi.get("state") or "unknown", "ssid": wifi.get("ssid") or "",
+        "wifi": {"state": text_or(wifi.get("state"), "unknown"), "ssid": text_or(wifi.get("ssid"), ""),
                  "radio": None, "iface": None, "signal_dbm": None, "ip": None},
         "macs": {"builtin": None, "usb": None},
         "tailscale": {"state": "unknown", "name": None, "ip": None},
@@ -623,12 +726,13 @@ def op_set(req):
             section, field = k.split(".")
             new[section][field] = v
     validate(new)
+    auth = preflight_auth() if "system.jellyfin_url" in changes else None
     if new != doc:
         write_settings(new)
     if new_sec != sec:
         write_secrets(new_sec)
     if "system.jellyfin_url" in changes:
-        sync_jellyfin_url(new["system"]["jellyfin_url"])
+        sync_jellyfin_url(new["system"]["jellyfin_url"], auth)
     if "display.output_max_height" in changes:
         write_atomic(P(DISPLAY_CONF), f"MAX_HEIGHT={new['display']['output_max_height']}\n", 0o644, 0, 0)
     if "secrets.hotspot_pass" in changes or "system.hotspot_ssid" in changes:

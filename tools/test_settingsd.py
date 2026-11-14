@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = pathlib.Path(__file__).resolve().parent.parent
@@ -141,6 +142,8 @@ class T03Validation(Base):
         self.err({"op": "set", "changes": {"system.hotspot_ssid": "evil\nap_password: x"}},
                  "invalid_value")
         self.err({"op": "set", "changes": {"secrets.hotspot_pass": "short"}}, "invalid_value")
+        for name in (" Spot", "Spot ", "'Spot", "#Spot"):  # unquoted ap_name would change
+            self.err({"op": "set", "changes": {"system.hotspot_ssid": name}}, "invalid_value")
         self.err({"op": "nope"}, "bad_request")
         self.assertEqual(sd.handle_line(b"not json\n")["error"], "bad_request")
 
@@ -290,6 +293,109 @@ class T11Socket(Base):
         self.assertEqual(json.loads(f.readline())["error"], "bad_request")
         f.close()
         c.close()
+
+
+class T12WriteAtomic(Base):
+    def test_mode_and_owner_set_on_the_fd_not_the_path(self):
+        target = self.path("/etc/pifin/x.conf")
+        with mock.patch("os.chmod", side_effect=AssertionError("path chmod")), \
+             mock.patch("os.chown", side_effect=AssertionError("path chown")):
+            sd.write_atomic(target, "A=1\n", 0o640, 0, 0)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+        self.assertEqual(self.read("/etc/pifin/x.conf"), "A=1\n")
+
+    def test_symlink_at_the_temp_name_is_not_followed(self):
+        victim = self.path("/victim")
+        self.write("/victim", "victim\n")
+        d = self.path(f"/home/{USER}/.config/pifin")
+        os.symlink(victim, os.path.join(d, ".auth.json.aaaaaaaaaaaa"))
+        with mock.patch.object(sd.secrets, "token_hex", return_value="aaaaaaaaaaaa"):
+            with self.assertRaises(sd.Unsafe):
+                sd.write_atomic(os.path.join(d, "auth.json"), "{}", 0o600, owner=os.getuid())
+        self.assertEqual(self.read("/victim"), "victim\n")
+        self.assertEqual(json.loads(self.read(f"/home/{USER}/.config/pifin/auth.json")), AUTH)
+
+
+class T13AuthJsonSafety(Base):
+    URL = {"op": "set", "changes": {"system.jellyfin_url": "http://new.example:8096"}}
+
+    def assert_refused(self):
+        before = {p: self.read(p) for p in ("/var/lib/pifin/settings.json",
+                                            "/var/lib/pifin/secrets.json", "/etc/pifin/app.conf")}
+        self.err(self.URL, "failed")
+        for p, text in before.items():
+            self.assertEqual(self.read(p), text, p)
+        self.assertNotIn(["systemctl", "restart", "pifin-firewall"], self.calls)
+
+    def test_symlinked_auth_json_is_refused(self):
+        auth = self.path(f"/home/{USER}/.config/pifin/auth.json")
+        os.unlink(auth)
+        os.symlink(self.path("/var/lib/pifin/secrets.json"), auth)
+        self.assert_refused()
+        self.assertTrue(os.path.islink(auth))
+
+    def test_auth_json_not_a_regular_file_is_refused(self):
+        auth = self.path(f"/home/{USER}/.config/pifin/auth.json")
+        os.unlink(auth)
+        os.mkfifo(auth)
+        self.assert_refused()
+
+    def test_foreign_owner_is_refused(self):
+        with mock.patch.object(sd, "user_uid", return_value=os.getuid() + 1):
+            self.assert_refused()
+
+    def test_symlinked_directory_is_refused(self):
+        d = self.path(f"/home/{USER}/.config/pifin")
+        os.rename(d, d + "-real")
+        os.symlink(d + "-real", d)
+        self.assert_refused()
+
+    def test_migration_ignores_a_symlinked_auth_json(self):
+        os.unlink(self.path("/etc/pifin/app.conf"))
+        self.write("/etc/pifin/secrets.env", f"PIFIN_USER='{USER}'\n")
+        self.write("/elsewhere.json", json.dumps({"server": "http://evil.example:8096"}))
+        auth = self.path(f"/home/{USER}/.config/pifin/auth.json")
+        os.unlink(auth)
+        os.symlink(self.path("/elsewhere.json"), auth)
+        os.unlink(self.path("/var/lib/pifin/settings.json"))
+        sd.init()
+        self.assertEqual(self.settings()["system"]["jellyfin_url"], "")
+
+
+class T14MigrationFallbacks(Base):
+    def remigrate(self):
+        for f in ("settings.json", "secrets.json"):
+            os.unlink(self.path(f"/var/lib/pifin/{f}"))
+        sd.init()
+        return self.settings(), self.secrets()
+
+    def test_second_and_third_sources(self):
+        os.unlink(self.path("/etc/pifin/app.conf"))
+        self.write("/etc/pifin/display.conf", "MAX_HEIGHT=480\n")
+        self.write("/etc/comitup.conf", "ap_password: 'it''s comitup'\nprimary_wifi_device: wlan1\n")
+        self.write("/etc/pifin/secrets.env", f"PIFIN_USER='{USER}'\nHOTSPOT_SSID='Env-Spot'\n"
+                   "JELLYFIN_URL='http://other.example:8096'\n")
+        s, sec = self.remigrate()
+        self.assertEqual(s["system"]["jellyfin_url"], "http://other.example:8096")
+        self.assertEqual(s["system"]["hotspot_ssid"], "Env-Spot")
+        self.assertEqual(s["display"]["output_max_height"], 1080)
+        self.assertEqual(sec["hotspot_pass"], "it's comitup")
+        self.write("/etc/pifin/secrets.env", f"PIFIN_USER='{USER}'\n")
+        s, _ = self.remigrate()
+        self.assertEqual(s["system"]["jellyfin_url"], "http://old.example:8096")  # auth.json
+        self.assertEqual(s["system"]["hotspot_ssid"], "PiFin-setup")
+
+    def test_lost_secrets_json_keeps_the_hotspot_password(self):
+        os.unlink(self.path("/var/lib/pifin/secrets.json"))
+        sd.init()
+        self.assertEqual(self.secrets(), {"pin_hash": None, "hotspot_pass": OLD_PASS})
+
+
+class T15Status(Base):
+    def test_non_string_wifi_fields_are_replaced(self):
+        self.write("/run/pifin/wifi.json", json.dumps({"state": 5, "ssid": ["x"]}))
+        w = self.ok({"op": "get"})["status"]["wifi"]
+        self.assertEqual((w["state"], w["ssid"]), ("unknown", ""))
 
 
 if __name__ == "__main__":
