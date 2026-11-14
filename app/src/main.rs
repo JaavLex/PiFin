@@ -901,6 +901,20 @@ fn local_ip() -> Option<std::net::IpAddr> {
     Some(s.local_addr().ok()?.ip())
 }
 
+/// The phone remote's address for the QR code: with the pairing token the scan pairs the
+/// phone (D8); without one (no token file yet) the plain address.
+fn remote_url(host: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) => format!("http://{host}:8080/pair?t={t}"),
+        None => format!("http://{host}:8080"),
+    }
+}
+
+/// The address phones reach the remote at; PIFIN_REMOTE_HOST overrides it (screenshots).
+fn remote_host() -> Option<String> {
+    std::env::var("PIFIN_REMOTE_HOST").ok().filter(|h| !h.is_empty()).or_else(|| local_ip().map(|ip| ip.to_string()))
+}
+
 /// A QR code as a 1-pixel-per-module image (scaled up by the UI, pixelated).
 fn qr_image(text: &str) -> Option<slint::Image> {
     let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
@@ -1870,11 +1884,13 @@ fn main() {
             if HINT_OFF.load(std::sync::atomic::Ordering::Relaxed) || tries.get() > 90 {
                 return true;
             }
-            let Some(ip) = local_ip() else { return false };
-            let url = format!("http://{ip}:8080");
-            if let Some(img) = qr_image(&url) {
+            let Some(host) = remote_host() else { return false };
+            // the token is read again on every try: a Re-pair may have replaced it
+            let token = settings::pair_token();
+            if let Some(img) = qr_image(&remote_url(&host, token.as_deref())) {
                 app.set_remote_qr(img);
-                app.set_remote_url(url.into());
+                // the text shows the address only; the token stays in the QR code
+                app.set_remote_url(remote_url(&host, None).into());
                 app.set_remote_show(true);
             }
             true
@@ -2075,4 +2091,11 @@ mod tests {
         // converted: every text subtitle is a file, the default one is selected
         let t = tracks(&s, Some((Some(2), Some(4))), true);
         assert_eq!((t.aid, t.sid, t.select_sub), (None, None, Some(1)));
+    }
+
+    #[test]
+    fn remote_qr_carries_the_pairing_token() {
+        let t = "0123456789abcdef0123456789abcdef";
+        assert_eq!(remote_url("192.0.2.5", Some(t)), format!("http://192.0.2.5:8080/pair?t={t}"));
+        assert_eq!(remote_url("192.0.2.5", None), "http://192.0.2.5:8080");
     }
