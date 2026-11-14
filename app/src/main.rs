@@ -12,6 +12,7 @@ mod jellyfin;
 mod profiles;
 #[allow(dead_code)] // the Settings UI (later tasks) uses the rest of the API
 mod settings;
+mod settings_ui;
 
 use jellyfin::{Auth, Client, Item};
 use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -1847,6 +1848,15 @@ fn main() {
                 drop(st);
                 show_profiles(&app, &store, Some(me.clone()));
             }
+        });
+    }
+    settings_ui::install(&app);
+    {
+        let weak = app.as_weak();
+        app.on_open_settings(move || {
+            let Some(app) = weak.upgrade() else { return };
+            hide_remote_hint(&app);
+            settings_ui::open(&app);
         });
     }
     {

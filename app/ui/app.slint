@@ -17,6 +17,35 @@ export struct Row {
     focus: int,        // remembered column
 }
 
+// one line of the Settings screen; kind: "choice" | "toggle" | "action" | "text" | "info"
+export struct SettingRow { key: string, kind: string, label: string, value: string, locked: bool }
+
+// on-screen keyboard (search and text entry): 46x27 keys on a 50x30 px step
+component KeyGrid {
+    in property <[string]> keys;
+    in property <int> focused-key;   // (`focus` is a built-in function name)
+    in property <bool> active: true;
+    in property <int> cols: 10;
+    in property <string> shift-label: "ABC";
+    in property <string> sym-label: "#+=";
+    for key[i] in root.keys: Rectangle {
+        property <bool> focused: root.active && i == root.focused-key;
+        x: mod(i, root.cols) * 50px;
+        y: floor(i / root.cols) * 30px;
+        width: 46px;
+        height: 27px;
+        border-radius: 6px;
+        background: focused ? #00a4dc : #1a1c2b;
+        Text {
+            text: key == "space" ? "␣" : key == "delete" ? "⌫" : key == "clear" ? "✕" : key == "done" ? "OK"
+                : key == "shift" ? root.shift-label : key == "sym" ? root.sym-label : key;
+            color: focused ? #0b0b12 : #c8c8d8;
+            font-size: 16px;
+            font-weight: focused ? 700 : 400;
+        }
+    }
+}
+
 component PosterCard inherits Rectangle {
     in property <Card> card;
     in property <bool> focused;
@@ -118,7 +147,7 @@ export component App inherits Window {
     callback open-search();
     // top bar on the home screen: search and the signed-in user (↑ from the first row)
     in property <bool> nav-show: false;
-    in-out property <int> nav-focus: -1;   // -1 rows, 0 search, 1 user
+    in-out property <int> nav-focus: -1;   // -1 rows, 0 search, 1 settings, 2 user
     in property <string> user-name;
     in property <string> user-initial;
     in property <int> user-index: 0;      // same colour as on "Who's watching?"
@@ -126,6 +155,51 @@ export component App inherits Window {
     in property <bool> user-has-image: false;
     callback open-profiles();
     callback kb-press(string);
+
+    // Settings screen (gear in the top bar); settings_ui.rs builds the rows and runs the overlays
+    in property <bool> settings-show: false;
+    in property <[string]> settings-sections;
+    in-out property <int> settings-section: 1;
+    in property <[SettingRow]> settings-rows;
+    in-out property <int> settings-row: -1;   // -1 = focus on the section list
+    in property <string> settings-message;    // "!" prefix = error (stripped here, drawn red)
+    property <int> settings-top: max(0, min(root.settings-rows.length - 9, root.settings-row - 4));
+    callback open-settings();
+    callback settings-close();
+    callback settings-section-changed(int);
+    callback settings-step(string, int);      // key, -1 | +1 (choice/toggle)
+    callback settings-activate(string);       // key (OK on any non-info row)
+    callback settings-move(int);              // -1 | +1: Rust picks the next non-info row
+    // list picker: the visible window (at most 9 items)
+    in property <bool> picker-show: false;
+    in property <string> picker-title;
+    in property <[string]> picker-items;
+    in property <int> picker-sel;
+    callback picker-move(int);
+    callback picker-ok();
+    callback picker-cancel();
+    // PIN digit pad
+    in property <bool> pad-show: false;
+    in property <string> pad-title;
+    in property <int> pad-len;
+    in property <string> pad-error;
+    in-out property <int> pad-focus: 0;
+    property <[string]> pad-labels: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "OK"];
+    callback pad-key(string);   // "0".."9" | "del" | "ok" | "cancel"
+    // confirmation: [Cancel] [confirm-yes]
+    in property <bool> confirm-show: false;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-yes;
+    in-out property <int> confirm-focus: 0;
+    callback confirm-done(bool);
+    // text entry over the rows area
+    in property <bool> te-show: false;
+    in property <string> te-title;
+    in property <string> te-value;
+    in property <[string]> te-keys;
+    in-out property <int> te-focus: 0;
+    callback te-key(string);
 
     // Wi-Fi screen (shown over everything while the Pi has no network)
     in property <bool> wifi-show: false;
@@ -171,7 +245,7 @@ export component App inherits Window {
     // header: focused item details
     Text {
         x: 64px; y: 36px;
-        width: root.nav-show ? 620px : 760px;
+        width: root.nav-show ? 564px : 760px;
         visible: !root.search-mode;
         text: root.heading;
         font-size: 36px; font-weight: 700;
@@ -201,10 +275,11 @@ export component App inherits Window {
         source: root.logo;
         visible: !root.search-mode;
     }
-    // top bar: [search] [avatar name], left of the logo
+    // top bar: [search] [gear] [avatar name], left of the logo
     if root.nav-show && !root.search-mode: Rectangle {
         property <bool> f-search: root.nav-focus == 0;
-        property <bool> f-user: root.nav-focus == 1;
+        property <bool> f-gear: root.nav-focus == 1;
+        property <bool> f-user: root.nav-focus == 2;
         x: parent.width - 56px - 150px - 24px - self.width; y: 30px;
         width: user-pill.x + user-pill.width; height: 44px;
         Rectangle {
@@ -227,8 +302,20 @@ export component App inherits Window {
                 color: f-search ? #0b0b12 : #c8c8d8;
             }
         }
+        Rectangle {
+            x: 162px; width: 44px; height: 44px;
+            border-radius: 22px;
+            background: f-gear ? #f2f2f7 : #1a1c2bd8;
+            Path {
+                x: 11px; y: 11px; width: 22px; height: 22px;
+                viewbox-width: 20; viewbox-height: 20;
+                commands: "M 16.5 10 A 6.5 6.5 0 1 0 3.5 10 A 6.5 6.5 0 1 0 16.5 10 M 12.8 10 A 2.8 2.8 0 1 0 7.2 10 A 2.8 2.8 0 1 0 12.8 10 M 16.5 10 L 19 10 M 14.6 14.6 L 16.4 16.4 M 10 16.5 L 10 19 M 5.4 14.6 L 3.6 16.4 M 3.5 10 L 1 10 M 5.4 5.4 L 3.6 3.6 M 10 3.5 L 10 1 M 14.6 5.4 L 16.4 3.6";
+                stroke: f-gear ? #0b0b12 : #c8c8d8;
+                stroke-width: 2.2px;
+            }
+        }
         user-pill := Rectangle {
-            x: 162px; height: 44px;
+            x: 218px; height: 44px;
             width: min(176px, 52px + name.preferred-width + 18px);
             border-radius: 22px;
             background: f-user ? #f2f2f7 : #1a1c2bd8;
@@ -279,20 +366,12 @@ export component App inherits Window {
             }
         }
         Text { x: 440px; y: 12px; text: root.kb-active ? "↓ results" : "↑ keyboard"; color: #6e6e86; font-size: 15px; }
-        for key[i] in root.kb-keys: Rectangle {
-            property <bool> focused: root.kb-active && i == root.kb-focus;
-            x: mod(i, root.kb-cols) * 50px;
-            y: 56px + floor(i / root.kb-cols) * 30px;
-            width: key == "space" || key == "delete" || key == "clear" ? 46px : 46px;
-            height: 27px;
-            border-radius: 6px;
-            background: focused ? #00a4dc : #1a1c2b;
-            Text {
-                text: key == "space" ? "␣" : key == "delete" ? "⌫" : key == "clear" ? "✕" : key;
-                color: focused ? #0b0b12 : #c8c8d8;
-                font-size: 16px;
-                font-weight: focused ? 700 : 400;
-            }
+        KeyGrid {
+            x: 0; y: 56px;
+            keys: root.kb-keys;
+            focused-key: root.kb-focus;
+            active: root.kb-active;
+            cols: root.kb-cols;
         }
     }
 
@@ -459,11 +538,308 @@ export component App inherits Window {
         }
     }
 
+    // Settings: section list on the left, rows of the current section on the right
+    if root.settings-show: Rectangle {
+        background: #0b0b12;
+        Text {
+            x: 64px; y: 36px;
+            text: "Settings";
+            font-size: 36px; font-weight: 700;
+            color: #f2f2f7;
+        }
+        for s[i] in root.settings-sections: Rectangle {
+            property <bool> current: i == root.settings-section;
+            property <bool> focused: current && root.settings-row < 0;
+            x: 64px; y: 120px + i * 52px;
+            width: 260px; height: 44px;
+            border-radius: 22px;
+            background: focused ? #f2f2f7 : current ? #1a1c2b : transparent;
+            Text {
+                x: 20px; height: parent.height;
+                vertical-alignment: center;
+                text: s;
+                font-size: 20px;
+                font-weight: 600;   // same width focused or not
+                color: focused ? #0b0b12 : current ? #f2f2f7 : #8e8ea6;
+            }
+        }
+        Rectangle {
+            x: 360px; y: 120px;
+            width: 856px; height: 9 * 56px;
+            clip: true;
+            for r[i] in root.settings-rows: Rectangle {
+                property <bool> focused: i == root.settings-row;
+                y: (i - root.settings-top) * 56px;
+                width: parent.width; height: 52px;
+                visible: i >= root.settings-top && i < root.settings-top + 9;
+                border-radius: 10px;
+                background: focused ? #1a1c2b : transparent;
+                border-width: focused ? 3px : 0px;
+                border-color: #ffffff;
+                Text {
+                    x: 20px; width: 380px; height: parent.height;
+                    vertical-alignment: center;
+                    text: r.label;
+                    font-size: 18px;
+                    color: #c8c8d8;
+                    overflow: elide;
+                }
+                value := Text {
+                    width: min(self.preferred-width, 420px);
+                    x: parent.width - 20px - self.width; height: parent.height;
+                    vertical-alignment: center;
+                    text: r.kind == "choice" ? "‹  " + r.value + "  ›" : r.value;
+                    font-size: 18px;
+                    color: #9a9ab0;
+                    overflow: elide;
+                }
+                if r.locked: Path {
+                    x: value.x - 24px; y: (parent.height - 18px) / 2;
+                    width: 16px; height: 18px;
+                    viewbox-width: 16; viewbox-height: 18;
+                    commands: "M 2 8 L 14 8 L 14 17 L 2 17 Z M 4.5 8 L 4.5 5 A 3.5 3.5 0 0 1 11.5 5 L 11.5 8";
+                    stroke: #9a9ab0;
+                    stroke-width: 1.6px;
+                }
+            }
+        }
+        Text {
+            x: 64px; y: 660px;
+            width: parent.width - 128px;
+            text: root.settings-message.starts-with("!") ? root.settings-message.replace-all("!", "") : root.settings-message;
+            font-size: 15px;
+            color: root.settings-message.starts-with("!") ? #ff9f9f : #8e8ea6;
+            overflow: elide;
+        }
+        Text {
+            x: 64px; y: 690px;
+            text: "OK to change · Back to go back";
+            font-size: 13px; color: #6e6e86;
+        }
+    }
+
+    if root.picker-show: Rectangle {
+        background: #0b0b12a0;
+        Rectangle {
+            width: 420px; height: 88px + root.picker-items.length * 48px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 16px;
+            background: #161826f0;
+            Text {
+                x: 24px; y: 22px;
+                text: root.picker-title;
+                font-size: 24px; font-weight: 700;
+                color: #f2f2f7;
+            }
+            for it[i] in root.picker-items: Rectangle {
+                x: 16px; y: 72px + i * 48px;
+                width: parent.width - 32px; height: 44px;
+                border-radius: 10px;
+                background: i == root.picker-sel ? #f2f2f7 : transparent;
+                Text {
+                    x: 16px; height: parent.height;
+                    vertical-alignment: center;
+                    text: it;
+                    font-size: 18px;
+                    color: i == root.picker-sel ? #0b0b12 : #c8c8d8;
+                }
+            }
+        }
+    }
+
+    // text entry: covers the rows area, the section list stays visible
+    if root.te-show: Rectangle {
+        x: 360px; y: 120px;
+        width: 856px; height: 520px;
+        background: #0b0b12;
+        Text {
+            x: 0; y: 0;
+            text: root.te-title;
+            font-size: 24px; font-weight: 700;
+            color: #f2f2f7;
+        }
+        Rectangle {
+            x: 0; y: 44px; width: 520px; height: 44px;
+            border-radius: 10px;
+            background: #1a1c2b;
+            Text {
+                x: 16px; width: parent.width - 32px; height: parent.height;
+                vertical-alignment: center;
+                text: root.te-value;
+                font-size: 22px;
+                color: #f2f2f7;
+                overflow: elide;
+            }
+        }
+        KeyGrid {
+            x: 0; y: 104px;
+            keys: root.te-keys;
+            focused-key: root.te-focus;
+            shift-label: root.te-keys.length > 0 && root.te-keys[0] == "A" ? "abc" : "ABC";
+            sym-label: root.te-keys.length > 0 && root.te-keys[0] == "." ? "abc" : "#+=";
+        }
+    }
+
+    if root.pad-show: Rectangle {
+        background: #0b0b12a0;
+        Rectangle {
+            width: 420px; height: 460px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 16px;
+            background: #161826f0;
+            Text {
+                y: 24px; width: parent.width;
+                horizontal-alignment: center;
+                text: root.pad-title;
+                font-size: 24px; font-weight: 700;
+                color: #f2f2f7;
+            }
+            for i in 8: Rectangle {
+                x: (parent.width - 8 * 16px - 7 * 12px) / 2 + i * 28px; y: 76px;
+                width: 16px; height: 16px;
+                border-radius: 8px;
+                background: i < root.pad-len ? #f2f2f7 : transparent;
+                border-width: 2px;
+                border-color: i < root.pad-len ? #f2f2f7 : #4a4a60;
+            }
+            Text {
+                y: 108px; width: parent.width;
+                horizontal-alignment: center;
+                text: root.pad-error;
+                font-size: 15px;
+                color: #ff9f9f;
+            }
+            for label[i] in root.pad-labels: Rectangle {
+                property <bool> focused: i == root.pad-focus;
+                x: (parent.width - 3 * 96px - 2 * 12px) / 2 + mod(i, 3) * 108px;
+                y: 150px + floor(i / 3) * 68px;
+                width: 96px; height: 56px;
+                border-radius: 10px;
+                background: focused ? #f2f2f7 : #1a1c2b;
+                Text {
+                    text: label;
+                    font-size: 22px;
+                    font-weight: focused ? 700 : 400;
+                    color: focused ? #0b0b12 : #c8c8d8;
+                }
+            }
+        }
+    }
+
+    if root.confirm-show: Rectangle {
+        background: #0b0b12a0;
+        Rectangle {
+            width: 560px; height: 250px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 16px;
+            background: #161826f0;
+            Text {
+                x: 28px; y: 28px;
+                text: root.confirm-title;
+                font-size: 24px; font-weight: 700;
+                color: #f2f2f7;
+            }
+            Text {
+                x: 28px; y: 74px; width: parent.width - 56px;
+                text: root.confirm-text;
+                font-size: 17px;
+                color: #b4b4c8;
+                wrap: word-wrap;
+            }
+            for b[i] in ["Cancel", root.confirm-yes]: Rectangle {
+                property <bool> focused: i == root.confirm-focus;
+                x: parent.width - 28px - (2 - i) * 162px + 12px; y: parent.height - 28px - 48px;
+                width: 150px; height: 48px;
+                border-radius: 24px;
+                background: focused ? #f2f2f7 : #1a1c2b;
+                Text {
+                    text: b;
+                    font-size: 18px; font-weight: 600;
+                    color: focused ? #0b0b12 : #c8c8d8;
+                }
+            }
+        }
+    }
+
     forward-focus: keys;
     keys := FocusScope {
         key-pressed(event) => {
             if (root.starting) {
                 if (event.text == Key.Escape || event.text == Key.Backspace) { root.cancel-start(); }
+                return accept;
+            }
+            if (root.confirm-show) {
+                if (event.text == Key.LeftArrow) { root.confirm-focus = 0; }
+                if (event.text == Key.RightArrow) { root.confirm-focus = 1; }
+                if (event.text == Key.Return || event.text == " ") { root.confirm-done(root.confirm-focus == 1); }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.confirm-done(false); }
+                return accept;
+            }
+            if (root.pad-show) {
+                if (event.text == Key.LeftArrow) { if (mod(root.pad-focus, 3) > 0) { root.pad-focus -= 1; } }
+                else if (event.text == Key.RightArrow) { if (mod(root.pad-focus, 3) < 2) { root.pad-focus += 1; } }
+                else if (event.text == Key.UpArrow) { if (root.pad-focus >= 3) { root.pad-focus -= 3; } }
+                else if (event.text == Key.DownArrow) { if (root.pad-focus < 9) { root.pad-focus += 3; } }
+                else if (event.text == Key.Return || event.text == " ") {
+                    root.pad-key(root.pad-focus == 9 ? "del" : root.pad-focus == 11 ? "ok" : root.pad-labels[root.pad-focus]);
+                }
+                else if (event.text == Key.Escape) { root.pad-key("cancel"); }
+                else if (event.text == Key.Backspace) { root.pad-key("del"); }
+                else if (event.text.character-count == 1 && event.text.is-float()) { root.pad-key(event.text); }
+                return accept;
+            }
+            if (root.te-show) {
+                if (event.text == Key.RightArrow) { root.te-focus = min(root.te-keys.length - 1, root.te-focus + 1); }
+                if (event.text == Key.LeftArrow) { root.te-focus = max(0, root.te-focus - 1); }
+                if (event.text == Key.UpArrow) { root.te-focus = max(0, root.te-focus - 10); }
+                if (event.text == Key.DownArrow && root.te-focus + 10 < root.te-keys.length) { root.te-focus += 10; }
+                if (event.text == Key.Return || event.text == " ") { root.te-key(root.te-keys[root.te-focus]); }
+                if (event.text == Key.Escape) { root.te-key("cancel"); }
+                if (event.text == Key.Backspace) { root.te-key("delete"); }
+                return accept;
+            }
+            if (root.picker-show) {
+                if (event.text == Key.UpArrow) { root.picker-move(-1); }
+                if (event.text == Key.DownArrow) { root.picker-move(1); }
+                if (event.text == Key.Return || event.text == " ") { root.picker-ok(); }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.picker-cancel(); }
+                return accept;
+            }
+            if (root.settings-show) {
+                if (root.settings-row < 0) {
+                    if (event.text == Key.UpArrow && root.settings-section > 0) {
+                        root.settings-section -= 1;
+                        root.settings-section-changed(root.settings-section);
+                    }
+                    if (event.text == Key.DownArrow && root.settings-section < root.settings-sections.length - 1) {
+                        root.settings-section += 1;
+                        root.settings-section-changed(root.settings-section);
+                    }
+                    if (event.text == Key.RightArrow || event.text == Key.Return || event.text == " ") { root.settings-move(1); }
+                    if (event.text == Key.Escape || event.text == Key.Backspace) { root.settings-close(); }
+                    return accept;
+                }
+                if (root.settings-row >= root.settings-rows.length) { root.settings-row = -1; return accept; }
+                if (event.text == Key.UpArrow) { root.settings-move(-1); }
+                if (event.text == Key.DownArrow) { root.settings-move(1); }
+                if (event.text == Key.LeftArrow) {
+                    if (root.settings-rows[root.settings-row].kind == "choice" || root.settings-rows[root.settings-row].kind == "toggle") {
+                        root.settings-step(root.settings-rows[root.settings-row].key, -1);
+                    } else { root.settings-row = -1; }
+                }
+                if (event.text == Key.RightArrow) {
+                    if (root.settings-rows[root.settings-row].kind == "choice" || root.settings-rows[root.settings-row].kind == "toggle") {
+                        root.settings-step(root.settings-rows[root.settings-row].key, 1);
+                    }
+                }
+                if (event.text == Key.Return || event.text == " ") {
+                    if (root.settings-rows[root.settings-row].kind == "toggle") {
+                        root.settings-step(root.settings-rows[root.settings-row].key, 1);
+                    } else if (root.settings-rows[root.settings-row].kind != "info") {
+                        root.settings-activate(root.settings-rows[root.settings-row].key);
+                    }
+                }
+                if (event.text == Key.Escape || event.text == Key.Backspace) { root.settings-row = -1; }
                 return accept;
             }
             if (root.profiles-show) {
@@ -493,12 +869,14 @@ export component App inherits Window {
                 return reject;
             }
             if (root.nav-show && root.nav-focus >= 0) {
-                if (event.text == Key.LeftArrow) { root.nav-focus = 0; }
-                if (event.text == Key.RightArrow) { root.nav-focus = 1; }
+                if (event.text == Key.LeftArrow) { root.nav-focus = max(0, root.nav-focus - 1); }
+                if (event.text == Key.RightArrow) { root.nav-focus = min(2, root.nav-focus + 1); }
                 if (event.text == Key.DownArrow && root.rows.length > 0) { root.nav-focus = -1; }
                 if (event.text == Key.Escape || event.text == Key.Backspace) { if (root.rows.length > 0) { root.nav-focus = -1; } else { root.back(); } }
                 if (event.text == Key.Return || event.text == " ") {
-                    if (root.nav-focus == 0) { root.nav-focus = -1; root.open-search(); } else { root.open-profiles(); }
+                    if (root.nav-focus == 0) { root.nav-focus = -1; root.open-search(); }
+                    else if (root.nav-focus == 1) { root.open-settings(); }
+                    else { root.open-profiles(); }
                 }
                 return accept;
             }
