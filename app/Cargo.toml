@@ -2,7 +2,9 @@
 name = "pifin"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"  # the Pi's compiler
+# slint 1.18 (Cargo.lock) needs 1.92. Build with rustup stable (on the Pi: `bash -lc
+# "cargo build --release"`, ~/.cargo/bin); the distro's /usr/bin/rustc 1.85 cannot build it.
+rust-version = "1.92"
 description = "Lightweight Jellyfin browser for Raspberry Pi; playback is handed to mpv"
 license = "MIT"
 
