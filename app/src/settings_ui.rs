@@ -858,9 +858,17 @@ fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
     u.message = "Restarting…".into();
     send(app, op, args, SHORT, |_, u, res| {
         if let Err(e) = res {
-            u.message = error_text(&e);
+            if let Some(text) = restart_error_text(&e) {
+                u.message = text;
+            }
         }
     });
+}
+
+/// The text for a failed reboot / factory reset. None when the daemon went away: the box
+/// is already restarting, so a lost connection is not an error worth showing.
+fn restart_error_text(e: &DaemonError) -> Option<String> {
+    (e.code != "unreachable").then(|| error_text(e))
 }
 
 // ---- wiring ----------------------------------------------------------------------------------------
@@ -964,6 +972,14 @@ pub fn install(app: &App, server_probe: net::Probe, client: std::sync::Arc<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_hides_a_dropped_connection_only() {
+        let gone = DaemonError { code: "unreachable".into(), message: "Settings service not reachable (no answer).".into() };
+        assert_eq!(restart_error_text(&gone), None);
+        let wrong = DaemonError { code: "pin_wrong".into(), message: "Wrong PIN.".into() };
+        assert_eq!(restart_error_text(&wrong), Some("!Wrong PIN.".into()));
+    }
 
     #[test]
     fn pin_entry_keeps_8_digits_and_needs_4() {
