@@ -80,6 +80,7 @@ jobs:
         run: sudo tools/build-image.sh --app pifin-aarch64 --version "${TAG#v}" --out dist
       - name: Update files and checksums
         run: |
+          sudo chown -R "$(id -u):$(id -g)" dist   # build-image.sh ran as root
           cp pifin-aarch64 dist/
           tar --owner=0 --group=0 -czf dist/pifin-files.tar.gz files
           cd dist

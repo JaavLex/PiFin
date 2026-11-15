@@ -15,8 +15,10 @@ StateDirectory=pifin
 ExecStartPre=+/usr/bin/install -d -o root -g @@PIFIN_USER@@ -m 0750 /run/pifin
 ProtectSystem=strict
 # /etc/comitup.conf is edited in place (no temp file can be made in a read-only /etc).
-# The "-" keeps the unit starting when nobody has signed in yet (dir missing).
-ReadWritePaths=/var/lib/pifin /run/pifin /etc/pifin /etc/comitup.conf -/home/@@PIFIN_USER@@/.config/pifin
+# The "-"s keep the unit starting when a path is missing: /run/pifin early at boot (the
+# ExecStartPre above creates it; without the "-" its own namespace setup fails, 226/NAMESPACE),
+# the config dir when nobody has signed in yet.
+ReadWritePaths=/var/lib/pifin -/run/pifin /etc/pifin /etc/comitup.conf -/home/@@PIFIN_USER@@/.config/pifin
 ProtectHome=no
 PrivateTmp=yes
 NoNewPrivileges=yes
