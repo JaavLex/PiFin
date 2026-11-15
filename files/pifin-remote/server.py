@@ -20,6 +20,7 @@ import os
 import pathlib
 import socket
 import threading
+import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,7 +60,14 @@ KEYS = {
 ui = UInput({e.EV_KEY: sorted(set(KEYS.values()))}, name="pifin-phone-remote")
 ui_lock = threading.Lock()
 player = Player()   # used only for its mpv IPC helpers; the app starts mpv
-state = {"seen": False}
+state = {"seen": False, "phones": {}, "bye_at": None}
+state_lock = threading.Lock()
+# The TV shows its QR code again only once every phone has left the remote page (the page
+# says "bye" when it is closed or navigated away; a phone that sleeps or switches apps
+# says nothing and stays connected). A short grace lets a reload or a move to /settings
+# come back first. A phone silent for STALE_AFTER (browser killed, phone gone) is dropped.
+BYE_GRACE = 5
+STALE_AFTER = 6 * 3600
 
 
 def press(key):
@@ -80,6 +88,41 @@ def app_cmd(line):
         return "ok"
     except OSError:
         return "app-not-running"
+
+
+def seen_now(now, phone):
+    """A paired phone made a request: on first contact the TV hides its QR hint."""
+    with state_lock:
+        state["phones"][phone] = now
+        if not state["seen"]:
+            state["seen"] = app_cmd("seen") == "ok"
+
+
+def bye(now, phone):
+    """The phone left the remote page (closed, reloaded, or moved to another page)."""
+    with state_lock:
+        state["phones"].pop(phone, None)
+        state["bye_at"] = now
+
+
+def check_gone(now):
+    """Every phone left (or went stale): the TV shows its QR hint again."""
+    with state_lock:
+        phones = state["phones"]
+        for phone, last in list(phones.items()):
+            if now - last > STALE_AFTER:
+                del phones[phone]
+        if not state["seen"] or phones:
+            return
+        if state["bye_at"] is not None and now - state["bye_at"] < BYE_GRACE:
+            return
+        state["seen"] = app_cmd("unseen") != "ok"
+
+
+def watch_phones():
+    while True:
+        time.sleep(2)
+        check_gone(time.monotonic())
 
 
 def mpv_alive():
@@ -313,9 +356,7 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def seen(self):
-        # first contact: the TV hides its "phone remote" hint
-        if not state["seen"]:
-            state["seen"] = app_cmd("seen") == "ok"
+        seen_now(time.monotonic(), self.client_address[0])
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path)
@@ -336,6 +377,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, SETTINGS_PAGE, "text/html; charset=utf-8")
             return self.reply(200, INDEX, "text/html; charset=utf-8")
         if path.path == "/settings":
+            self.seen()
             return self.reply(200, SETTINGS_PAGE, "text/html; charset=utf-8")
         if path.path == "/api/langs":
             try:
@@ -371,6 +413,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.paired():
             return self.forbidden()
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/bye":  # sendBeacon from the page's pagehide
+            bye(time.monotonic(), self.client_address[0])
+            return self.json({"ok": True})
+        self.seen()
         if path == "/api/settings":
             try:
                 data = self.body()
@@ -396,7 +442,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(set_langs(data))
             except Exception:
                 return self.json({"ok": False, "error": "failed", "message": "Jellyfin server not reachable."})
-        self.seen()
         try:
             data = self.body(1024 * 1024)
         except ValueError:
@@ -429,4 +474,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=watch_phones, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

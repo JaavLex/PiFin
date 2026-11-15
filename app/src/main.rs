@@ -1015,6 +1015,20 @@ fn hide_remote_hint(app: &App) {
     app.set_remote_show(false);
 }
 
+/// Shows the phone-remote QR hint; false while there is no address yet.
+fn show_remote_hint(app: &App) -> bool {
+    let Some(host) = remote_host() else { return false };
+    // the token is read again every time: a Re-pair may have replaced it
+    let token = settings::pair_token();
+    if let Some(img) = qr_image(&remote_url(&host, token.as_deref())) {
+        app.set_remote_qr(img);
+        // the text shows the address only; the token stays in the QR code
+        app.set_remote_url(remote_url(&host, None).into());
+        app.set_remote_show(true);
+    }
+    true
+}
+
 fn local_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?; // documentation address: no packet is sent
@@ -2107,6 +2121,11 @@ fn main() {
         REMOTE.with(|r| {
             *r.borrow_mut() = Some(Box::new(move |app: &App, cmd: &str, item: Option<Item>| match cmd {
                 "seen" => hide_remote_hint(app),
+                // no phone connected any more: the QR code again, so one can pair or reconnect
+                "unseen" => {
+                    HINT_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                    show_remote_hint(app);
+                }
                 "home" => {
                     let mut st = state.borrow_mut();
                     if st.screens.len() > 1 {
@@ -2137,16 +2156,7 @@ fn main() {
             if HINT_OFF.load(std::sync::atomic::Ordering::Relaxed) || tries.get() > 90 {
                 return true;
             }
-            let Some(host) = remote_host() else { return false };
-            // the token is read again on every try: a Re-pair may have replaced it
-            let token = settings::pair_token();
-            if let Some(img) = qr_image(&remote_url(&host, token.as_deref())) {
-                app.set_remote_qr(img);
-                // the text shows the address only; the token stays in the QR code
-                app.set_remote_url(remote_url(&host, None).into());
-                app.set_remote_show(true);
-            }
-            true
+            show_remote_hint(&app)
         };
         if !show() {
             let timer = Rc::new(slint::Timer::default());

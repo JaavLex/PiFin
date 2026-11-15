@@ -589,6 +589,9 @@ for (const sel of document.querySelectorAll("[data-opts]")) fill(sel, OPTS[sel.d
 refresh();
 setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 5000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+// leaving the page (closed, reloaded, other page; not sleep or app switching):
+// once every phone has left, the TV shows its QR code again
+addEventListener("pagehide", () => navigator.sendBeacon("/api/bye"));
 </script>
 </body>
 </html>

@@ -356,8 +356,13 @@ async function poll() {
     $("dot").classList.remove("on"); $("statusText").textContent = "Offline";
   } finally { polling = false; }
 }
-poll(); setInterval(poll, 2000);
+// only while on screen (saves the phone's battery)
+poll(); setInterval(() => { if (document.visibilityState === "visible") poll(); }, 2000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") poll(); });
 setInterval(() => { if (np && np.playing && !np.paused) { np.posTicks += 1e7; render(); } }, 1000);
+// leaving the page (closed, reloaded, other page; not sleep or app switching):
+// once every phone has left, the TV shows its QR code again
+addEventListener("pagehide", () => navigator.sendBeacon("/api/bye"));
 </script>
 </body>
 </html>

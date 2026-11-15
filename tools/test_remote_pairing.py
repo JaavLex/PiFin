@@ -176,5 +176,84 @@ class Pairing(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": False, "error": "failed", "message": "Settings service not running."})
 
 
+class PhoneGone(unittest.TestCase):
+    """The TV gets "unseen" only once every phone has left the remote page."""
+
+    def setUp(self):
+        self.sent = []
+        patch = mock.patch.object(server, "app_cmd", side_effect=lambda c: self.sent.append(c) or "ok")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(server.state.update, dict(server.state))
+        server.state.update(seen=False, phones={}, bye_at=None)
+
+    def test_sleeping_phone_keeps_the_qr_hidden(self):
+        server.seen_now(100.0, "A")
+        for t in range(100, 100 + 3 * 3600, 60):      # a film long, no request at all
+            server.check_gone(float(t))
+        self.assertEqual(self.sent, ["seen"])
+
+    def test_leaving_brings_the_qr_back_once_after_the_grace(self):
+        server.seen_now(100.0, "A")
+        server.bye(110.0, "A")
+        server.check_gone(110.0 + server.BYE_GRACE - 1)  # still in the grace
+        self.assertEqual(self.sent, ["seen"])
+        server.check_gone(110.0 + server.BYE_GRACE)
+        server.check_gone(200.0)                          # told once, not every 2 s
+        self.assertEqual(self.sent, ["seen", "unseen"])
+        server.seen_now(300.0, "A")                       # back: the QR hides again
+        self.assertEqual(self.sent, ["seen", "unseen", "seen"])
+
+    def test_reload_or_settings_page_comes_back_within_the_grace(self):
+        server.seen_now(100.0, "A")
+        server.bye(110.0, "A")
+        server.seen_now(111.0, "A")
+        server.check_gone(130.0)
+        self.assertEqual(self.sent, ["seen"])
+
+    def test_qr_waits_for_the_last_phone(self):
+        server.seen_now(100.0, "A")
+        server.seen_now(101.0, "B")
+        server.bye(110.0, "A")
+        server.check_gone(130.0)
+        self.assertEqual(self.sent, ["seen"])
+        server.bye(140.0, "B")
+        server.check_gone(160.0)
+        self.assertEqual(self.sent, ["seen", "unseen"])
+
+    def test_phone_silent_for_hours_is_dropped(self):
+        server.seen_now(100.0, "A")
+        server.check_gone(100.0 + server.STALE_AFTER + 1)
+        self.assertEqual(self.sent, ["seen", "unseen"])
+
+    def test_no_phone_ever_means_no_unseen(self):
+        server.check_gone(100_000.0)
+        self.assertEqual(self.sent, [])
+
+    def test_bye_endpoint_needs_pairing_and_records_the_phone(self):
+        write_token(GOOD)
+        server.seen_now(1.0, "127.0.0.1")
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/bye")
+        self.assertEqual(c.getresponse().status, 403)
+        self.assertIn("127.0.0.1", server.state["phones"])
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/bye", headers={"Cookie": "pifin=" + GOOD})
+        self.assertEqual(c.getresponse().status, 200)
+        self.assertNotIn("127.0.0.1", server.state["phones"])
+        self.assertIsNotNone(server.state["bye_at"])
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
