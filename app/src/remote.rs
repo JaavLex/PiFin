@@ -132,11 +132,7 @@ pub(crate) fn listen(
                     let weak = weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         let Some(app) = weak.upgrade() else { return };
-                        REMOTE.with(|r| {
-                            if let Some(f) = r.borrow().as_ref() {
-                                f(&app, &cmd, item);
-                            }
-                        });
+                        dispatch(&app, &cmd, item);
                     });
                 }
             });
