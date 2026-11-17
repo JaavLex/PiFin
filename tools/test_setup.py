@@ -16,6 +16,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.dont_write_bytecode = True
@@ -167,9 +168,12 @@ class Wizard(unittest.TestCase):
 
     def test_server_test(self):
         url = f"http://127.0.0.1:{self.jf.server_address[1]}"
-        status, j = self.post("/api/server_test", {"url": url})
-        self.assertEqual(j, {"ok": True, "result": {"name": "Home", "version": "10.11.0"}})
-        self.assertFalse(self.post("/api/server_test", {"url": url + "/nothing-here"})[1]["ok"])
+        # the fake server is on loopback, which the real test refuses (see test_remote_pairing)
+        self.assertEqual(self.post("/api/server_test", {"url": url})[1]["error"], "invalid_value")
+        with mock.patch.object(server, "address_allowed", lambda ip: True):
+            status, j = self.post("/api/server_test", {"url": url})
+            self.assertEqual(j, {"ok": True, "result": {"name": "Home", "version": "10.11.0"}})
+            self.assertFalse(self.post("/api/server_test", {"url": url + "/nothing-here"})[1]["ok"])
         self.assertEqual(self.post("/api/server_test", {"url": "file:///etc/passwd"})[1]["error"], "invalid_value")
 
     def test_update_ops_are_allowed_for_the_phone(self):
