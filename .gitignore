@@ -27,3 +27,10 @@ target/
 
 # tools/build-image.sh output
 dist/
+
+# agent / assistant working directories
+.buddy/
+.claude/
+.superpowers/
+.wf/
+.session-bridge/

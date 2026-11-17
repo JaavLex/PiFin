@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problem? Do not post it here: use the Security tab, "Report a vulnerability".
+        Remove passwords, auth keys, tokens, Wi-Fi names and IP addresses from anything you paste.
+  - type: input
+    id: pi
+    attributes:
+      label: Pi model
+      placeholder: Raspberry Pi 4, 4 GB
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PiFin version
+      description: Settings > System, on the TV or the phone.
+      placeholder: "0.3.1"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: The PiFin image, or Raspberry Pi OS with build.py.
+      placeholder: PiFin image 0.3.1
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: |
+        From `journalctl -u <unit> -n 100 --no-pager` over SSH, for the unit that misbehaved
+        (pifin-app, pifin-remote, pifin-settingsd, comitup, ...). Secrets removed.
+      render: text

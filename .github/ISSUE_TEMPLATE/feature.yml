@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do, or what is annoying? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should PiFin do?
+    validations:
+      required: true
+  - type: textarea
+    id: weight
+    attributes:
+      label: Lightweight impact
+      description: >
+        PiFin must stay lightweight and fast. Would this add a dependency, a background process,
+        idle CPU or memory, or boot time? Your best guess is fine.
