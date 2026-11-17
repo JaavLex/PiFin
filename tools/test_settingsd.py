@@ -26,6 +26,7 @@ _loader = importlib.machinery.SourceFileLoader("settingsd", str(HERE / "files/pi
 _spec = importlib.util.spec_from_loader("settingsd", _loader)
 sd = importlib.util.module_from_spec(_spec)
 _loader.exec_module(sd)
+BOOT_REBOOT_MARK = sd.LAST_PHONE_REBOOT  # the daemon's value at start
 
 USER = "testuser"
 OLD_PASS = "old hot $pass"
@@ -58,6 +59,7 @@ class Base(unittest.TestCase):
         self.clock = 1000.0
         sd.FAILS = 0
         sd.LOCK_UNTIL = 0.0
+        sd.LAST_PHONE_REBOOT = BOOT_REBOOT_MARK
         sd.init()
 
     def fake_run(self, argv, timeout=10):
@@ -219,10 +221,56 @@ class T07JellyfinUrl(Base):
         self.assertEqual(self.settings()["system"]["jellyfin_url"], url)
         self.assertEqual(self.read("/etc/pifin/app.conf"), f"JELLYFIN_URL={url}\n")
         auth = json.loads(self.read(f"/home/{USER}/.config/pifin/auth.json"))
-        self.assertEqual(auth, dict(AUTH, server=url))
+        # another server: its saved logins are dropped, the device id stays
+        self.assertEqual(auth, dict(AUTH, server=url, users=[], token="", user_id=""))
         mode = os.stat(self.path(f"/home/{USER}/.config/pifin/auth.json")).st_mode & 0o777
         self.assertEqual(mode, 0o600)
         self.assertIn(["systemctl", "restart", "pifin-firewall"], self.calls)
+
+
+class T07bJellyfinLogins(Base):
+    def auth(self):
+        return json.loads(self.read(f"/home/{USER}/.config/pifin/auth.json"))
+
+    def set_url(self, url):
+        self.ok({"op": "set", "changes": {"system.jellyfin_url": url}})
+
+    def test_same_origin_keeps_the_logins(self):
+        for url in ("http://old.example:8096/", "http://Old.Example:8096/jellyfin",
+                    "http://old.example:8096"):
+            self.set_url(url)
+            self.assertEqual(self.auth(), dict(AUTH, server=url), url)
+
+    def test_default_port_counts_as_the_same_origin(self):
+        self.write(f"/home/{USER}/.config/pifin/auth.json",
+                   json.dumps(dict(AUTH, server="https://old.example")))
+        self.set_url("https://old.example:443/jf")
+        self.assertEqual(self.auth()["users"], AUTH["users"])
+
+    def test_other_host_port_or_scheme_drops_the_logins(self):
+        for url in ("http://evil.example:8096", "http://old.example:8097",
+                    "https://old.example:8096"):
+            self.write(f"/home/{USER}/.config/pifin/auth.json", json.dumps(AUTH))
+            self.set_url(url)
+            a = self.auth()
+            self.assertEqual((a["users"], a["token"], a["user_id"]), ([], "", ""), url)
+            self.assertEqual((a["server"], a["device_id"]), (url, "d1"), url)
+            self.assertNotIn("tok1", self.read(f"/home/{USER}/.config/pifin/auth.json"), url)
+
+    def test_missing_old_server_drops_the_logins(self):
+        self.write(f"/home/{USER}/.config/pifin/auth.json",
+                   json.dumps({k: v for k, v in AUTH.items() if k != "server"}))
+        self.set_url("http://old.example:8096")
+        self.assertEqual(self.auth()["users"], [])
+
+    def test_tokens_are_gone_before_the_new_address_is_saved(self):
+        # the app restarts the moment settings.json has the new address
+        seen = []
+        real = sd.write_settings
+        with mock.patch.object(sd, "write_settings",
+                               lambda doc: (seen.append(self.auth()["users"]), real(doc))):
+            self.set_url("http://evil.example:8096")
+        self.assertEqual(seen, [[]])
 
 
 class T08Hotspot(Base):
@@ -570,6 +618,59 @@ class T20WifiForget(FixtureBase):
         self.assertEqual(s["networks"], {"Example-Home": {"hdr": True}})
         self.assertEqual(self.settings()["networks"], {"Example-Home": {"hdr": True}})
         self.err({"op": "wifi_forget", "ssid": "Example-Library"}, "invalid_value")
+
+
+class T20bPhoneRules(FixtureBase):
+    """Requests the phone-remote server forwards carry via=phone; the TV's do not."""
+
+    def test_wifi_add_and_forget_need_the_pin_from_a_phone(self):
+        self.set_pin()
+        add = {"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK, "via": "phone"}
+        self.err(add, "pin_required")
+        self.err(dict(add, pin="0000"), "pin_wrong")
+        self.assertEqual(self.connects, [])
+        self.ok(dict(add, pin="1234"))
+        self.assertEqual(self.connects, [("Example-Cafe", PSK)])
+        forget = {"op": "wifi_forget", "ssid": "Example-Office", "via": "phone"}
+        self.err(forget, "pin_required")
+        self.assertFalse(any("delete" in c for c in self.calls))
+        self.ok(dict(forget, pin="1234"))
+        self.assertIn(["nmcli", "con", "delete", "uuid", OFFICE_UUID], self.calls)
+
+    def test_wifi_from_the_tv_or_without_a_pin_is_free(self):
+        self.ok({"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK, "via": "phone"})
+        self.set_pin()
+        self.ok({"op": "wifi_add", "ssid": "Example-Cafe", "psk": PSK})
+        self.ok({"op": "wifi_forget", "ssid": "Example-Office"})
+
+    def test_first_pin_only_from_the_tv(self):
+        r = self.err({"op": "pin_set", "pin": "1234", "via": "phone"}, "tv_only")
+        self.assertEqual(r["message"], "Set the first PIN on the TV.")
+        self.assertFalse(self.settings()["system"]["pin_set"])
+        self.set_pin()
+        # changing it from the phone still works with the old PIN
+        self.err({"op": "pin_set", "pin": "5678", "via": "phone"}, "pin_required")
+        self.ok({"op": "pin_set", "pin": "5678", "old_pin": "1234", "via": "phone"})
+        self.ok({"op": "pin_check", "pin": "5678"})
+
+    def test_phone_reboot_at_most_every_five_minutes(self):
+        self.ok({"op": "reboot", "via": "phone"})
+        self.clock += 299
+        r = self.err({"op": "reboot", "via": "phone"}, "too_soon")
+        self.assertIn("Try again", r["message"])
+        self.assertEqual(len(self.joins), 1)
+        self.ok({"op": "reboot"})  # the TV is never limited
+        self.clock += 1
+        self.ok({"op": "reboot", "via": "phone"})
+        self.join()
+        self.assertEqual(len(self.joins), 3)
+
+    def test_no_phone_reboot_in_the_first_minutes_after_boot(self):
+        self.clock = 120.0  # the monotonic clock counts from boot
+        self.err({"op": "reboot", "via": "phone"}, "too_soon")
+        self.ok({"op": "reboot"})
+        self.clock = 300.0
+        self.ok({"op": "reboot", "via": "phone"})
 
 
 class T21TailscaleLogin(FixtureBase):

@@ -690,13 +690,40 @@ def preflight_auth():
         return None
 
 
-def sync_jellyfin_url(url, auth):
-    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
+def url_origin(url):
+    """(scheme, host, port) with default ports filled in; None if it can't be parsed."""
+    if not isinstance(url, str):
+        return None
+    try:
+        u = urllib.parse.urlsplit(url.strip())
+        scheme = u.scheme.lower()
+        port = u.port or {"http": 80, "https": 443}.get(scheme)
+    except ValueError:
+        return None
+    if not scheme or not u.hostname:
+        return None
+    return scheme, u.hostname.lower(), port
+
+
+def sync_auth_server(url, auth):
+    """Point auth.json at the new server. Called before settings.json changes: the app
+    restarts as soon as it sees the new address and must not find the old tokens then."""
     if auth is not None:
+        old = url_origin(auth.get("server"))
+        if old is None or old != url_origin(url):
+            # The saved Jellyfin tokens belong to the old server: never hand them to a
+            # new one. With no users left the app asks for a fresh sign-in.
+            auth["users"] = []
+            auth["token"] = ""
+            auth["user_id"] = ""
         auth["server"] = url
         uid, gid = user_ids()
         write_atomic(auth_path(), json.dumps(auth, indent=2) + "\n", 0o600, uid, gid,
                      owner=user_uid())
+
+
+def sync_jellyfin_url(url):
+    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
     RUN(["systemctl", "restart", "pifin-firewall"])
 
 
@@ -880,13 +907,14 @@ def op_set(req):
             section, field = k.split(".")
             new[section][field] = v
     validate(new)
-    auth = preflight_auth() if "system.jellyfin_url" in changes else None
+    if "system.jellyfin_url" in changes:
+        sync_auth_server(new["system"]["jellyfin_url"], preflight_auth())
     if new != doc:
         write_settings(new)
     if new_sec != sec:
         write_secrets(new_sec)
     if "system.jellyfin_url" in changes:
-        sync_jellyfin_url(new["system"]["jellyfin_url"], auth)
+        sync_jellyfin_url(new["system"]["jellyfin_url"])
     if "display.output_max_height" in changes:
         write_atomic(P(DISPLAY_CONF), f"MAX_HEIGHT={new['display']['output_max_height']}\n", 0o644, 0, 0)
     if "secrets.hotspot_pass" in changes or "system.hotspot_ssid" in changes:
@@ -916,10 +944,18 @@ def check_pin_format(pin):
         raise Invalid("invalid_value", PIN_MSG)
 
 
+def via_phone(req):
+    """True when the phone-remote server forwarded this request (it stamps every one)."""
+    return req.get("via") == "phone"
+
+
 def op_pin_set(req):
     pin = req.get("pin")
     check_pin_format(pin)
     stored = load_secrets()["pin_hash"]
+    if not stored and via_phone(req):
+        # Otherwise anyone who pairs a phone first could lock the owner out.
+        raise Invalid("tv_only", "Set the first PIN on the TV.")
     if stored:
         verify_pin(req.get("old_pin"), stored)
     store_pin(hash_pin(pin))
@@ -1053,6 +1089,8 @@ COMITUP_CONNECT = _dbus_connect
 
 
 def op_wifi_add(req):
+    if via_phone(req):
+        pin_gate(req.get("pin"))
     ssid, psk = req.get("ssid"), req.get("psk")
     check_ssid(ssid)
     if psk is None:
@@ -1064,6 +1102,8 @@ def op_wifi_add(req):
 
 
 def op_wifi_forget(req):
+    if via_phone(req):
+        pin_gate(req.get("pin"))
     ssid = req.get("ssid")
     check_ssid(ssid)
     matches = [p for p in wifi_profiles() if p["ssid"] == ssid]
@@ -1105,7 +1145,19 @@ def reboot_later():
     RUN(["systemctl", "reboot"])
 
 
+PHONE_REBOOT_GAP = 300  # seconds between two reboots asked from a phone
+# NOW() of the last one. It starts at 0: on Linux the monotonic clock counts from boot,
+# so the first five minutes after a boot count too and a phone can't loop reboots.
+LAST_PHONE_REBOOT = 0.0
+
+
 def op_reboot(req):
+    global LAST_PHONE_REBOOT
+    if via_phone(req):
+        now = NOW()
+        if now - LAST_PHONE_REBOOT < PHONE_REBOOT_GAP:
+            raise Invalid("too_soon", "PiFin restarted a moment ago. Try again in a few minutes.")
+        LAST_PHONE_REBOOT = now
     SPAWN(reboot_later)
     return None
 
@@ -1156,7 +1208,7 @@ def op_factory_reset(req):
     return None
 
 
-# ---- updates (D9) -----------------------------------------------------------
+# ---- updates ----------------------------------------------------------------
 # The work happens in pifin-update@.service (pifin-update): this daemon has no network
 # access and a read-only system on purpose.
 
