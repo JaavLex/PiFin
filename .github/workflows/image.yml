@@ -59,7 +59,7 @@ jobs:
   image:
     needs: app
     # x86 runner + qemu-user-static: the chroot runs arm64 programs through binfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # qemu-user-static is a virtual package on 26.04
     # read-only on purpose: this job runs third-party install scripts as root
     permissions:
       contents: read
@@ -99,7 +99,7 @@ jobs:
 
   release:
     needs: image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # the only job that can write; it runs no build code and needs no checkout
     permissions:
       contents: write
