@@ -139,12 +139,17 @@ class Pairing(unittest.TestCase):
         code, _, body = self.req("POST", "/api/settings", cookie=GOOD, body={"op": "get"})
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["result"]["settings"], {"version": 1})
-        self.assertEqual(fake.requests, [{"op": "get"}])
+        self.assertEqual(fake.requests, [{"op": "get", "via": "phone"}])
         for op in ("pair_reset", "nope", None):
             code, _, body = self.req("POST", "/api/settings", cookie=GOOD, body={"op": op})
             self.assertEqual(code, 400, op)
             self.assertEqual(json.loads(body)["error"], "bad_request")
-        self.assertEqual(fake.requests, [{"op": "get"}])
+        self.assertEqual(fake.requests, [{"op": "get", "via": "phone"}])
+        # a phone can't pass itself off as the TV
+        for via in ("tv", None, ""):
+            fake.requests.clear()
+            self.req("POST", "/api/settings", cookie=GOOD, body={"op": "reboot", "via": via})
+            self.assertEqual(fake.requests, [{"op": "reboot", "via": "phone"}], via)
 
     def raw_post(self, path, length):
         c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=3)

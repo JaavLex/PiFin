@@ -424,6 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = None
             if not isinstance(data, dict) or data.get("op") not in SETTINGS_OPS:
                 return self.json({"ok": False, "error": "bad_request", "message": "Unknown op."}, 400)
+            data["via"] = "phone"  # set here, never by the client: the daemon is stricter with phones
             return self.reply(200, daemon(data))
         if path == "/api/server_test":
             try:

@@ -404,7 +404,7 @@ async function loadSaved() {
   for (const n of list) {
     box.append(itemRow(n.ssid, "", "Forget", async () => {
       if (!confirm(`Forget ${n.ssid}?\nPiFin won't join it again until you add it.`)) return;
-      if (await op("wifi_forget", { ssid: n.ssid }) !== null) toast(`Forgot ${n.ssid}.`);
+      if (await guarded("wifi_forget", { ssid: n.ssid }) !== null) toast(`Forgot ${n.ssid}.`);
       loadSaved(); refresh();
     }, "danger"));
   }
@@ -436,7 +436,7 @@ $("joinBtn").onclick = async () => {
   if (ssid.length < 1 || ssid.length > 32) { toast("The network name needs 1 to 32 characters."); return; }
   if (!confirm(`Join ${ssid}?`)) return;
   toast(`Joining ${ssid}…`);
-  if (await op("wifi_add", { ssid, psk }) !== null) {
+  if (await guarded("wifi_add", { ssid, psk }) !== null) {
     toast(`Joined ${ssid}.`);
     show("joinBox", false); $("scanList").innerHTML = "";
   }
@@ -524,7 +524,7 @@ $("resetBtn").onclick = async () => {
   if (await guarded("factory_reset", {}) !== null) toast("Resetting…");
 };
 
-// ---- Updates (D9: manual, never during playback) ----
+// ---- Updates (manual, never during playback) ----
 $("updBtn").onclick = async () => {
   $("updNote").textContent = "Checking…";
   const u = await op("update_check");
@@ -579,7 +579,7 @@ $("wNext").onclick = async () => {
     if (await op("set", { changes: f.changes }) === null) return;
     wizSent = true;
     if (f.pin && await op("pin_set", { pin: f.pin }) === null)
-      $("wErr").textContent = "The server is saved, but the PIN is not: set it later in System.";
+      $("wErr").textContent = "The server is saved, but the PIN is not: set the first PIN on the TV.";
   }
   wizStep = r.step; wizRender(); refresh();
 };
