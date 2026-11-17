@@ -110,9 +110,7 @@
     </div>
     <div data-step="pin" id="w-pin">
       <h2>PIN (optional)</h2>
-      <p>A PIN protects the server address, Tailscale, the hotspot password and factory reset. Leave empty for none.</p>
-      <div class="line"><input id="wPin1" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="New PIN">
-        <input id="wPin2" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="Repeat"></div>
+      <p>A PIN protects the server address, Wi-Fi, Tailscale, the hotspot password and factory reset. Set it on the TV, in Settings &gt; System, so a phone can't lock you out.</p>
     </div>
     <div data-step="done" id="w-done">
       <h2>Almost there</h2>
@@ -133,9 +131,9 @@
         <select id="nLim"><option value="same">Same as all networks</option><option value="custom">Custom</option></select></div>
       <div class="row" id="nBrRow"><span class="lbl">Max bitrate here</span><select id="nBr" data-opts="bitrate"></select></div>
       <div class="row" id="nHRow"><span class="lbl">Max resolution here</span><select id="nH" data-opts="height"></select></div>
-      <div class="row col"><div class="item"><span class="lbl">Saved networks</span><button id="savedBtn">Show</button></div>
+      <div class="row col"><div class="item"><span class="lbl sens">Saved networks</span><button id="savedBtn">Show</button></div>
         <div class="list" id="savedList"></div></div>
-      <div class="row col"><div class="item"><span class="lbl">Add network</span><button id="scanBtn">Scan</button></div>
+      <div class="row col"><div class="item"><span class="lbl sens">Add network</span><button id="scanBtn">Scan</button></div>
         <div class="list" id="scanList"></div>
         <div class="hide" id="joinBox">
           <div class="line"><input id="joinName" placeholder="Network name" autocomplete="off" maxlength="32"></div>
@@ -178,7 +176,7 @@
       <div class="row col"><span class="lbl sens">Setup hotspot password</span>
         <div class="line"><input id="hp" type="password" autocomplete="new-password" placeholder="8 to 63 characters" maxlength="63"><button id="hpBtn">Save</button></div></div>
       <div class="row col"><div class="item"><span class="lbl sens">PIN</span><span class="val" id="pinVal">Off</span></div>
-        <div class="line" id="pinNew"><input id="pin1" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="New PIN"><input id="pin2" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="Repeat"><button id="pinBtn">Set</button></div>
+        <div class="line" id="pinNew"><small>Set the first PIN on the TV, in Settings &gt; System.</small></div>
         <div class="line hide" id="pinOld"><button id="pinChange">Change PIN</button><button id="pinRemove" class="danger">Remove PIN</button></div></div>
       <div class="row"><span class="lbl">About</span><span class="val" id="about"></span></div>
       <div class="row"><span class="lbl">Address</span><span class="val" id="aIp">—</span></div>
@@ -492,13 +490,6 @@ $("tsBtn").onclick = async () => {
 $("hpBtn").onclick = async () => {
   if (await set({ "secrets.hotspot_pass": $("hp").value }, true) !== null) { $("hp").value = ""; toast("Saved."); }
 };
-$("pinBtn").onclick = async () => {
-  const a = $("pin1").value, b = $("pin2").value;
-  if (!/^[0-9]{4,8}$/.test(a)) { toast("The PIN has 4 to 8 digits."); return; }
-  if (a !== b) { toast("The PINs don't match."); return; }
-  if (await op("pin_set", { pin: a }) !== null) { $("pin1").value = $("pin2").value = ""; toast("PIN set."); }
-  refresh();
-};
 $("pinChange").onclick = async () => {
   const old = await askPin("Current PIN");
   if (old === null || await op("pin_check", { pin: old }) === null) return;
@@ -538,8 +529,8 @@ $("updBtn").onclick = async () => {
 
 // ---- first setup wizard ----
 let wizStep = "server", wizSent = false;
-const wizData = () => ({ url: $("wUrl").value, tsKey: $("wTs").value, hotspot: $("wHp").value,
-                         pin: $("wPin1").value, pin2: $("wPin2").value });
+// no PIN fields: the daemon only takes the first PIN from the TV
+const wizData = () => ({ url: $("wUrl").value, tsKey: $("wTs").value, hotspot: $("wHp").value });
 function wizRender() {
   const on = wizVisible(S && S.settings, wizStep);
   show("wiz", on);
@@ -578,8 +569,6 @@ $("wNext").onclick = async () => {
     const f = wizFinal(d);
     if (await op("set", { changes: f.changes }) === null) return;
     wizSent = true;
-    if (f.pin && await op("pin_set", { pin: f.pin }) === null)
-      $("wErr").textContent = "The server is saved, but the PIN is not: set the first PIN on the TV.";
   }
   wizStep = r.step; wizRender(); refresh();
 };

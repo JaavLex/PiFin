@@ -263,6 +263,15 @@ class T07bJellyfinLogins(Base):
         self.set_url("http://old.example:8096")
         self.assertEqual(self.auth()["users"], [])
 
+    def test_tokens_are_gone_before_the_new_address_is_saved(self):
+        # the app restarts the moment settings.json has the new address
+        seen = []
+        real = sd.write_settings
+        with mock.patch.object(sd, "write_settings",
+                               lambda doc: (seen.append(self.auth()["users"]), real(doc))):
+            self.set_url("http://evil.example:8096")
+        self.assertEqual(seen, [[]])
+
 
 class T08Hotspot(Base):
     def source(self, var):

@@ -705,8 +705,9 @@ def url_origin(url):
     return scheme, u.hostname.lower(), port
 
 
-def sync_jellyfin_url(url, auth):
-    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
+def sync_auth_server(url, auth):
+    """Point auth.json at the new server. Called before settings.json changes: the app
+    restarts as soon as it sees the new address and must not find the old tokens then."""
     if auth is not None:
         old = url_origin(auth.get("server"))
         if old is None or old != url_origin(url):
@@ -719,6 +720,10 @@ def sync_jellyfin_url(url, auth):
         uid, gid = user_ids()
         write_atomic(auth_path(), json.dumps(auth, indent=2) + "\n", 0o600, uid, gid,
                      owner=user_uid())
+
+
+def sync_jellyfin_url(url):
+    write_atomic(P(APP_CONF), f"JELLYFIN_URL={url}\n", 0o644, 0, 0)
     RUN(["systemctl", "restart", "pifin-firewall"])
 
 
@@ -902,13 +907,14 @@ def op_set(req):
             section, field = k.split(".")
             new[section][field] = v
     validate(new)
-    auth = preflight_auth() if "system.jellyfin_url" in changes else None
+    if "system.jellyfin_url" in changes:
+        sync_auth_server(new["system"]["jellyfin_url"], preflight_auth())
     if new != doc:
         write_settings(new)
     if new_sec != sec:
         write_secrets(new_sec)
     if "system.jellyfin_url" in changes:
-        sync_jellyfin_url(new["system"]["jellyfin_url"], auth)
+        sync_jellyfin_url(new["system"]["jellyfin_url"])
     if "display.output_max_height" in changes:
         write_atomic(P(DISPLAY_CONF), f"MAX_HEIGHT={new['display']['output_max_height']}\n", 0o644, 0, 0)
     if "secrets.hotspot_pass" in changes or "system.hotspot_ssid" in changes:
