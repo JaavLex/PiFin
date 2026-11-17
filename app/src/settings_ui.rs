@@ -246,7 +246,7 @@ pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
             false,
         )
     };
-    // D3: with a PIN set, every sensitive row shows the lock
+    // with a PIN set, every sensitive row shows the lock
     let pin = v.settings.system.pin_set;
     match section {
         PLAYBACK => vec![
@@ -544,7 +544,7 @@ enum ConfirmFor {
         current: bool,
     },
     Join(String),
-    /// Install this release (D9: on request only).
+    /// Install this release (only when the user asks).
     Update(String),
 }
 
@@ -1154,18 +1154,18 @@ fn te_key(app: &App, u: &mut Ui, key: &str) {
 /// QR code; the text shows the address only.
 fn pair_texts(host: &str, token: Option<&str>) -> (String, String) {
     (
-        crate::remote_url(host, token),
-        crate::remote_url(host, None),
+        crate::remote::remote_url(host, token),
+        crate::remote::remote_url(host, None),
     )
 }
 
 /// The panel with the token read from the file now (a Re-pair replaces it).
 fn pair_overlay(note: String) -> Overlay {
-    match crate::remote_host() {
+    match crate::remote::remote_host() {
         Some(host) => {
             let (qr, url) = pair_texts(&host, settings::pair_token().as_deref());
             Overlay::Pair {
-                qr: crate::qr_image(&qr),
+                qr: crate::remote::qr_image(&qr),
                 url,
                 note,
             }
@@ -1223,7 +1223,7 @@ fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
     });
 }
 
-// ---- updates (D9) -----------------------------------------------------------------------------
+// ---- updates -----------------------------------------------------------------------------------
 
 /// update_check takes up to ~60 s (GitHub over a slow link).
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(75);
