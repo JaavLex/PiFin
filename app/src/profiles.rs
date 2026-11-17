@@ -32,7 +32,10 @@ pub struct Store {
 
 pub fn path() -> String {
     std::env::var("PIFIN_AUTH").unwrap_or_else(|_| {
-        format!("{}/.config/pifin/auth.json", std::env::var("HOME").unwrap_or_default())
+        format!(
+            "{}/.config/pifin/auth.json",
+            std::env::var("HOME").unwrap_or_default()
+        )
     })
 }
 
@@ -41,7 +44,12 @@ impl Store {
         let mut s: Store = serde_json::from_str(&std::fs::read_to_string(path()).ok()?).ok()?;
         // single-user file from v0.1: becomes the first profile
         if s.users.is_empty() && !s.token.is_empty() {
-            s.users.push(Profile { user_id: s.user_id.clone(), name: String::new(), token: s.token.clone(), device_id: s.device_id.clone() });
+            s.users.push(Profile {
+                user_id: s.user_id.clone(),
+                name: String::new(),
+                token: s.token.clone(),
+                device_id: s.device_id.clone(),
+            });
         }
         (!s.users.is_empty()).then_some(s)
     }
@@ -54,7 +62,12 @@ impl Store {
         }
         let tmp = format!("{p}.tmp");
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
             .and_then(|mut f| std::io::Write::write_all(&mut f, json.as_bytes()))
             .and_then(|_| std::fs::rename(&tmp, &p))
             .map_err(|e| format!("{p}: {e}"))
@@ -72,7 +85,12 @@ impl Store {
     /// Add or refresh a user and make it active.
     pub fn add(&mut self, auth: &Auth, name: &str) {
         self.server = auth.server.clone();
-        let p = Profile { user_id: auth.user_id.clone(), name: name.into(), token: auth.token.clone(), device_id: auth.device_id.clone() };
+        let p = Profile {
+            user_id: auth.user_id.clone(),
+            name: name.into(),
+            token: auth.token.clone(),
+            device_id: auth.device_id.clone(),
+        };
         match self.users.iter_mut().find(|u| u.user_id == p.user_id) {
             Some(u) => *u = p,
             None => self.users.push(p),
@@ -81,7 +99,12 @@ impl Store {
     }
 
     pub fn auth(&self, p: &Profile) -> Auth {
-        Auth { server: self.server.clone(), user_id: p.user_id.clone(), token: p.token.clone(), device_id: p.device_id.clone() }
+        Auth {
+            server: self.server.clone(),
+            user_id: p.user_id.clone(),
+            token: p.token.clone(),
+            device_id: p.device_id.clone(),
+        }
     }
 }
 

@@ -3,8 +3,8 @@
 //! settings_ui: it reuses the screen's rows, overlays, keyboard and daemon client.
 
 use super::{
-    check_hotspot_pass, error_text, open_overlay, refresh_status, row, send, value_label, with_ui, ConfirmFor, Layer,
-    Overlay, PickFor, Row, TeFor, TextEntry, Ui, View, WifiStatus, SHORT,
+    check_hotspot_pass, error_text, open_overlay, refresh_status, row, send, value_label, with_ui,
+    ConfirmFor, Layer, Overlay, PickFor, Row, TeFor, TextEntry, Ui, View, WifiStatus, SHORT,
 };
 use crate::settings::{self, DaemonError};
 use crate::App;
@@ -37,7 +37,10 @@ pub enum Test {
     #[default]
     Idle,
     Running,
-    Done { internet: Option<u64>, server: Option<u64> },
+    Done {
+        internet: Option<u64>,
+        server: Option<u64>,
+    },
 }
 
 /// The last `wifi_list` answer.
@@ -79,7 +82,11 @@ fn suggestion(s: u64) -> ((i64, i32), bool) {
     let (bitrate, slow) = if s > 40 * MBIT {
         (0, false)
     } else {
-        match [40i64, 20, 10, 6, 3].iter().map(|m| m * MBIT as i64).find(|b| *b as f64 <= budget) {
+        match [40i64, 20, 10, 6, 3]
+            .iter()
+            .map(|m| m * MBIT as i64)
+            .find(|b| *b as f64 <= budget)
+        {
             Some(b) => (b, false),
             None => (3_000_000, true),
         }
@@ -116,15 +123,24 @@ pub fn signal_word(dbm: i32) -> &'static str {
 /// Mbit/s with one decimal below 10, else whole.
 fn mbit(bps: u64) -> String {
     let m = bps as f64 / 1e6;
-    if m < 9.95 { format!("{m:.1}") } else { format!("{m:.0}") }
+    if m < 9.95 {
+        format!("{m:.1}")
+    } else {
+        format!("{m:.0}")
+    }
 }
 
 fn test_value(t: &Test) -> String {
-    let side = |b: &Option<u64>| b.map(|b| format!("{} Mbit/s", mbit(b))).unwrap_or_else(|| "—".into());
+    let side = |b: &Option<u64>| {
+        b.map(|b| format!("{} Mbit/s", mbit(b)))
+            .unwrap_or_else(|| "—".into())
+    };
     match t {
         Test::Idle => String::new(),
         Test::Running => "Testing…".into(),
-        Test::Done { internet, server } => format!("Internet {} · Server {}", side(internet), side(server)),
+        Test::Done { internet, server } => {
+            format!("Internet {} · Server {}", side(internet), side(server))
+        }
     }
 }
 
@@ -152,14 +168,22 @@ pub fn scan_items(entries: &[ScanEntry]) -> Vec<String> {
 
 /// A network name typed for "Other network…", checked before it is sent.
 pub fn check_ssid(name: &str) -> Result<(), &'static str> {
-    if (1..=32).contains(&name.len()) { Ok(()) } else { Err("The network name needs 1 to 32 characters.") }
+    if (1..=32).contains(&name.len()) {
+        Ok(())
+    } else {
+        Err("The network name needs 1 to 32 characters.")
+    }
 }
 
 /// The Network rows; `choice_row` is the screen's own (it shows pending steps).
 pub fn rows(v: &View, choice_row: &dyn Fn(&str, &str) -> Row) -> Vec<Row> {
     let w = &v.status.wifi;
     let id = ssid(w);
-    let name = if w.state == "HOTSPOT" { "Setup hotspot on" } else { id.unwrap_or("Not connected") };
+    let name = if w.state == "HOTSPOT" {
+        "Setup hotspot on"
+    } else {
+        id.unwrap_or("Not connected")
+    };
     let mut r = vec![row("net.ssid", "info", "Network", name, false)];
     if let Some(radio) = &w.radio {
         let radio = match radio.as_str() {
@@ -170,18 +194,36 @@ pub fn rows(v: &View, choice_row: &dyn Fn(&str, &str) -> Row) -> Vec<Row> {
         r.push(row("net.radio", "info", "Radio", radio, false));
     }
     if let Some(dbm) = w.signal_dbm {
-        r.push(row("net.signal", "info", "Signal", format!("{dbm} dBm · {}", signal_word(dbm)), false));
+        r.push(row(
+            "net.signal",
+            "info",
+            "Signal",
+            format!("{dbm} dBm · {}", signal_word(dbm)),
+            false,
+        ));
     }
     if let Some(ip) = &w.ip {
         r.push(row("net.ip", "info", "Address", ip.as_str(), false));
     }
-    r.push(row("net.test", "action", "Test connection", test_value(&v.net.test), false));
-    if let Test::Done { server: Some(s), .. } = v.net.test {
+    r.push(row(
+        "net.test",
+        "action",
+        "Test connection",
+        test_value(&v.net.test),
+        false,
+    ));
+    if let Test::Done {
+        server: Some(s), ..
+    } = v.net.test
+    {
         let value = match id {
             None => "Wi-Fi only".to_string(),
             Some(_) => {
                 let (b, h) = suggest(s);
-                let (b, h) = (value_label("playback.max_bitrate", b as f64), value_label("playback.max_height", h as f64));
+                let (b, h) = (
+                    value_label("playback.max_bitrate", b as f64),
+                    value_label("playback.max_height", h as f64),
+                );
                 format!("{b} · {h} · OK to apply")
             }
         };
@@ -189,7 +231,17 @@ pub fn rows(v: &View, choice_row: &dyn Fn(&str, &str) -> Row) -> Vec<Row> {
     }
     if let Some(id) = id {
         let custom = v.settings.networks.contains_key(id);
-        r.push(row("net.limits", "action", "Limits on this network", if custom { "Custom" } else { "Same as all networks" }, false));
+        r.push(row(
+            "net.limits",
+            "action",
+            "Limits on this network",
+            if custom {
+                "Custom"
+            } else {
+                "Same as all networks"
+            },
+            false,
+        ));
         if custom {
             r.push(choice_row("net.max_bitrate", "Max bitrate here"));
             r.push(choice_row("net.max_height", "Max resolution here"));
@@ -230,11 +282,15 @@ pub fn section_opened(app: &App, u: &mut Ui) {
     refresh_status(app);
     list_saved(app, false);
     let weak = app.as_weak();
-    u.timers.entry(STATUS_TIMER.into()).or_default().start(slint::TimerMode::Repeated, STATUS_EVERY, move || {
-        if let Some(app) = weak.upgrade() {
-            refresh_status(&app);
-        }
-    });
+    u.timers.entry(STATUS_TIMER.into()).or_default().start(
+        slint::TimerMode::Repeated,
+        STATUS_EVERY,
+        move || {
+            if let Some(app) = weak.upgrade() {
+                refresh_status(&app);
+            }
+        },
+    );
 }
 
 pub fn section_left(u: &mut Ui) {
@@ -250,56 +306,83 @@ fn can_pick(app: &App, u: &Ui) -> bool {
 }
 
 fn list_saved(app: &App, then_pick: bool) {
-    send(app, "wifi_list", json!({}), SHORT, move |app, u, res| match res {
-        Ok(v) => {
-            let mut names: Vec<String> = Vec::new();
-            for p in v.as_array().into_iter().flatten() {
-                if let Some(s) = p.get("ssid").and_then(|s| s.as_str()) {
-                    if !names.iter().any(|n| n == s) {
-                        names.push(s.to_string());
+    send(
+        app,
+        "wifi_list",
+        json!({}),
+        SHORT,
+        move |app, u, res| match res {
+            Ok(v) => {
+                let mut names: Vec<String> = Vec::new();
+                for p in v.as_array().into_iter().flatten() {
+                    if let Some(s) = p.get("ssid").and_then(|s| s.as_str()) {
+                        if !names.iter().any(|n| n == s) {
+                            names.push(s.to_string());
+                        }
+                    }
+                }
+                u.net.saved = Saved::Known(names.clone());
+                if then_pick && can_pick(app, u) {
+                    if names.is_empty() {
+                        u.message = "No saved networks.".into();
+                    } else {
+                        let ov = Overlay::Picker {
+                            title: "Saved networks".into(),
+                            items: names,
+                            sel: 0,
+                            purpose: PickFor::Saved,
+                        };
+                        open_overlay(app, u, ov);
                     }
                 }
             }
-            u.net.saved = Saved::Known(names.clone());
-            if then_pick && can_pick(app, u) {
-                if names.is_empty() {
-                    u.message = "No saved networks.".into();
-                } else {
-                    let ov = Overlay::Picker { title: "Saved networks".into(), items: names, sel: 0, purpose: PickFor::Saved };
-                    open_overlay(app, u, ov);
-                }
+            Err(e) => {
+                u.net.saved = Saved::Failed;
+                u.message = error_text(&e);
             }
-        }
-        Err(e) => {
-            u.net.saved = Saved::Failed;
-            u.message = error_text(&e);
-        }
-    });
+        },
+    );
 }
 
 /// "Add network": scan, then the picker. Also the Wi-Fi setup screen's OK.
 pub fn start_add(app: &App, u: &mut Ui) {
     u.message = "Looking for networks…".into();
-    send(app, "wifi_scan", json!({}), SCAN_TIMEOUT, |app, u, res| match res {
-        Ok(v) => {
-            u.net.scan = serde_json::from_value(v).unwrap_or_default();
-            u.message.clear();
-            if can_pick(app, u) {
-                let ov = Overlay::Picker { title: "Add network".into(), items: scan_items(&u.net.scan), sel: 0, purpose: PickFor::Scan };
-                open_overlay(app, u, ov);
+    send(
+        app,
+        "wifi_scan",
+        json!({}),
+        SCAN_TIMEOUT,
+        |app, u, res| match res {
+            Ok(v) => {
+                u.net.scan = serde_json::from_value(v).unwrap_or_default();
+                u.message.clear();
+                if can_pick(app, u) {
+                    let ov = Overlay::Picker {
+                        title: "Add network".into(),
+                        items: scan_items(&u.net.scan),
+                        sel: 0,
+                        purpose: PickFor::Scan,
+                    };
+                    open_overlay(app, u, ov);
+                }
             }
-        }
-        Err(e) => u.message = error_text(&e),
-    });
+            Err(e) => u.message = error_text(&e),
+        },
+    );
 }
 
 fn start_test(app: &App, u: &mut Ui) {
-    let Some(probe) = u.net.probe.clone() else { return };
+    let Some(probe) = u.net.probe.clone() else {
+        return;
+    };
     u.net.test = Test::Running;
     let gen = u.net.test_gen;
     let weak = app.as_weak();
     std::thread::spawn(move || {
-        let (internet, server) = run_probes(|| crate::jellyfin::measure(INTERNET_URL, None, 2.0), move || probe());
+        let (internet, server) = run_probes(
+            || crate::jellyfin::measure(INTERNET_URL, None, 2.0),
+            move || probe(),
+        );
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = weak.upgrade() {
                 with_ui(&app, |_, u| {
@@ -319,14 +402,20 @@ fn start_test(app: &App, u: &mut Ui) {
 }
 
 fn network_set(app: &App, ssid: String, limits: Value, saved_msg: Option<String>) {
-    send(app, "network_set", json!({ "ssid": ssid, "limits": limits }), SHORT, move |_, u, res| match res {
-        Ok(_) => {
-            if let Some(m) = saved_msg {
-                u.message = m;
+    send(
+        app,
+        "network_set",
+        json!({ "ssid": ssid, "limits": limits }),
+        SHORT,
+        move |_, u, res| match res {
+            Ok(_) => {
+                if let Some(m) = saved_msg {
+                    u.message = m;
+                }
             }
-        }
-        Err(e) => u.message = error_text(&e),
-    });
+            Err(e) => u.message = error_text(&e),
+        },
+    );
 }
 
 pub fn activate(app: &App, u: &mut Ui, key: &str) {
@@ -334,10 +423,21 @@ pub fn activate(app: &App, u: &mut Ui, key: &str) {
     match key {
         "net.test" if u.net.test != Test::Running => start_test(app, u),
         "net.apply" => {
-            if let (Test::Done { server: Some(s), .. }, Some(id)) = (&u.net.test, id) {
+            if let (
+                Test::Done {
+                    server: Some(s), ..
+                },
+                Some(id),
+            ) = (&u.net.test, id)
+            {
                 let (b, h) = suggest(*s);
                 let msg = format!("Limits saved for {id}.");
-                network_set(app, id, json!({ "max_bitrate": b, "max_height": h }), Some(msg));
+                network_set(
+                    app,
+                    id,
+                    json!({ "max_bitrate": b, "max_height": h }),
+                    Some(msg),
+                );
             }
         }
         "net.limits" => {
@@ -347,7 +447,12 @@ pub fn activate(app: &App, u: &mut Ui, key: &str) {
                 network_set(app, id, Value::Null, None);
             } else {
                 let p = &s.playback;
-                network_set(app, id, json!({ "max_bitrate": p.max_bitrate, "max_height": p.max_height }), None);
+                network_set(
+                    app,
+                    id,
+                    json!({ "max_bitrate": p.max_bitrate, "max_height": p.max_height }),
+                    None,
+                );
             }
         }
         "net.saved" => list_saved(app, true),
@@ -365,39 +470,75 @@ pub fn send_limits(app: &App, u: &mut Ui) {
         return;
     };
     let eff = settings::effective(&settings::current(), Some(&id));
-    let sent: Vec<Option<Value>> = NET_CHOICES.iter().map(|k| u.pending.get(*k).cloned()).collect();
+    let sent: Vec<Option<Value>> = NET_CHOICES
+        .iter()
+        .map(|k| u.pending.get(*k).cloned())
+        .collect();
     let b = sent[0].clone().unwrap_or(json!(eff.max_bitrate));
     let h = sent[1].clone().unwrap_or(json!(eff.max_height));
     let args = json!({ "ssid": id, "limits": { "max_bitrate": b, "max_height": h } });
-    send(app, "network_set", args, SHORT, move |_, u, res: Result<Value, DaemonError>| {
-        // a newer step has its own send coming: leave its value alone
-        for (k, v) in NET_CHOICES.iter().zip(sent) {
-            if v.is_some() && u.pending.get(*k) == v.as_ref() {
-                u.pending.remove(*k);
+    send(
+        app,
+        "network_set",
+        args,
+        SHORT,
+        move |_, u, res: Result<Value, DaemonError>| {
+            // a newer step has its own send coming: leave its value alone
+            for (k, v) in NET_CHOICES.iter().zip(sent) {
+                if v.is_some() && u.pending.get(*k) == v.as_ref() {
+                    u.pending.remove(*k);
+                }
             }
-        }
-        if let Err(e) = res {
-            u.message = error_text(&e);
-        }
-    });
+            if let Err(e) = res {
+                u.message = error_text(&e);
+            }
+        },
+    );
 }
 
 fn text(title: String, purpose: TeFor) -> Overlay {
-    Overlay::Text { title, entry: TextEntry { value: String::new(), layer: Layer::Lower }, purpose, pin: None }
+    Overlay::Text {
+        title,
+        entry: TextEntry {
+            value: String::new(),
+            layer: Layer::Lower,
+        },
+        purpose,
+        pin: None,
+    }
 }
 
 pub fn picked(app: &App, u: &mut Ui, purpose: PickFor, sel: usize, items: &[String]) {
     match purpose {
         PickFor::Saved => {
-            let Some(name) = items.get(sel).cloned() else { return };
+            let Some(name) = items.get(sel).cloned() else {
+                return;
+            };
             let current = ssid(&u.status.wifi) == Some(name.as_str());
-            open_overlay(app, u, Overlay::Confirm(ConfirmFor::Forget { ssid: name, current }));
+            open_overlay(
+                app,
+                u,
+                Overlay::Confirm(ConfirmFor::Forget {
+                    ssid: name,
+                    current,
+                }),
+            );
         }
         PickFor::Scan => match u.net.scan.get(sel).cloned() {
             None => open_overlay(app, u, text("Network name".into(), TeFor::WifiName)),
             Some(e) if e.secured => {
                 let title = format!("Password for {}", e.ssid);
-                open_overlay(app, u, text(title, TeFor::WifiPass { ssid: e.ssid, open_ok: false }));
+                open_overlay(
+                    app,
+                    u,
+                    text(
+                        title,
+                        TeFor::WifiPass {
+                            ssid: e.ssid,
+                            open_ok: false,
+                        },
+                    ),
+                );
             }
             Some(e) => open_overlay(app, u, Overlay::Confirm(ConfirmFor::Join(e.ssid))),
         },
@@ -412,7 +553,17 @@ pub fn text_done(app: &App, u: &mut Ui, purpose: TeFor, value: String) {
             Ok(()) => {
                 let title = format!("Password for {value}");
                 // a hidden network may be open: an empty password joins without one
-                open_overlay(app, u, text(title, TeFor::WifiPass { ssid: value, open_ok: true }));
+                open_overlay(
+                    app,
+                    u,
+                    text(
+                        title,
+                        TeFor::WifiPass {
+                            ssid: value,
+                            open_ok: true,
+                        },
+                    ),
+                );
             }
         },
         TeFor::WifiPass { ssid, open_ok } => {
@@ -432,15 +583,21 @@ pub fn text_done(app: &App, u: &mut Ui, purpose: TeFor, value: String) {
 fn join(app: &App, u: &mut Ui, ssid: String, psk: String) {
     u.overlay = Overlay::None;
     u.message = format!("Joining {ssid}…");
-    send(app, "wifi_add", json!({ "ssid": ssid, "psk": psk }), JOIN_TIMEOUT, |app, u, res| match res {
-        Ok(_) => {
-            u.overlay = Overlay::None;
-            u.message.clear();
-            section_left(u);
-            app.set_settings_show(false);
-        }
-        Err(e) => u.message = error_text(&e),
-    });
+    send(
+        app,
+        "wifi_add",
+        json!({ "ssid": ssid, "psk": psk }),
+        JOIN_TIMEOUT,
+        |app, u, res| match res {
+            Ok(_) => {
+                u.overlay = Overlay::None;
+                u.message.clear();
+                section_left(u);
+                app.set_settings_show(false);
+            }
+            Err(e) => u.message = error_text(&e),
+        },
+    );
 }
 
 pub fn confirm_text(purpose: &ConfirmFor) -> (String, String, String) {
@@ -461,13 +618,19 @@ pub fn confirm_text(purpose: &ConfirmFor) -> (String, String, String) {
 pub fn confirmed(app: &App, u: &mut Ui, purpose: ConfirmFor) {
     match purpose {
         ConfirmFor::Forget { ssid, .. } => {
-            send(app, "wifi_forget", json!({ "ssid": ssid.clone() }), SHORT, move |app, u, res| match res {
-                Ok(_) => {
-                    u.message = format!("{ssid} forgotten.");
-                    list_saved(app, false);
-                }
-                Err(e) => u.message = error_text(&e),
-            });
+            send(
+                app,
+                "wifi_forget",
+                json!({ "ssid": ssid.clone() }),
+                SHORT,
+                move |app, u, res| match res {
+                    Ok(_) => {
+                        u.message = format!("{ssid} forgotten.");
+                        list_saved(app, false);
+                    }
+                    Err(e) => u.message = error_text(&e),
+                },
+            );
         }
         ConfirmFor::Join(ssid) => join(app, u, ssid, String::new()),
         _ => {}
@@ -504,20 +667,50 @@ mod tests {
 
     #[test]
     fn test_result_shows_both_sides() {
-        let t = Test::Done { internet: Some(85_400_000), server: Some(7_260_000) };
+        let t = Test::Done {
+            internet: Some(85_400_000),
+            server: Some(7_260_000),
+        };
         assert_eq!(test_value(&t), "Internet 85 Mbit/s · Server 7.3 Mbit/s");
-        assert_eq!(test_value(&Test::Done { internet: None, server: Some(12_000_000) }), "Internet — · Server 12 Mbit/s");
+        assert_eq!(
+            test_value(&Test::Done {
+                internet: None,
+                server: Some(12_000_000)
+            }),
+            "Internet — · Server 12 Mbit/s"
+        );
         assert_eq!(test_value(&Test::Running), "Testing…");
     }
 
     fn wifi(state: &str, ssid: &str) -> WifiStatus {
-        WifiStatus { state: state.into(), ssid: ssid.into(), ..Default::default() }
+        WifiStatus {
+            state: state.into(),
+            ssid: ssid.into(),
+            ..Default::default()
+        }
     }
 
     fn net_rows(s: &Settings, w: WifiStatus, test: Test) -> Vec<Row> {
-        let status = Status { wifi: w, ..Default::default() };
-        let net = NetState { test, ..Default::default() };
-        build_rows(NETWORK, &View { settings: s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net, lang: &crate::settings_ui::lang::LangState::default(), update: "" })
+        let status = Status {
+            wifi: w,
+            ..Default::default()
+        };
+        let net = NetState {
+            test,
+            ..Default::default()
+        };
+        build_rows(
+            NETWORK,
+            &View {
+                settings: s,
+                pending: &HashMap::new(),
+                status: &status,
+                restart_offered: false,
+                net: &net,
+                lang: &crate::settings_ui::lang::LangState::default(),
+                update: "",
+            },
+        )
     }
 
     fn find<'a>(rows: &'a [Row], key: &str) -> Option<&'a Row> {
@@ -526,7 +719,10 @@ mod tests {
 
     #[test]
     fn without_a_wifi_network_there_are_no_per_network_limits() {
-        let done = Test::Done { internet: Some(50_000_000), server: Some(30_000_000) };
+        let done = Test::Done {
+            internet: Some(50_000_000),
+            server: Some(30_000_000),
+        };
         // Ethernet or offline: suggestion shown but not appliable, no limits row
         let rows = net_rows(&Settings::default(), wifi("", ""), done.clone());
         assert!(find(&rows, "net.limits").is_none());
@@ -538,11 +734,24 @@ mod tests {
         assert_eq!(find(&rows, "net.ssid").unwrap().value, "Setup hotspot on");
         // on Wi-Fi: the suggestion can be applied
         let rows = net_rows(&Settings::default(), wifi("CONNECTED", "Home"), done);
-        assert_eq!(find(&rows, "net.apply").unwrap().value, "20 Mbit/s · 4K · OK to apply");
-        assert_eq!(find(&rows, "net.limits").unwrap().value, "Same as all networks");
+        assert_eq!(
+            find(&rows, "net.apply").unwrap().value,
+            "20 Mbit/s · 4K · OK to apply"
+        );
+        assert_eq!(
+            find(&rows, "net.limits").unwrap().value,
+            "Same as all networks"
+        );
         assert!(find(&rows, "net.max_bitrate").is_none());
         // no test with a server result yet: no suggestion row
-        let rows = net_rows(&Settings::default(), wifi("CONNECTED", "Home"), Test::Done { internet: Some(1), server: None });
+        let rows = net_rows(
+            &Settings::default(),
+            wifi("CONNECTED", "Home"),
+            Test::Done {
+                internet: Some(1),
+                server: None,
+            },
+        );
         assert!(find(&rows, "net.apply").is_none());
     }
 
@@ -551,7 +760,13 @@ mod tests {
         let mut s = Settings::default();
         s.playback.max_bitrate = 0;
         s.playback.max_height = 1080;
-        s.networks.insert("Home".into(), NetLimits { max_bitrate: Some(6_000_000), ..Default::default() });
+        s.networks.insert(
+            "Home".into(),
+            NetLimits {
+                max_bitrate: Some(6_000_000),
+                ..Default::default()
+            },
+        );
         let rows = net_rows(&s, wifi("CONNECTED", "Home"), Test::Idle);
         assert_eq!(find(&rows, "net.limits").unwrap().value, "Custom");
         // a key the entry leaves out shows the global value
@@ -560,7 +775,10 @@ mod tests {
         assert_eq!(find(&rows, "net.max_height").unwrap().kind, "choice");
         // another network uses the global limits
         let rows = net_rows(&s, wifi("CONNECTED", "Cafe"), Test::Idle);
-        assert_eq!(find(&rows, "net.limits").unwrap().value, "Same as all networks");
+        assert_eq!(
+            find(&rows, "net.limits").unwrap().value,
+            "Same as all networks"
+        );
         assert!(find(&rows, "net.max_height").is_none());
     }
 
@@ -577,14 +795,35 @@ mod tests {
         assert_eq!(find(&rows, "net.signal").unwrap().value, "-67 dBm · good");
         assert_eq!(find(&rows, "net.saved").unwrap().value, "…");
         let rows = net_rows(&Settings::default(), wifi("CONNECTED", "Home"), Test::Idle);
-        assert!(find(&rows, "net.radio").is_none() && find(&rows, "net.signal").is_none() && find(&rows, "net.ip").is_none());
+        assert!(
+            find(&rows, "net.radio").is_none()
+                && find(&rows, "net.signal").is_none()
+                && find(&rows, "net.ip").is_none()
+        );
     }
 
     #[test]
     fn scan_items_flag_saved_and_open_networks() {
-        let e = |ssid: &str, signal, secured, saved| ScanEntry { ssid: ssid.into(), signal, secured, saved };
-        let items = scan_items(&[e("Home", 80, true, true), e("Cafe", 45, false, false), e("Lab", 30, true, false)]);
-        assert_eq!(items, ["Home   80%  (saved)", "Cafe   45%  (open)", "Lab   30%", "Other network…"]);
+        let e = |ssid: &str, signal, secured, saved| ScanEntry {
+            ssid: ssid.into(),
+            signal,
+            secured,
+            saved,
+        };
+        let items = scan_items(&[
+            e("Home", 80, true, true),
+            e("Cafe", 45, false, false),
+            e("Lab", 30, true, false),
+        ]);
+        assert_eq!(
+            items,
+            [
+                "Home   80%  (saved)",
+                "Cafe   45%  (open)",
+                "Lab   30%",
+                "Other network…"
+            ]
+        );
         assert_eq!(scan_items(&[]), ["Other network…"]);
     }
 

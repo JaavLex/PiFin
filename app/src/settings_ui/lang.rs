@@ -48,7 +48,11 @@ fn language_label(cultures: &[(String, String)], code: &str) -> String {
     if code.is_empty() {
         return "Any".into();
     }
-    cultures.iter().find(|(c, _)| c == code).map(|(_, n)| n.clone()).unwrap_or_else(|| code.to_string())
+    cultures
+        .iter()
+        .find(|(c, _)| c == code)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| code.to_string())
 }
 
 pub fn rows(l: &LangState) -> Vec<Row> {
@@ -58,18 +62,41 @@ pub fn rows(l: &LangState) -> Vec<Row> {
         Load::Failed => "Server not reachable".into(),
         _ => "Loading…".into(),
     };
-    let mode = MODES.iter().position(|m| *m == l.prefs.mode).map_or("Default", |i| MODE_LABELS[i]);
+    let mode = MODES
+        .iter()
+        .position(|m| *m == l.prefs.mode)
+        .map_or("Default", |i| MODE_LABELS[i]);
     vec![
-        row("lang.audio", "action", "Audio language", show(&|| language_label(&l.cultures, &l.prefs.audio)), false),
-        row("lang.sub", "action", "Subtitle language", show(&|| language_label(&l.cultures, &l.prefs.subtitle)), false),
+        row(
+            "lang.audio",
+            "action",
+            "Audio language",
+            show(&|| language_label(&l.cultures, &l.prefs.audio)),
+            false,
+        ),
+        row(
+            "lang.sub",
+            "action",
+            "Subtitle language",
+            show(&|| language_label(&l.cultures, &l.prefs.subtitle)),
+            false,
+        ),
         // arrows only once there is something to change
-        row("lang.mode", if ready { "choice" } else { "action" }, "Subtitles", show(&|| mode.to_string()), false),
+        row(
+            "lang.mode",
+            if ready { "choice" } else { "action" },
+            "Subtitles",
+            show(&|| mode.to_string()),
+            false,
+        ),
     ]
 }
 
 /// The section is shown: read the preferences (and, once, the language list).
 pub fn section_opened(app: &App, u: &mut Ui) {
-    let Some(api) = u.lang.api.clone() else { return };
+    let Some(api) = u.lang.api.clone() else {
+        return;
+    };
     if u.lang.load != Load::Ready {
         u.lang.load = Load::Loading;
     }
@@ -118,22 +145,48 @@ pub fn activate(app: &App, u: &mut Ui, key: &str) {
     }
     let (title, items, sel, purpose) = match key {
         "lang.mode" => {
-            let sel = MODES.iter().position(|m| *m == u.lang.prefs.mode).unwrap_or(0);
-            ("Subtitles", MODE_LABELS.iter().map(|s| s.to_string()).collect(), sel, PickFor::LangMode)
+            let sel = MODES
+                .iter()
+                .position(|m| *m == u.lang.prefs.mode)
+                .unwrap_or(0);
+            (
+                "Subtitles",
+                MODE_LABELS.iter().map(|s| s.to_string()).collect(),
+                sel,
+                PickFor::LangMode,
+            )
         }
         k => {
             let (cur, purpose, title) = if k == "lang.audio" {
                 (&u.lang.prefs.audio, PickFor::LangAudio, "Audio language")
             } else {
-                (&u.lang.prefs.subtitle, PickFor::LangSub, "Subtitle language")
+                (
+                    &u.lang.prefs.subtitle,
+                    PickFor::LangSub,
+                    "Subtitle language",
+                )
             };
             let mut items = vec!["Any".to_string()];
             items.extend(u.lang.cultures.iter().map(|(_, n)| n.clone()));
-            let sel = u.lang.cultures.iter().position(|(c, _)| c == cur).map_or(0, |i| i + 1);
+            let sel = u
+                .lang
+                .cultures
+                .iter()
+                .position(|(c, _)| c == cur)
+                .map_or(0, |i| i + 1);
             (title, items, sel, purpose)
         }
     };
-    open_overlay(app, u, Overlay::Picker { title: title.into(), items, sel, purpose });
+    open_overlay(
+        app,
+        u,
+        Overlay::Picker {
+            title: title.into(),
+            items,
+            sel,
+            purpose,
+        },
+    );
 }
 
 /// Left/Right on the Subtitles row.
@@ -141,7 +194,10 @@ pub fn step(app: &App, u: &mut Ui, delta: i32) {
     if u.lang.load != Load::Ready {
         return;
     }
-    let cur = MODES.iter().position(|m| *m == u.lang.prefs.mode).unwrap_or(0);
+    let cur = MODES
+        .iter()
+        .position(|m| *m == u.lang.prefs.mode)
+        .unwrap_or(0);
     let new = MODES[step_choice(&MODES, cur, delta)];
     change(app, u, |p| p.mode = new.to_string());
 }
@@ -154,7 +210,15 @@ pub fn picked(app: &App, u: &mut Ui, purpose: PickFor, sel: usize) {
         }
         return;
     }
-    let code = if sel == 0 { String::new() } else { u.lang.cultures.get(sel - 1).map(|(c, _)| c.clone()).unwrap_or_default() };
+    let code = if sel == 0 {
+        String::new()
+    } else {
+        u.lang
+            .cultures
+            .get(sel - 1)
+            .map(|(c, _)| c.clone())
+            .unwrap_or_default()
+    };
     if purpose == PickFor::LangAudio {
         change(app, u, |p| p.audio = code);
     } else {
@@ -170,20 +234,29 @@ fn change(app: &App, u: &mut Ui, f: impl FnOnce(&mut LangPrefs)) {
         return;
     }
     let weak = app.as_weak();
-    u.timers.entry(TIMER.into()).or_default().start(slint::TimerMode::SingleShot, SEND_DELAY, move || {
-        if let Some(app) = weak.upgrade() {
-            with_ui(&app, send);
-        }
-    });
+    u.timers.entry(TIMER.into()).or_default().start(
+        slint::TimerMode::SingleShot,
+        SEND_DELAY,
+        move || {
+            if let Some(app) = weak.upgrade() {
+                with_ui(&app, send);
+            }
+        },
+    );
 }
 
 fn send(app: &App, u: &mut Ui) {
-    let Some(api) = u.lang.api.clone() else { return };
+    let Some(api) = u.lang.api.clone() else {
+        return;
+    };
     let want = u.lang.prefs.clone();
     let weak = app.as_weak();
     std::thread::spawn(move || {
         // re-read right before posting: the server replaces the whole Configuration
-        let res = api.client.lang_prefs().and_then(|(_, cfg)| api.client.set_lang_prefs(cfg, &want));
+        let res = api
+            .client
+            .lang_prefs()
+            .and_then(|(_, cfg)| api.client.set_lang_prefs(cfg, &want));
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = weak.upgrade() {
                 with_ui(&app, |_, u| match res {
@@ -212,8 +285,15 @@ mod tests {
     fn ready(audio: &str) -> LangState {
         LangState {
             load: Load::Ready,
-            prefs: LangPrefs { audio: audio.into(), subtitle: "fre".into(), mode: "Smart".into() },
-            cultures: vec![("fra".into(), "French".into()), ("fre".into(), "French".into())],
+            prefs: LangPrefs {
+                audio: audio.into(),
+                subtitle: "fre".into(),
+                mode: "Smart".into(),
+            },
+            cultures: vec![
+                ("fra".into(), "French".into()),
+                ("fre".into(), "French".into()),
+            ],
             ..Default::default()
         }
     }

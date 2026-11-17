@@ -44,12 +44,34 @@ static CHOICES: [Choice; 4] = [
     Choice {
         key: "playback.max_bitrate",
         values: &[0.0, 40e6, 20e6, 10e6, 6e6, 3e6],
-        labels: &["No limit", "40 Mbit/s", "20 Mbit/s", "10 Mbit/s", "6 Mbit/s", "3 Mbit/s"],
+        labels: &[
+            "No limit",
+            "40 Mbit/s",
+            "20 Mbit/s",
+            "10 Mbit/s",
+            "6 Mbit/s",
+            "3 Mbit/s",
+        ],
         int: true,
     },
-    Choice { key: "playback.max_height", values: &[2160.0, 1080.0, 720.0, 480.0], labels: &["4K", "1080p", "720p", "480p"], int: true },
-    Choice { key: "display.output_max_height", values: &[2160.0, 1080.0, 720.0], labels: &["4K", "1080p", "720p"], int: true },
-    Choice { key: "display.subtitle_scale", values: &[0.8, 1.0, 1.25, 1.5], labels: &["Small", "Normal", "Large", "Huge"], int: false },
+    Choice {
+        key: "playback.max_height",
+        values: &[2160.0, 1080.0, 720.0, 480.0],
+        labels: &["4K", "1080p", "720p", "480p"],
+        int: true,
+    },
+    Choice {
+        key: "display.output_max_height",
+        values: &[2160.0, 1080.0, 720.0],
+        labels: &["4K", "1080p", "720p"],
+        int: true,
+    },
+    Choice {
+        key: "display.subtitle_scale",
+        values: &[0.8, 1.0, 1.25, 1.5],
+        labels: &["Small", "Normal", "Large", "Huge"],
+        int: false,
+    },
 ];
 
 fn choice(key: &str) -> Option<&'static Choice> {
@@ -68,13 +90,19 @@ impl Choice {
     }
     /// The value as the daemon expects it: integers stay integers.
     fn json(&self, i: usize) -> Value {
-        if self.int { json!(self.values[i] as i64) } else { json!(self.values[i]) }
+        if self.int {
+            json!(self.values[i] as i64)
+        } else {
+            json!(self.values[i])
+        }
     }
 }
 
 /// What a stored value shows: the choice's own label, else the raw number.
 pub fn value_label(key: &str, v: f64) -> String {
-    choice(key).and_then(|c| c.index_of(v).map(|i| c.labels[i].to_string())).unwrap_or_else(|| format!("{v}"))
+    choice(key)
+        .and_then(|c| c.index_of(v).map(|i| c.labels[i].to_string()))
+        .unwrap_or_else(|| format!("{v}"))
 }
 
 /// Index after one step, clamped at both ends (no wrap).
@@ -164,7 +192,13 @@ pub struct Row {
 }
 
 fn row(key: &str, kind: &'static str, label: &str, value: impl Into<String>, locked: bool) -> Row {
-    Row { key: key.into(), kind, label: label.into(), value: value.into(), locked }
+    Row {
+        key: key.into(),
+        kind,
+        label: label.into(),
+        value: value.into(),
+        locked,
+    }
 }
 
 /// Everything the rows are built from.
@@ -183,9 +217,35 @@ pub struct View<'a> {
 
 pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
     let ssid = net::ssid(&v.status.wifi);
-    let val = |key: &str| v.pending.get(key).cloned().or_else(|| stored(v.settings, ssid, key)).unwrap_or(Value::Null);
-    let choice_row = |key: &str, label: &str| row(key, "choice", label, value_label(key, val(key).as_f64().unwrap_or(0.0)), false);
-    let toggle_row = |key: &str, label: &str| row(key, "toggle", label, if val(key).as_bool() == Some(true) { "On" } else { "Off" }, false);
+    let val = |key: &str| {
+        v.pending
+            .get(key)
+            .cloned()
+            .or_else(|| stored(v.settings, ssid, key))
+            .unwrap_or(Value::Null)
+    };
+    let choice_row = |key: &str, label: &str| {
+        row(
+            key,
+            "choice",
+            label,
+            value_label(key, val(key).as_f64().unwrap_or(0.0)),
+            false,
+        )
+    };
+    let toggle_row = |key: &str, label: &str| {
+        row(
+            key,
+            "toggle",
+            label,
+            if val(key).as_bool() == Some(true) {
+                "On"
+            } else {
+                "Off"
+            },
+            false,
+        )
+    };
     // D3: with a PIN set, every sensitive row shows the lock
     let pin = v.settings.system.pin_set;
     match section {
@@ -207,23 +267,81 @@ pub fn build_rows(section: usize, v: &View) -> Vec<Row> {
         }
         SYSTEM => {
             let (sys, st) = (&v.settings.system, v.status);
-            let url = if sys.jellyfin_url.is_empty() { "Not set" } else { sys.jellyfin_url.as_str() };
+            let url = if sys.jellyfin_url.is_empty() {
+                "Not set"
+            } else {
+                sys.jellyfin_url.as_str()
+            };
             let mut r = vec![
                 row("system.jellyfin_url", "text", "Jellyfin server", url, pin),
-                row("system.tailscale", "action", "Tailscale", tailscale_label(&st.tailscale), pin),
-                row("secrets.hotspot_pass", "text", "Setup hotspot password", "••••••••", pin),
-                row("system.pin", "action", "PIN", if pin { "On" } else { "Off" }, pin),
+                row(
+                    "system.tailscale",
+                    "action",
+                    "Tailscale",
+                    tailscale_label(&st.tailscale),
+                    pin,
+                ),
+                row(
+                    "secrets.hotspot_pass",
+                    "text",
+                    "Setup hotspot password",
+                    "••••••••",
+                    pin,
+                ),
+                row(
+                    "system.pin",
+                    "action",
+                    "PIN",
+                    if pin { "On" } else { "Off" },
+                    pin,
+                ),
                 row("system.pair", "action", "Phone remote", "Show code", false),
-                row("system.about", "info", "About", format!("PiFin {}", env!("CARGO_PKG_VERSION")), false),
-                row("system.update", "action", "Check for updates", v.update, false),
-                row("system.ip", "info", "Address", st.wifi.ip.as_deref().unwrap_or("—"), false),
+                row(
+                    "system.about",
+                    "info",
+                    "About",
+                    format!("PiFin {}", env!("CARGO_PKG_VERSION")),
+                    false,
+                ),
+                row(
+                    "system.update",
+                    "action",
+                    "Check for updates",
+                    v.update,
+                    false,
+                ),
+                row(
+                    "system.ip",
+                    "info",
+                    "Address",
+                    st.wifi.ip.as_deref().unwrap_or("—"),
+                    false,
+                ),
             ];
             if let Some(ip) = &st.tailscale.ip {
-                r.push(row("system.ts_ip", "info", "Tailscale address", ip.as_str(), false));
+                r.push(row(
+                    "system.ts_ip",
+                    "info",
+                    "Tailscale address",
+                    ip.as_str(),
+                    false,
+                ));
             }
-            r.push(row("system.mac_builtin", "info", "MAC (built-in)", st.macs.builtin.as_deref().unwrap_or("—"), false));
+            r.push(row(
+                "system.mac_builtin",
+                "info",
+                "MAC (built-in)",
+                st.macs.builtin.as_deref().unwrap_or("—"),
+                false,
+            ));
             if let Some(mac) = &st.macs.usb {
-                r.push(row("system.mac_usb", "info", "MAC (USB)", mac.as_str(), false));
+                r.push(row(
+                    "system.mac_usb",
+                    "info",
+                    "MAC (USB)",
+                    mac.as_str(),
+                    false,
+                ));
             }
             r.push(row("system.reboot", "action", "Restart PiFin", "", false));
             r.push(row("system.factory", "action", "Factory reset", "", pin));
@@ -257,7 +375,11 @@ fn valid_focus(kinds: &[&str], row: i32) -> i32 {
         return r;
     }
     let up = next_row(kinds, r, -1);
-    if up != r { up } else { next_row(kinds, -1, 1) }
+    if up != r {
+        up
+    } else {
+        next_row(kinds, -1, 1)
+    }
 }
 
 // ---- PIN pad and text entry ----------------------------------------------------------------
@@ -285,7 +407,9 @@ impl PinEntry {
             "cancel" => return PadAction::Cancel,
             "ok" if self.digits.len() < 4 => self.error = "Enter 4 to 8 digits.".into(),
             "ok" => return PadAction::Submit(self.digits.clone()),
-            d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && self.digits.len() < 8 => self.digits.push_str(d),
+            d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && self.digits.len() < 8 => {
+                self.digits.push_str(d)
+            }
             _ => {}
         }
         PadAction::None
@@ -309,7 +433,11 @@ pub fn te_keys(layer: Layer) -> Vec<String> {
         Layer::Symbols => SYMBOLS.chars().map(String::from).collect(),
     };
     let tail = ["shift", "sym", "space", "delete", "done"];
-    chars.into_iter().chain(('0'..='9').map(String::from)).chain(tail.iter().map(|s| s.to_string())).collect()
+    chars
+        .into_iter()
+        .chain(('0'..='9').map(String::from))
+        .chain(tail.iter().map(|s| s.to_string()))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -328,8 +456,20 @@ pub enum TeAction {
 impl TextEntry {
     pub fn press(&mut self, key: &str) -> TeAction {
         match key {
-            "shift" => self.layer = if self.layer == Layer::Upper { Layer::Lower } else { Layer::Upper },
-            "sym" => self.layer = if self.layer == Layer::Symbols { Layer::Lower } else { Layer::Symbols },
+            "shift" => {
+                self.layer = if self.layer == Layer::Upper {
+                    Layer::Lower
+                } else {
+                    Layer::Upper
+                }
+            }
+            "sym" => {
+                self.layer = if self.layer == Layer::Symbols {
+                    Layer::Lower
+                } else {
+                    Layer::Symbols
+                }
+            }
             "space" => self.value.push(' '),
             "delete" => {
                 self.value.pop();
@@ -344,7 +484,11 @@ impl TextEntry {
 
 /// The setup hotspot password, checked before it is sent (the daemon checks it again).
 pub fn check_hotspot_pass(p: &str) -> Result<(), &'static str> {
-    if (8..=63).contains(&p.chars().count()) { Ok(()) } else { Err("The password needs 8 to 63 characters.") }
+    if (8..=63).contains(&p.chars().count()) {
+        Ok(())
+    } else {
+        Err("The password needs 8 to 63 characters.")
+    }
 }
 
 // ---- screen state ----------------------------------------------------------------------------
@@ -385,14 +529,20 @@ enum TeFor {
     Hotspot,
     WifiName,
     /// `open_ok`: an empty password joins an open network ("Other network…" only).
-    WifiPass { ssid: String, open_ok: bool },
+    WifiPass {
+        ssid: String,
+        open_ok: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
 enum ConfirmFor {
     Reboot,
     Factory(Option<String>),
-    Forget { ssid: String, current: bool },
+    Forget {
+        ssid: String,
+        current: bool,
+    },
     Join(String),
     /// Install this release (D9: on request only).
     Update(String),
@@ -402,13 +552,31 @@ enum ConfirmFor {
 enum Overlay {
     #[default]
     None,
-    Picker { title: String, items: Vec<String>, sel: usize, purpose: PickFor },
-    Pad { title: String, entry: PinEntry, purpose: PadFor },
+    Picker {
+        title: String,
+        items: Vec<String>,
+        sel: usize,
+        purpose: PickFor,
+    },
+    Pad {
+        title: String,
+        entry: PinEntry,
+        purpose: PadFor,
+    },
     // `pin`: the PIN checked for this one op, dropped with the overlay
-    Text { title: String, entry: TextEntry, purpose: TeFor, pin: Option<String> },
+    Text {
+        title: String,
+        entry: TextEntry,
+        purpose: TeFor,
+        pin: Option<String>,
+    },
     Confirm(ConfirmFor),
     /// The phone-remote panel: QR code with the token, the address as text, a note.
-    Pair { qr: Option<slint::Image>, url: String, note: String },
+    Pair {
+        qr: Option<slint::Image>,
+        url: String,
+        note: String,
+    },
 }
 
 #[derive(Default)]
@@ -431,20 +599,43 @@ thread_local! {
 }
 
 fn error_text(e: &DaemonError) -> String {
-    format!("!{}", if e.message.is_empty() { "Something went wrong." } else { e.message.as_str() })
+    format!(
+        "!{}",
+        if e.message.is_empty() {
+            "Something went wrong."
+        } else {
+            e.message.as_str()
+        }
+    )
 }
 
 /// Push the rows and the overlay to Slint.
 fn sync(app: &App, u: &Ui) {
     let s = settings::current();
-    let section = app.get_settings_section().clamp(0, SECTIONS.len() as i32 - 1) as usize;
-    let view = View { settings: &s, pending: &u.pending, status: &u.status, restart_offered: u.restart_offered, net: &u.net, lang: &u.lang, update: &u.update };
+    let section = app
+        .get_settings_section()
+        .clamp(0, SECTIONS.len() as i32 - 1) as usize;
+    let view = View {
+        settings: &s,
+        pending: &u.pending,
+        status: &u.status,
+        restart_offered: u.restart_offered,
+        net: &u.net,
+        lang: &u.lang,
+        update: &u.update,
+    };
     let rows = build_rows(section, &view);
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
     app.set_settings_row(valid_focus(&kinds, app.get_settings_row()));
     let model: Vec<SettingRow> = rows
         .into_iter()
-        .map(|r| SettingRow { key: r.key.into(), kind: r.kind.into(), label: r.label.into(), value: r.value.into(), locked: r.locked })
+        .map(|r| SettingRow {
+            key: r.key.into(),
+            kind: r.kind.into(),
+            label: r.label.into(),
+            value: r.value.into(),
+            locked: r.locked,
+        })
         .collect();
     app.set_settings_rows(ModelRc::new(VecModel::from(model)));
     app.set_settings_message(u.message.clone().into());
@@ -464,9 +655,16 @@ fn sync(app: &App, u: &Ui) {
             app.set_pair_url(url.into());
             app.set_pair_note(note.into());
         }
-        Overlay::Picker { title, items, sel, .. } => {
+        Overlay::Picker {
+            title, items, sel, ..
+        } => {
             let top = picker_top(items.len(), *sel);
-            let window: Vec<SharedString> = items.iter().skip(top).take(PICKER_ROWS).map(|s| s.into()).collect();
+            let window: Vec<SharedString> = items
+                .iter()
+                .skip(top)
+                .take(PICKER_ROWS)
+                .map(|s| s.into())
+                .collect();
             app.set_picker_title(title.into());
             app.set_picker_items(ModelRc::new(VecModel::from(window)));
             app.set_picker_sel((sel - top) as i32);
@@ -477,7 +675,8 @@ fn sync(app: &App, u: &Ui) {
             app.set_pad_error(entry.error.clone().into());
         }
         Overlay::Text { title, entry, .. } => {
-            let keys: Vec<SharedString> = te_keys(entry.layer).into_iter().map(|k| k.into()).collect();
+            let keys: Vec<SharedString> =
+                te_keys(entry.layer).into_iter().map(|k| k.into()).collect();
             app.set_te_focus(app.get_te_focus().min(keys.len() as i32 - 1));
             app.set_te_title(title.into());
             app.set_te_value(entry.value.clone().into());
@@ -515,7 +714,15 @@ fn open_overlay(app: &App, u: &mut Ui, ov: Overlay) {
 }
 
 fn open_pad(app: &App, u: &mut Ui, title: &str, purpose: PadFor) {
-    open_overlay(app, u, Overlay::Pad { title: title.into(), entry: PinEntry::default(), purpose });
+    open_overlay(
+        app,
+        u,
+        Overlay::Pad {
+            title: title.into(),
+            entry: PinEntry::default(),
+            purpose,
+        },
+    );
 }
 
 fn with_ui(app: &App, f: impl FnOnce(&App, &mut Ui)) {
@@ -555,7 +762,13 @@ fn with_pin(mut args: Value, pin: Option<String>) -> Value {
 
 fn refresh_status(app: &App) {
     send(app, "get", json!({}), SHORT, |_, u, res| match res {
-        Ok(v) => u.status = v.get("status").cloned().and_then(|s| serde_json::from_value(s).ok()).unwrap_or_default(),
+        Ok(v) => {
+            u.status = v
+                .get("status")
+                .cloned()
+                .and_then(|s| serde_json::from_value(s).ok())
+                .unwrap_or_default()
+        }
         Err(e) => u.message = error_text(&e),
     });
 }
@@ -567,10 +780,18 @@ fn step(app: &App, u: &mut Ui, key: &str, delta: i32) {
         return lang::step(app, u, delta);
     }
     let s = settings::current();
-    let cur = u.pending.get(key).cloned().or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
+    let cur = u
+        .pending
+        .get(key)
+        .cloned()
+        .or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
     let new = match choice(key) {
         Some(c) => {
-            let idx = cur.as_ref().and_then(|v| v.as_f64()).and_then(|v| c.index_of(v)).unwrap_or(0);
+            let idx = cur
+                .as_ref()
+                .and_then(|v| v.as_f64())
+                .and_then(|v| c.index_of(v))
+                .unwrap_or(0);
             c.json(step_choice(c.values, idx, delta))
         }
         // a toggle flips on any step: OK and both arrows change it
@@ -588,36 +809,52 @@ fn set_pending(app: &App, u: &mut Ui, key: &str, value: Value) {
     u.pending.insert(key.to_string(), value);
     let weak = app.as_weak();
     // both per-network choices go out in one network_set
-    let k = if net::NET_CHOICES.contains(&key) { net::LIMITS_TIMER.to_string() } else { key.to_string() };
-    u.timers.entry(k.clone()).or_default().start(slint::TimerMode::SingleShot, SEND_DELAY, move || {
-        if let Some(app) = weak.upgrade() {
-            with_ui(&app, |app, u| send_pending(app, u, &k));
-        }
-    });
+    let k = if net::NET_CHOICES.contains(&key) {
+        net::LIMITS_TIMER.to_string()
+    } else {
+        key.to_string()
+    };
+    u.timers.entry(k.clone()).or_default().start(
+        slint::TimerMode::SingleShot,
+        SEND_DELAY,
+        move || {
+            if let Some(app) = weak.upgrade() {
+                with_ui(&app, |app, u| send_pending(app, u, &k));
+            }
+        },
+    );
 }
 
 fn send_pending(app: &App, u: &mut Ui, key: &str) {
     if key == net::LIMITS_TIMER {
         return net::send_limits(app, u);
     }
-    let Some(value) = u.pending.get(key).cloned() else { return };
+    let Some(value) = u.pending.get(key).cloned() else {
+        return;
+    };
     let mut changes = serde_json::Map::new();
     changes.insert(key.to_string(), value.clone());
     let k = key.to_string();
-    send(app, "set", json!({ "changes": changes }), SHORT, move |_, u, res| {
-        // a newer step of the same key has its own timer: leave its value alone
-        if u.pending.get(&k) == Some(&value) {
-            u.pending.remove(&k); // shown from the file now, or reverted on an error
-        }
-        match res {
-            Ok(_) if k == "display.output_max_height" => {
-                u.restart_offered = true;
-                u.message = "The new resolution applies after a restart.".into();
+    send(
+        app,
+        "set",
+        json!({ "changes": changes }),
+        SHORT,
+        move |_, u, res| {
+            // a newer step of the same key has its own timer: leave its value alone
+            if u.pending.get(&k) == Some(&value) {
+                u.pending.remove(&k); // shown from the file now, or reverted on an error
             }
-            Ok(_) => {}
-            Err(e) => u.message = error_text(&e),
-        }
-    });
+            match res {
+                Ok(_) if k == "display.output_max_height" => {
+                    u.restart_offered = true;
+                    u.message = "The new resolution applies after a restart.".into();
+                }
+                Ok(_) => {}
+                Err(e) => u.message = error_text(&e),
+            }
+        },
+    );
 }
 
 // ---- actions -------------------------------------------------------------------------------------
@@ -625,12 +862,37 @@ fn send_pending(app: &App, u: &mut Ui, key: &str) {
 fn activate(app: &App, u: &mut Ui, key: &str) {
     if let Some(c) = choice(key) {
         let s = settings::current();
-        let cur = u.pending.get(key).cloned().or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
-        let sel = cur.and_then(|v| v.as_f64()).and_then(|v| c.index_of(v)).unwrap_or(0);
-        let title = app.get_settings_rows().iter().find(|r| r.key == key).map(|r| r.label.to_string()).unwrap_or_default();
+        let cur = u
+            .pending
+            .get(key)
+            .cloned()
+            .or_else(|| stored(&s, net::ssid(&u.status.wifi), key));
+        let sel = cur
+            .and_then(|v| v.as_f64())
+            .and_then(|v| c.index_of(v))
+            .unwrap_or(0);
+        let title = app
+            .get_settings_rows()
+            .iter()
+            .find(|r| r.key == key)
+            .map(|r| r.label.to_string())
+            .unwrap_or_default();
         let items = c.labels.iter().map(|l| l.to_string()).collect();
-        let key = net::NET_CHOICES.iter().copied().find(|k| *k == key).unwrap_or(c.key);
-        open_overlay(app, u, Overlay::Picker { title, items, sel, purpose: PickFor::Choice(key) });
+        let key = net::NET_CHOICES
+            .iter()
+            .copied()
+            .find(|k| *k == key)
+            .unwrap_or(c.key);
+        open_overlay(
+            app,
+            u,
+            Overlay::Picker {
+                title,
+                items,
+                sel,
+                purpose: PickFor::Choice(key),
+            },
+        );
         return;
     }
     match key {
@@ -641,7 +903,16 @@ fn activate(app: &App, u: &mut Ui, key: &str) {
         "system.factory" => gated(app, u, Gated::Factory),
         "system.pin" if settings::current().system.pin_set => {
             let items = vec!["Change PIN".to_string(), "Remove PIN".to_string()];
-            open_overlay(app, u, Overlay::Picker { title: "PIN".into(), items, sel: 0, purpose: PickFor::PinMenu });
+            open_overlay(
+                app,
+                u,
+                Overlay::Picker {
+                    title: "PIN".into(),
+                    items,
+                    sel: 0,
+                    purpose: PickFor::PinMenu,
+                },
+            );
         }
         "system.pin" => open_pad(app, u, "New PIN", PadFor::NewPin { old: None }),
         "system.pair" => open_overlay(app, u, pair_overlay(String::new())),
@@ -665,12 +936,19 @@ fn gated(app: &App, u: &mut Ui, g: Gated) {
 fn after_gate(app: &App, u: &mut Ui, g: Gated, pin: Option<String>) {
     let text = |title: &str, value: String, purpose| Overlay::Text {
         title: title.into(),
-        entry: TextEntry { value, layer: Layer::Lower },
+        entry: TextEntry {
+            value,
+            layer: Layer::Lower,
+        },
         purpose,
         pin: pin.clone(),
     };
     let ov = match g {
-        Gated::Url => text("Jellyfin server", settings::current().system.jellyfin_url.clone(), TeFor::Url),
+        Gated::Url => text(
+            "Jellyfin server",
+            settings::current().system.jellyfin_url.clone(),
+            TeFor::Url,
+        ),
         Gated::Tailscale => text("Tailscale auth key", String::new(), TeFor::Tailscale),
         Gated::Hotspot => text("Setup hotspot password", String::new(), TeFor::Hotspot),
         Gated::Factory => Overlay::Confirm(ConfirmFor::Factory(pin.clone())),
@@ -679,14 +957,24 @@ fn after_gate(app: &App, u: &mut Ui, g: Gated, pin: Option<String>) {
 }
 
 fn picker_ok(app: &App, u: &mut Ui) {
-    let Overlay::Picker { sel, purpose, items, .. } = std::mem::take(&mut u.overlay) else { return };
+    let Overlay::Picker {
+        sel,
+        purpose,
+        items,
+        ..
+    } = std::mem::take(&mut u.overlay)
+    else {
+        return;
+    };
     match purpose {
         PickFor::Choice(key) => {
             if let Some(c) = choice(key) {
                 set_pending(app, u, key, c.json(sel));
             }
         }
-        PickFor::LangAudio | PickFor::LangSub | PickFor::LangMode => lang::picked(app, u, purpose, sel),
+        PickFor::LangAudio | PickFor::LangSub | PickFor::LangMode => {
+            lang::picked(app, u, purpose, sel)
+        }
         PickFor::PinMenu if sel == 0 => open_pad(app, u, "Current PIN", PadFor::CurrentForChange),
         PickFor::PinMenu => open_pad(app, u, "Current PIN", PadFor::CurrentForRemove),
         PickFor::Saved | PickFor::Scan => net::picked(app, u, purpose, sel, &items),
@@ -710,45 +998,68 @@ fn pin_error(u: &mut Ui, e: &DaemonError) {
     }
 }
 
-fn check_pin(app: &App, u: &mut Ui, pin: String, then: impl FnOnce(&App, &mut Ui, String) + Send + 'static) {
+fn check_pin(
+    app: &App,
+    u: &mut Ui,
+    pin: String,
+    then: impl FnOnce(&App, &mut Ui, String) + Send + 'static,
+) {
     u.busy = true;
-    send(app, "pin_check", json!({ "pin": pin.clone() }), SHORT, move |app, u, res| {
-        u.busy = false;
-        match res {
-            Ok(_) => then(app, u, pin),
-            Err(e) => pin_error(u, &e),
-        }
-    });
+    send(
+        app,
+        "pin_check",
+        json!({ "pin": pin.clone() }),
+        SHORT,
+        move |app, u, res| {
+            u.busy = false;
+            match res {
+                Ok(_) => then(app, u, pin),
+                Err(e) => pin_error(u, &e),
+            }
+        },
+    );
 }
 
 fn pad_key(app: &App, u: &mut Ui, key: &str) {
     if u.busy {
         return;
     }
-    let Overlay::Pad { entry, purpose, .. } = &mut u.overlay else { return };
+    let Overlay::Pad { entry, purpose, .. } = &mut u.overlay else {
+        return;
+    };
     let purpose = purpose.clone();
     match entry.press(key) {
         PadAction::None => {}
         PadAction::Cancel => u.overlay = Overlay::None,
         PadAction::Submit(pin) => match purpose {
-            PadFor::Gate(g) => check_pin(app, u, pin, move |app, u, pin| after_gate(app, u, g, Some(pin))),
-            PadFor::CurrentForChange => {
-                check_pin(app, u, pin, |app, u, pin| open_pad(app, u, "New PIN", PadFor::NewPin { old: Some(pin) }))
-            }
+            PadFor::Gate(g) => check_pin(app, u, pin, move |app, u, pin| {
+                after_gate(app, u, g, Some(pin))
+            }),
+            PadFor::CurrentForChange => check_pin(app, u, pin, |app, u, pin| {
+                open_pad(app, u, "New PIN", PadFor::NewPin { old: Some(pin) })
+            }),
             PadFor::CurrentForRemove => {
                 u.busy = true;
-                send(app, "pin_clear", json!({ "pin": pin }), SHORT, |_, u, res| {
-                    u.busy = false;
-                    match res {
-                        Ok(_) => {
-                            u.overlay = Overlay::None;
-                            u.message = "PIN removed.".into();
+                send(
+                    app,
+                    "pin_clear",
+                    json!({ "pin": pin }),
+                    SHORT,
+                    |_, u, res| {
+                        u.busy = false;
+                        match res {
+                            Ok(_) => {
+                                u.overlay = Overlay::None;
+                                u.message = "PIN removed.".into();
+                            }
+                            Err(e) => pin_error(u, &e),
                         }
-                        Err(e) => pin_error(u, &e),
-                    }
-                });
+                    },
+                );
             }
-            PadFor::NewPin { old } => open_pad(app, u, "Repeat PIN", PadFor::RepeatPin { old, first: pin }),
+            PadFor::NewPin { old } => {
+                open_pad(app, u, "Repeat PIN", PadFor::RepeatPin { old, first: pin })
+            }
             PadFor::RepeatPin { old, first } if first != pin => {
                 open_pad(app, u, "New PIN", PadFor::NewPin { old });
                 if let Overlay::Pad { entry, .. } = &mut u.overlay {
@@ -773,7 +1084,15 @@ fn pad_key(app: &App, u: &mut Ui, key: &str) {
 }
 
 fn te_key(app: &App, u: &mut Ui, key: &str) {
-    let Overlay::Text { entry, purpose, pin, .. } = &mut u.overlay else { return };
+    let Overlay::Text {
+        entry,
+        purpose,
+        pin,
+        ..
+    } = &mut u.overlay
+    else {
+        return;
+    };
     let (purpose, pin) = (purpose.clone(), pin.clone());
     let value = match entry.press(key) {
         TeAction::None => return,
@@ -788,31 +1107,45 @@ fn te_key(app: &App, u: &mut Ui, key: &str) {
             u.message = format!("!{}", check_hotspot_pass(&value).unwrap_err());
         }
         TeFor::Url | TeFor::Hotspot => {
-            let key = if matches!(purpose, TeFor::Url) { "system.jellyfin_url" } else { "secrets.hotspot_pass" };
+            let key = if matches!(purpose, TeFor::Url) {
+                "system.jellyfin_url"
+            } else {
+                "secrets.hotspot_pass"
+            };
             let mut changes = serde_json::Map::new();
             changes.insert(key.into(), value.into());
             u.overlay = Overlay::None;
             u.message = "Saving…".into();
-            send(app, "set", with_pin(json!({ "changes": changes }), pin), SHORT, |_, u, res| {
-                u.message = match res {
-                    Ok(_) => "Saved.".into(),
-                    Err(e) => error_text(&e),
-                }
-            });
+            send(
+                app,
+                "set",
+                with_pin(json!({ "changes": changes }), pin),
+                SHORT,
+                |_, u, res| {
+                    u.message = match res {
+                        Ok(_) => "Saved.".into(),
+                        Err(e) => error_text(&e),
+                    }
+                },
+            );
         }
         TeFor::WifiName | TeFor::WifiPass { .. } => net::text_done(app, u, purpose, value),
         TeFor::Tailscale => {
             u.overlay = Overlay::None;
             u.message = "Signing in…".into();
-            send(app, "tailscale_login", with_pin(json!({ "authkey": value }), pin), TAILSCALE_TIMEOUT, |app, u, res| {
-                match res {
+            send(
+                app,
+                "tailscale_login",
+                with_pin(json!({ "authkey": value }), pin),
+                TAILSCALE_TIMEOUT,
+                |app, u, res| match res {
                     Ok(_) => {
                         u.message = "Signed in.".into();
                         refresh_status(app);
                     }
                     Err(e) => u.message = error_text(&e),
-                }
-            });
+                },
+            );
         }
     }
 }
@@ -820,7 +1153,10 @@ fn te_key(app: &App, u: &mut Ui, key: &str) {
 /// What the phone-remote panel shows: (QR payload, address text). The token stays in the
 /// QR code; the text shows the address only.
 fn pair_texts(host: &str, token: Option<&str>) -> (String, String) {
-    (crate::remote_url(host, token), crate::remote_url(host, None))
+    (
+        crate::remote_url(host, token),
+        crate::remote_url(host, None),
+    )
 }
 
 /// The panel with the token read from the file now (a Re-pair replaces it).
@@ -828,9 +1164,17 @@ fn pair_overlay(note: String) -> Overlay {
     match crate::remote_host() {
         Some(host) => {
             let (qr, url) = pair_texts(&host, settings::pair_token().as_deref());
-            Overlay::Pair { qr: crate::qr_image(&qr), url, note }
+            Overlay::Pair {
+                qr: crate::qr_image(&qr),
+                url,
+                note,
+            }
         }
-        None => Overlay::Pair { qr: None, url: "No network address yet.".into(), note },
+        None => Overlay::Pair {
+            qr: None,
+            url: "No network address yet.".into(),
+            note,
+        },
     }
 }
 
@@ -856,9 +1200,10 @@ fn pair_done(app: &App, u: &mut Ui, again: bool) {
     });
 }
 
-
 fn confirm_done(app: &App, u: &mut Ui, yes: bool) {
-    let Overlay::Confirm(purpose) = std::mem::take(&mut u.overlay) else { return };
+    let Overlay::Confirm(purpose) = std::mem::take(&mut u.overlay) else {
+        return;
+    };
     if !yes {
         return;
     }
@@ -885,13 +1230,25 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// An `update_check` answer -> (row value, the version to offer when there is a newer one).
 fn update_outcome(res: &Value) -> (String, Option<String>) {
-    let text = |k: &str| res.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = |k: &str| {
+        res.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let latest = text("latest");
     if res.get("available").and_then(|v| v.as_bool()) == Some(true) && !latest.is_empty() {
         (format!("PiFin {latest} available"), Some(latest))
     } else {
         let current = text("current");
-        (if current.is_empty() { "Up to date".into() } else { format!("Up to date ({current})") }, None)
+        (
+            if current.is_empty() {
+                "Up to date".into()
+            } else {
+                format!("Up to date ({current})")
+            },
+            None,
+        )
     }
 }
 
@@ -900,19 +1257,25 @@ fn check_update(app: &App, u: &mut Ui) {
         return;
     }
     u.update = "Checking…".into();
-    send(app, "update_check", json!({}), UPDATE_TIMEOUT, |app, u, res| match res {
-        Ok(v) => {
-            let (label, offer) = update_outcome(&v);
-            u.update = label;
-            if let Some(latest) = offer {
-                open_overlay(app, u, Overlay::Confirm(ConfirmFor::Update(latest)));
+    send(
+        app,
+        "update_check",
+        json!({}),
+        UPDATE_TIMEOUT,
+        |app, u, res| match res {
+            Ok(v) => {
+                let (label, offer) = update_outcome(&v);
+                u.update = label;
+                if let Some(latest) = offer {
+                    open_overlay(app, u, Overlay::Confirm(ConfirmFor::Update(latest)));
+                }
             }
-        }
-        Err(e) => {
-            u.update.clear();
-            u.message = error_text(&e);
-        }
-    });
+            Err(e) => {
+                u.update.clear();
+                u.message = error_text(&e);
+            }
+        },
+    );
 }
 
 fn install_update(app: &App, u: &mut Ui, version: String) {
@@ -963,7 +1326,12 @@ fn open_at(app: &App, section: usize) {
 
 /// Register the Settings callbacks (the gear's `open-settings` is wired by main) and the
 /// Wi-Fi setup screen's OK. `server_probe` measures the Jellyfin server for Test connection.
-pub fn install(app: &App, server_probe: net::Probe, client: std::sync::Arc<crate::jellyfin::Client>, user: String) {
+pub fn install(
+    app: &App,
+    server_probe: net::Probe,
+    client: std::sync::Arc<crate::jellyfin::Client>,
+    user: String,
+) {
     UI.with(|cell| {
         let mut u = cell.borrow_mut();
         u.net.probe = Some(server_probe);
@@ -1012,7 +1380,9 @@ pub fn install(app: &App, server_probe: net::Probe, client: std::sync::Arc<crate
         let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
         app.set_settings_row(next_row(&kinds, app.get_settings_row(), dir));
     }));
-    let step_cb = on(app, |app, u, (key, delta): (SharedString, i32)| step(app, u, &key, delta));
+    let step_cb = on(app, |app, u, (key, delta): (SharedString, i32)| {
+        step(app, u, &key, delta)
+    });
     app.on_settings_step(move |key, delta| step_cb((key, delta)));
     app.on_settings_activate(on(app, |app, u, key: SharedString| activate(app, u, &key)));
     app.on_picker_move(on(app, |_, u, delta: i32| {
@@ -1036,9 +1406,15 @@ mod tests {
 
     #[test]
     fn restart_hides_a_dropped_connection_only() {
-        let gone = DaemonError { code: "unreachable".into(), message: "Settings service not reachable (no answer).".into() };
+        let gone = DaemonError {
+            code: "unreachable".into(),
+            message: "Settings service not reachable (no answer).".into(),
+        };
         assert_eq!(restart_error_text(&gone), None);
-        let wrong = DaemonError { code: "pin_wrong".into(), message: "Wrong PIN.".into() };
+        let wrong = DaemonError {
+            code: "pin_wrong".into(),
+            message: "Wrong PIN.".into(),
+        };
         assert_eq!(restart_error_text(&wrong), Some("!Wrong PIN.".into()));
     }
 
@@ -1076,18 +1452,41 @@ mod tests {
         let mut s = Settings::default();
         s.system.pin_set = pin_set;
         let status = Status {
-            tailscale: Tailscale { state: "connected".into(), name: Some("pifin".into()), ip: Some("192.0.2.10".into()) },
-            macs: Macs { builtin: Some("aa".into()), usb: Some("bb".into()) },
+            tailscale: Tailscale {
+                state: "connected".into(),
+                name: Some("pifin".into()),
+                ip: Some("192.0.2.10".into()),
+            },
+            macs: Macs {
+                builtin: Some("aa".into()),
+                usb: Some("bb".into()),
+            },
             ..Default::default()
         };
-        build_rows(SYSTEM, &View { settings: &s, pending: &HashMap::new(), status: &status, restart_offered: false, net: &net::NetState::default(), lang: &lang::LangState::default(), update: "" })
+        build_rows(
+            SYSTEM,
+            &View {
+                settings: &s,
+                pending: &HashMap::new(),
+                status: &status,
+                restart_offered: false,
+                net: &net::NetState::default(),
+                lang: &lang::LangState::default(),
+                update: "",
+            },
+        )
     }
 
     #[test]
     fn update_check_offers_only_a_newer_release() {
-        let (label, offer) = update_outcome(&json!({"current": "0.2.0", "latest": "0.3.0", "available": true}));
-        assert_eq!((label.as_str(), offer.as_deref()), ("PiFin 0.3.0 available", Some("0.3.0")));
-        let (label, offer) = update_outcome(&json!({"current": "0.3.0", "latest": "0.3.0", "available": false}));
+        let (label, offer) =
+            update_outcome(&json!({"current": "0.2.0", "latest": "0.3.0", "available": true}));
+        assert_eq!(
+            (label.as_str(), offer.as_deref()),
+            ("PiFin 0.3.0 available", Some("0.3.0"))
+        );
+        let (label, offer) =
+            update_outcome(&json!({"current": "0.3.0", "latest": "0.3.0", "available": false}));
         assert_eq!((label.as_str(), offer), ("Up to date (0.3.0)", None));
         // "available" without a version to name is not offered
         assert_eq!(update_outcome(&json!({"available": true})).1, None);
@@ -1096,13 +1495,18 @@ mod tests {
     #[test]
     fn system_has_a_check_for_updates_row() {
         let rows = system_rows(false);
-        assert!(rows.iter().any(|r| r.key == "system.update" && r.kind == "action" && !r.locked));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "system.update" && r.kind == "action" && !r.locked));
     }
 
     #[test]
     fn pair_panel_follows_the_token_file_after_a_reset() {
         let path = std::env::temp_dir().join(format!("pifin-pair-{}", std::process::id()));
-        let (a, b) = ("0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+        let (a, b) = (
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        );
         std::fs::write(&path, format!("{a}\n")).unwrap();
         let (qr, url) = pair_texts("192.0.2.7", settings::read_pair_token(&path).as_deref());
         assert_eq!(qr, format!("http://192.0.2.7:8080/pair?t={a}"));
@@ -1115,10 +1519,15 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-
     #[test]
     fn a_pin_locks_every_sensitive_row_and_only_those() {
-        let sensitive = ["system.jellyfin_url", "system.tailscale", "secrets.hotspot_pass", "system.pin", "system.factory"];
+        let sensitive = [
+            "system.jellyfin_url",
+            "system.tailscale",
+            "secrets.hotspot_pass",
+            "system.pin",
+            "system.factory",
+        ];
         let rows = system_rows(true);
         for r in &rows {
             assert_eq!(r.locked, sensitive.contains(&r.key.as_str()), "{}", r.key);
@@ -1127,7 +1536,13 @@ mod tests {
         assert!(system_rows(false).iter().all(|r| !r.locked));
         // optional rows show only with a value
         assert!(rows.iter().any(|r| r.key == "system.ts_ip"));
-        assert_eq!(rows.iter().find(|r| r.key == "system.tailscale").unwrap().value, "Connected as pifin");
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.key == "system.tailscale")
+                .unwrap()
+                .value,
+            "Connected as pifin"
+        );
     }
 
     #[test]
@@ -1145,7 +1560,10 @@ mod tests {
         assert_eq!(value_label("playback.max_bitrate", 6_000_000.0), "6 Mbit/s");
         assert_eq!(value_label("playback.max_height", 2160.0), "4K");
         assert_eq!(value_label("playback.max_height", 1080.0), "1080p");
-        assert_eq!(value_label("display.subtitle_scale", 0.8f32 as f64), "Small");
+        assert_eq!(
+            value_label("display.subtitle_scale", 0.8f32 as f64),
+            "Small"
+        );
     }
 
     #[test]

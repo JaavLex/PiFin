@@ -42,7 +42,12 @@ pub struct Playback {
 // Not derived: a partial file must fall back to 1080p / prefer original, not to zeros.
 impl Default for Playback {
     fn default() -> Self {
-        Playback { max_bitrate: 0, max_height: 1080, hdr: false, prefer_original: true }
+        Playback {
+            max_bitrate: 0,
+            max_height: 1080,
+            hdr: false,
+            prefer_original: true,
+        }
     }
 }
 
@@ -66,7 +71,11 @@ pub struct Display {
 
 impl Default for Display {
     fn default() -> Self {
-        Display { output_max_height: 1080, subtitle_scale: 1.0, audio_passthrough: false }
+        Display {
+            output_max_height: 1080,
+            subtitle_scale: 1.0,
+            audio_passthrough: false,
+        }
     }
 }
 
@@ -100,7 +109,9 @@ pub fn current() -> Arc<Settings> {
 
 fn load_cached(cache: &Mutex<Cache>, path: &str) -> Arc<Settings> {
     // mtime plus length: two writes within the timestamp granularity rarely keep both
-    let mtime = std::fs::metadata(path).and_then(|m| Ok((m.modified()?, m.len()))).ok();
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| Ok((m.modified()?, m.len())))
+        .ok();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((seen, value)) = guard.as_ref() {
         if *seen == mtime {
@@ -109,7 +120,10 @@ fn load_cached(cache: &Mutex<Cache>, path: &str) -> Arc<Settings> {
     }
     let fresh = match mtime {
         None => Arc::new(Settings::default()),
-        Some(_) => match std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok()) {
+        Some(_) => match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        {
             Some(s) => Arc::new(s),
             None => guard.as_ref().map(|(_, v)| v.clone()).unwrap_or_default(),
         },
@@ -134,10 +148,18 @@ pub fn current_ssid() -> Option<String> {
 pub fn effective(s: &Settings, ssid: Option<&str>) -> Playback {
     let mut p = s.playback.clone();
     if let Some(n) = ssid.and_then(|id| s.networks.get(id)) {
-        if let Some(v) = n.max_bitrate { p.max_bitrate = v; }
-        if let Some(v) = n.max_height { p.max_height = v; }
-        if let Some(v) = n.hdr { p.hdr = v; }
-        if let Some(v) = n.prefer_original { p.prefer_original = v; }
+        if let Some(v) = n.max_bitrate {
+            p.max_bitrate = v;
+        }
+        if let Some(v) = n.max_height {
+            p.max_height = v;
+        }
+        if let Some(v) = n.hdr {
+            p.hdr = v;
+        }
+        if let Some(v) = n.prefer_original {
+            p.prefer_original = v;
+        }
     }
     p
 }
@@ -161,16 +183,28 @@ pub struct DaemonError {
 }
 
 fn unreachable_err(what: &str) -> DaemonError {
-    DaemonError { code: "unreachable".into(), message: format!("Settings service not reachable ({what}).") }
+    DaemonError {
+        code: "unreachable".into(),
+        message: format!("Settings service not reachable ({what})."),
+    }
 }
 
 /// One request to the settings daemon: `{"op": op, ..args}` out, the `result` back.
 /// Timeouts callers use: 5 s; `wifi_scan` 20 s; `tailscale_login` 40 s.
-pub fn request(op: &str, args: serde_json::Value, timeout: Duration) -> Result<serde_json::Value, DaemonError> {
+pub fn request(
+    op: &str,
+    args: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, DaemonError> {
     request_at(&paths().sock, op, args, timeout)
 }
 
-fn request_at(sock: &str, op: &str, args: serde_json::Value, timeout: Duration) -> Result<serde_json::Value, DaemonError> {
+fn request_at(
+    sock: &str,
+    op: &str,
+    args: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, DaemonError> {
     let mut obj = match args {
         serde_json::Value::Object(m) => m,
         _ => serde_json::Map::new(),
@@ -179,15 +213,31 @@ fn request_at(sock: &str, op: &str, args: serde_json::Value, timeout: Duration) 
     let mut s = UnixStream::connect(sock).map_err(|e| unreachable_err(&e.kind().to_string()))?;
     s.set_read_timeout(Some(timeout)).ok();
     s.set_write_timeout(Some(timeout)).ok();
-    s.write_all(format!("{}\n", serde_json::Value::Object(obj)).as_bytes()).map_err(|e| unreachable_err(&e.kind().to_string()))?;
+    s.write_all(format!("{}\n", serde_json::Value::Object(obj)).as_bytes())
+        .map_err(|e| unreachable_err(&e.kind().to_string()))?;
     let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).map_err(|e| unreachable_err(&e.kind().to_string()))?;
-    let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| unreachable_err("no answer"))?;
+    BufReader::new(s)
+        .read_line(&mut line)
+        .map_err(|e| unreachable_err(&e.kind().to_string()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&line).map_err(|_| unreachable_err("no answer"))?;
     if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
         return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
     }
-    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
-    Err(DaemonError { code: if text("error").is_empty() { "failed".into() } else { text("error") }, message: text("message") })
+    let text = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Err(DaemonError {
+        code: if text("error").is_empty() {
+            "failed".into()
+        } else {
+            text("error")
+        },
+        message: text("message"),
+    })
 }
 
 #[cfg(test)]
@@ -202,7 +252,8 @@ mod tests {
       "system":   {"jellyfin_url": "http://host:8096", "hotspot_ssid": "PiFin-setup", "pin_set": false}}"#;
 
     fn tmp(name: &str) -> String {
-        let d = std::env::temp_dir().join(format!("pifin-settings-test-{}-{name}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("pifin-settings-test-{}-{name}", std::process::id()));
         d.to_string_lossy().into_owned()
     }
 
@@ -211,9 +262,19 @@ mod tests {
         let mut s = Settings::default();
         s.playback.max_bitrate = 20_000_000;
         s.playback.max_height = 2160;
-        s.networks.insert("Hotel".into(), NetLimits { max_bitrate: Some(6_000_000), prefer_original: Some(false), ..Default::default() });
+        s.networks.insert(
+            "Hotel".into(),
+            NetLimits {
+                max_bitrate: Some(6_000_000),
+                prefer_original: Some(false),
+                ..Default::default()
+            },
+        );
         let p = effective(&s, Some("Hotel"));
-        assert_eq!((p.max_bitrate, p.max_height, p.hdr, p.prefer_original), (6_000_000, 2160, false, false));
+        assert_eq!(
+            (p.max_bitrate, p.max_height, p.hdr, p.prefer_original),
+            (6_000_000, 2160, false, false)
+        );
         let p = effective(&s, Some("Elsewhere"));
         assert_eq!((p.max_bitrate, p.prefer_original), (20_000_000, true));
         assert_eq!(effective(&s, None).max_bitrate, 20_000_000);
@@ -228,7 +289,10 @@ mod tests {
         let missing = tmp("missing");
         let d = load_cached(&Mutex::new(None), &missing);
         assert!(d.playback.prefer_original);
-        assert_eq!((d.playback.max_height, d.display.output_max_height), (1080, 1080));
+        assert_eq!(
+            (d.playback.max_height, d.display.output_max_height),
+            (1080, 1080)
+        );
         // a partial file keeps the other defaults
         let p: Settings = serde_json::from_str(r#"{"playback": {"max_bitrate": 5}}"#).unwrap();
         assert!(p.playback.prefer_original && p.playback.max_height == 1080);
@@ -239,7 +303,10 @@ mod tests {
         let path = tmp("reload");
         let cache = Mutex::new(None);
         std::fs::write(&path, SPEC_EXAMPLE).unwrap();
-        assert_eq!(load_cached(&cache, &path).system.hotspot_ssid, "PiFin-setup");
+        assert_eq!(
+            load_cached(&cache, &path).system.hotspot_ssid,
+            "PiFin-setup"
+        );
         // new content with a different mtime is picked up
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&path, SPEC_EXAMPLE.replace("PiFin-setup", "Other")).unwrap();
@@ -257,7 +324,9 @@ mod tests {
         let h = std::thread::spawn(move || {
             let (mut c, _) = l.accept().unwrap();
             let mut line = String::new();
-            BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+            BufReader::new(c.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
             c.write_all(reply.as_bytes()).unwrap();
             line
         });
@@ -271,11 +340,20 @@ mod tests {
         let r = request_at(&sock, "get", serde_json::json!({"x": 2}), t).unwrap();
         assert_eq!(r["n"], 1);
         let sent: serde_json::Value = serde_json::from_str(&h.join().unwrap()).unwrap();
-        assert_eq!((sent["op"].as_str(), sent["x"].as_i64()), (Some("get"), Some(2)));
+        assert_eq!(
+            (sent["op"].as_str(), sent["x"].as_i64()),
+            (Some("get"), Some(2))
+        );
 
-        let (sock, h) = serve("err", "{\"ok\": false, \"error\": \"pin_wrong\", \"message\": \"Wrong PIN.\"}\n");
+        let (sock, h) = serve(
+            "err",
+            "{\"ok\": false, \"error\": \"pin_wrong\", \"message\": \"Wrong PIN.\"}\n",
+        );
         let e = request_at(&sock, "set", serde_json::json!({}), t).unwrap_err();
-        assert_eq!((e.code.as_str(), e.message.as_str()), ("pin_wrong", "Wrong PIN."));
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("pin_wrong", "Wrong PIN.")
+        );
         h.join().unwrap();
 
         let e = request_at(&tmp("nobody-listens"), "get", serde_json::json!({}), t).unwrap_err();
@@ -287,7 +365,10 @@ mod tests {
         let path = tmp("token");
         std::env::set_var("PIFIN_PAIR_TOKEN", &path);
         std::fs::write(&path, "0123456789abcdef0123456789ABCDEF\n").unwrap();
-        assert_eq!(pair_token().as_deref(), Some("0123456789abcdef0123456789ABCDEF"));
+        assert_eq!(
+            pair_token().as_deref(),
+            Some("0123456789abcdef0123456789ABCDEF")
+        );
         std::fs::write(&path, "xyz").unwrap();
         assert_eq!(pair_token(), None);
         std::fs::remove_file(&path).ok();

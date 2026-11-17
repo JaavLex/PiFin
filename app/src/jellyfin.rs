@@ -97,11 +97,17 @@ impl Item {
     pub fn subtitle(&self) -> String {
         match (self.parent_index_number, self.index_number) {
             (Some(s), Some(e)) if self.kind == "Episode" => format!("S{s}:E{e} · {}", self.name),
-            _ => self.production_year.map(|y| y.to_string()).unwrap_or_default(),
+            _ => self
+                .production_year
+                .map(|y| y.to_string())
+                .unwrap_or_default(),
         }
     }
     pub fn title(&self) -> &str {
-        self.series_name.as_deref().filter(|_| self.kind == "Episode").unwrap_or(&self.name)
+        self.series_name
+            .as_deref()
+            .filter(|_| self.kind == "Episode")
+            .unwrap_or(&self.name)
     }
 }
 
@@ -136,21 +142,36 @@ struct PbInfo {
 fn parse_playback_defaults(json: &str) -> Result<(Option<i32>, Option<i32>), String> {
     let p: PbInfo = serde_json::from_str(json).map_err(|e| format!("bad PlaybackInfo: {e}"))?;
     Ok(p.media_sources.first().map_or((None, None), |s| {
-        (s.default_audio_stream_index.filter(|i| *i >= 0), s.default_subtitle_stream_index.filter(|i| *i >= 0))
+        (
+            s.default_audio_stream_index.filter(|i| *i >= 0),
+            s.default_subtitle_stream_index.filter(|i| *i >= 0),
+        )
     }))
 }
 
 /// Read the three language keys out of a user's Configuration.
 pub(crate) fn lang_prefs_of(cfg: &serde_json::Value) -> LangPrefs {
-    let s = |k: &str| cfg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    LangPrefs { audio: s("AudioLanguagePreference"), subtitle: s("SubtitleLanguagePreference"), mode: s("SubtitleMode") }
+    let s = |k: &str| {
+        cfg.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    LangPrefs {
+        audio: s("AudioLanguagePreference"),
+        subtitle: s("SubtitleLanguagePreference"),
+        mode: s("SubtitleMode"),
+    }
 }
 
 /// Write the three language keys into a Configuration.
 fn with_lang_prefs(mut cfg: serde_json::Value, p: &LangPrefs) -> serde_json::Value {
     if let Some(o) = cfg.as_object_mut() {
         o.insert("AudioLanguagePreference".into(), p.audio.clone().into());
-        o.insert("SubtitleLanguagePreference".into(), p.subtitle.clone().into());
+        o.insert(
+            "SubtitleLanguagePreference".into(),
+            p.subtitle.clone().into(),
+        );
         o.insert("SubtitleMode".into(), p.mode.clone().into());
     }
     cfg
@@ -160,7 +181,12 @@ fn with_lang_prefs(mut cfg: serde_json::Value, p: &LangPrefs) -> serde_json::Val
 fn parse_cultures(v: &[serde_json::Value]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for c in v {
-        let (Some(code), Some(name)) = (c.get("ThreeLetterISOLanguageName").and_then(|x| x.as_str()), c.get("DisplayName").and_then(|x| x.as_str())) else { continue };
+        let (Some(code), Some(name)) = (
+            c.get("ThreeLetterISOLanguageName").and_then(|x| x.as_str()),
+            c.get("DisplayName").and_then(|x| x.as_str()),
+        ) else {
+            continue;
+        };
         if !code.is_empty() && !out.iter().any(|(k, _)| k == code) {
             out.push((code.to_string(), name.to_string()));
         }
@@ -176,9 +202,20 @@ mod tests {
     #[test]
     fn playback_defaults_minus_one_and_missing_mean_none() {
         let p = |s: &str| parse_playback_defaults(s).unwrap();
-        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":-1}]}"#), (Some(1), None));
-        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":2}]}"#), (Some(2), None));
-        assert_eq!(p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":3}]}"#), (Some(1), Some(3)));
+        assert_eq!(
+            p(
+                r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":-1}]}"#
+            ),
+            (Some(1), None)
+        );
+        assert_eq!(
+            p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":2}]}"#),
+            (Some(2), None)
+        );
+        assert_eq!(
+            p(r#"{"MediaSources":[{"DefaultAudioStreamIndex":1,"DefaultSubtitleStreamIndex":3}]}"#),
+            (Some(1), Some(3))
+        );
         assert_eq!(p(r#"{"MediaSources":[]}"#), (None, None));
     }
 
@@ -189,15 +226,35 @@ mod tests {
                 {"DisplayName":"French (Canada)","ThreeLetterISOLanguageName":"fre"},{"DisplayName":"None","ThreeLetterISOLanguageName":""}]"#,
         )
         .unwrap();
-        assert_eq!(parse_cultures(&v), vec![("eng".to_string(), "English".to_string()), ("fre".to_string(), "French".to_string())]);
+        assert_eq!(
+            parse_cultures(&v),
+            vec![
+                ("eng".to_string(), "English".to_string()),
+                ("fre".to_string(), "French".to_string())
+            ]
+        );
     }
 
     #[test]
     fn saving_keeps_the_rest_of_the_configuration() {
-        let cfg = serde_json::json!({ "PlayDefaultAudioTrack": true, "AudioLanguagePreference": null });
-        let out = with_lang_prefs(cfg, &LangPrefs { audio: "fre".into(), subtitle: "".into(), mode: "Smart".into() });
+        let cfg =
+            serde_json::json!({ "PlayDefaultAudioTrack": true, "AudioLanguagePreference": null });
+        let out = with_lang_prefs(
+            cfg,
+            &LangPrefs {
+                audio: "fre".into(),
+                subtitle: "".into(),
+                mode: "Smart".into(),
+            },
+        );
         assert_eq!(out["PlayDefaultAudioTrack"], true);
-        assert_eq!((out["AudioLanguagePreference"].as_str(), out["SubtitleMode"].as_str()), (Some("fre"), Some("Smart")));
+        assert_eq!(
+            (
+                out["AudioLanguagePreference"].as_str(),
+                out["SubtitleMode"].as_str()
+            ),
+            (Some("fre"), Some("Smart"))
+        );
     }
 }
 
@@ -267,17 +324,27 @@ impl Client {
     /// Throughput from the server in bit/s, measured on Jellyfin's bitrate test (see
     /// `measure`). Used when Play is pressed.
     pub fn link_rate(&self) -> Option<u64> {
-        let url = format!("{}/Playback/BitrateTest?size=4000000", self.auth.server.trim_end_matches('/'));
+        let url = format!(
+            "{}/Playback/BitrateTest?size=4000000",
+            self.auth.server.trim_end_matches('/')
+        );
         measure(&url, Some(&self.header()), 2.0)
     }
 
     /// The same measurement on a larger test file, for Settings > Network > Test connection.
     pub fn server_test(&self) -> Option<u64> {
-        let url = format!("{}/Playback/BitrateTest?size=10000000", self.auth.server.trim_end_matches('/'));
+        let url = format!(
+            "{}/Playback/BitrateTest?size=10000000",
+            self.auth.server.trim_end_matches('/')
+        );
         measure(&url, Some(&self.header()), 2.0)
     }
 
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, String> {
+    fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, String> {
         let url = format!("{}{}", self.auth.server.trim_end_matches('/'), path);
         let mut req = self.agent.get(&url).header("Authorization", &self.header());
         for (k, v) in query {
@@ -302,35 +369,66 @@ impl Client {
     }
 
     /// Playback reporting (keeps Continue Watching and "now playing" right).
-    pub fn report(&self, kind: &str, item_id: &str, pos_ticks: i64, paused: bool, session: Option<&str>) -> Result<(), String> {
+    pub fn report(
+        &self,
+        kind: &str,
+        item_id: &str,
+        pos_ticks: i64,
+        paused: bool,
+        session: Option<&str>,
+    ) -> Result<(), String> {
         let path = match kind {
             "start" => "/Sessions/Playing",
             "stop" => "/Sessions/Playing/Stopped",
             _ => "/Sessions/Playing/Progress",
         };
-        self.post(path, &serde_json::json!({
-            "ItemId": item_id, "MediaSourceId": item_id, "PositionTicks": pos_ticks,
-            "IsPaused": paused, "CanSeek": true,
-            "PlayMethod": if session.is_some() { "Transcode" } else { "DirectPlay" },
-            "PlaySessionId": session,
-        }))
+        self.post(
+            path,
+            &serde_json::json!({
+                "ItemId": item_id, "MediaSourceId": item_id, "PositionTicks": pos_ticks,
+                "IsPaused": paused, "CanSeek": true,
+                "PlayMethod": if session.is_some() { "Transcode" } else { "DirectPlay" },
+                "PlaySessionId": session,
+            }),
+        )
     }
 
     /// Stop the server-side conversion of a transcoded playback.
     pub fn stop_transcode(&self, session: &str) {
-        let url = format!("{}/Videos/ActiveEncodings?DeviceId={}&PlaySessionId={session}",
-            self.auth.server.trim_end_matches('/'), self.auth.device_id);
-        let _ = self.agent.delete(&url).header("Authorization", &self.header()).call();
+        let url = format!(
+            "{}/Videos/ActiveEncodings?DeviceId={}&PlaySessionId={session}",
+            self.auth.server.trim_end_matches('/'),
+            self.auth.device_id
+        );
+        let _ = self
+            .agent
+            .delete(&url)
+            .header("Authorization", &self.header())
+            .call();
     }
 
     /// Store the resume position, or mark watched past 90 %.
-    pub fn save_position(&self, item_id: &str, pos_ticks: i64, run_ticks: i64) -> Result<(), String> {
+    pub fn save_position(
+        &self,
+        item_id: &str,
+        pos_ticks: i64,
+        run_ticks: i64,
+    ) -> Result<(), String> {
         let uid = &self.auth.user_id;
         if run_ticks > 0 && pos_ticks > run_ticks * 9 / 10 {
-            self.post(&format!("/UserPlayedItems/{item_id}?userId={uid}"), &serde_json::json!({}))?;
-            self.post(&format!("/UserItems/{item_id}/UserData?userId={uid}"), &serde_json::json!({"PlaybackPositionTicks": 0}))
+            self.post(
+                &format!("/UserPlayedItems/{item_id}?userId={uid}"),
+                &serde_json::json!({}),
+            )?;
+            self.post(
+                &format!("/UserItems/{item_id}/UserData?userId={uid}"),
+                &serde_json::json!({"PlaybackPositionTicks": 0}),
+            )
         } else {
-            self.post(&format!("/UserItems/{item_id}/UserData?userId={uid}"), &serde_json::json!({"PlaybackPositionTicks": pos_ticks}))
+            self.post(
+                &format!("/UserItems/{item_id}/UserData?userId={uid}"),
+                &serde_json::json!({"PlaybackPositionTicks": pos_ticks}),
+            )
         }
     }
 
@@ -341,13 +439,19 @@ impl Client {
     /// The user's language preferences, and the whole Configuration they came from.
     pub fn lang_prefs(&self) -> Result<(LangPrefs, serde_json::Value), String> {
         let me: serde_json::Value = self.get("/Users/Me", &[])?;
-        let cfg = me.get("Configuration").cloned().ok_or("no Configuration in /Users/Me")?;
+        let cfg = me
+            .get("Configuration")
+            .cloned()
+            .ok_or("no Configuration in /Users/Me")?;
         Ok((lang_prefs_of(&cfg), cfg))
     }
 
     /// Save the three language keys inside the full Configuration (the server replaces it whole).
     pub fn set_lang_prefs(&self, cfg: serde_json::Value, p: &LangPrefs) -> Result<(), String> {
-        self.post(&format!("/Users/Configuration?userId={}", self.auth.user_id), &with_lang_prefs(cfg, p))
+        self.post(
+            &format!("/Users/Configuration?userId={}", self.auth.user_id),
+            &with_lang_prefs(cfg, p),
+        )
     }
 
     /// Languages the server knows: (3-letter code, display name), by name, no duplicates.
@@ -358,25 +462,48 @@ impl Client {
 
     /// The server's default (audio, subtitle) stream indexes for this user and item.
     pub fn playback_defaults(&self, item_id: &str) -> Result<(Option<i32>, Option<i32>), String> {
-        let v: serde_json::Value = self.get(&format!("/Items/{item_id}/PlaybackInfo"), &[("userId", &self.auth.user_id)])?;
+        let v: serde_json::Value = self.get(
+            &format!("/Items/{item_id}/PlaybackInfo"),
+            &[("userId", &self.auth.user_id)],
+        )?;
         parse_playback_defaults(&v.to_string())
     }
 
     /// A TV library's shows, most recently updated first.
     pub fn shows(&self, parent_id: &str) -> Result<Vec<Item>, String> {
         let p = format!("/Users/{}/Items", self.auth.user_id);
-        let r: Items = self.get(&p, &[("ParentId", parent_id), ("Recursive", "true"), ("IncludeItemTypes", "Series"),
-            ("SortBy", "DateLastContentAdded,SortName"), ("SortOrder", "Descending"), ("Limit", "40"), ("Fields", CARD_FIELDS)])?;
+        let r: Items = self.get(
+            &p,
+            &[
+                ("ParentId", parent_id),
+                ("Recursive", "true"),
+                ("IncludeItemTypes", "Series"),
+                ("SortBy", "DateLastContentAdded,SortName"),
+                ("SortOrder", "Descending"),
+                ("Limit", "40"),
+                ("Fields", CARD_FIELDS),
+            ],
+        )?;
         Ok(r.items)
     }
 
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>, String> {
-        let r: Items = self.get(&format!("/Shows/{series_id}/Seasons"), &[("UserId", &self.auth.user_id)])?;
+        let r: Items = self.get(
+            &format!("/Shows/{series_id}/Seasons"),
+            &[("UserId", &self.auth.user_id)],
+        )?;
         Ok(r.items)
     }
 
     pub fn episodes(&self, series_id: &str, season_id: &str) -> Result<Vec<Item>, String> {
-        let r: Items = self.get(&format!("/Shows/{series_id}/Episodes"), &[("UserId", &self.auth.user_id), ("SeasonId", season_id), ("Fields", "Overview,PrimaryImageAspectRatio")])?;
+        let r: Items = self.get(
+            &format!("/Shows/{series_id}/Episodes"),
+            &[
+                ("UserId", &self.auth.user_id),
+                ("SeasonId", season_id),
+                ("Fields", "Overview,PrimaryImageAspectRatio"),
+            ],
+        )?;
         Ok(r.items)
     }
 
@@ -413,21 +540,49 @@ impl Client {
         }
         let me: Me = self.get("/Users/Me", &[])?;
         let avatar = me.primary_image_tag.and_then(|_| {
-            let url = format!("{}/Users/{}/Images/Primary?maxWidth={avatar_w}&quality=90", self.auth.server.trim_end_matches('/'), self.auth.user_id);
-            let mut r = self.agent.get(&url).header("Authorization", &self.header()).call().ok()?;
-            r.body_mut().with_config().limit(4 * 1024 * 1024).read_to_vec().ok()
+            let url = format!(
+                "{}/Users/{}/Images/Primary?maxWidth={avatar_w}&quality=90",
+                self.auth.server.trim_end_matches('/'),
+                self.auth.user_id
+            );
+            let mut r = self
+                .agent
+                .get(&url)
+                .header("Authorization", &self.header())
+                .call()
+                .ok()?;
+            r.body_mut()
+                .with_config()
+                .limit(4 * 1024 * 1024)
+                .read_to_vec()
+                .ok()
         });
         Ok((me.name, avatar))
     }
 
     pub fn resume(&self) -> Result<Vec<Item>, String> {
         let p = format!("/Users/{}/Items/Resume", self.auth.user_id);
-        let r: Items = self.get(&p, &[("Limit", "12"), ("Fields", CARD_FIELDS), ("MediaTypes", "Video"), ("EnableImageTypes", "Primary,Backdrop,Thumb")])?;
+        let r: Items = self.get(
+            &p,
+            &[
+                ("Limit", "12"),
+                ("Fields", CARD_FIELDS),
+                ("MediaTypes", "Video"),
+                ("EnableImageTypes", "Primary,Backdrop,Thumb"),
+            ],
+        )?;
         Ok(r.items)
     }
 
     pub fn next_up(&self) -> Result<Vec<Item>, String> {
-        let r: Items = self.get("/Shows/NextUp", &[("UserId", &self.auth.user_id), ("Limit", "12"), ("Fields", CARD_FIELDS)])?;
+        let r: Items = self.get(
+            "/Shows/NextUp",
+            &[
+                ("UserId", &self.auth.user_id),
+                ("Limit", "12"),
+                ("Fields", CARD_FIELDS),
+            ],
+        )?;
         Ok(r.items)
     }
 
@@ -438,24 +593,31 @@ impl Client {
 
     pub fn latest(&self, parent_id: &str) -> Result<Vec<Item>, String> {
         let p = format!("/Users/{}/Items/Latest", self.auth.user_id);
-        self.get(&p, &[("ParentId", parent_id), ("Limit", "16"), ("Fields", CARD_FIELDS)])
+        self.get(
+            &p,
+            &[
+                ("ParentId", parent_id),
+                ("Limit", "16"),
+                ("Fields", CARD_FIELDS),
+            ],
+        )
     }
 
     pub fn search(&self, term: &str) -> Result<Vec<Item>, String> {
         let p = format!("/Users/{}/Items", self.auth.user_id);
-        let r: Items = self.get(&p, &[("SearchTerm", term), ("Recursive", "true"), ("IncludeItemTypes", "Movie,Series,Episode"), ("Limit", "24"), ("Fields", CARD_FIELDS)])?;
+        let r: Items = self.get(
+            &p,
+            &[
+                ("SearchTerm", term),
+                ("Recursive", "true"),
+                ("IncludeItemTypes", "Movie,Series,Episode"),
+                ("Limit", "24"),
+                ("Fields", CARD_FIELDS),
+            ],
+        )?;
         Ok(r.items)
     }
-
-    /// One page of a library, sorted by name.
-    pub fn library(&self, parent_id: &str, start: usize, limit: usize) -> Result<(Vec<Item>, i64), String> {
-        let p = format!("/Users/{}/Items", self.auth.user_id);
-        let (s, l) = (start.to_string(), limit.to_string());
-        let r: Items = self.get(&p, &[("ParentId", parent_id), ("Recursive", "true"), ("IncludeItemTypes", "Movie,Series"), ("SortBy", "SortName"), ("StartIndex", &s), ("Limit", &l), ("Fields", CARD_FIELDS)])?;
-        Ok((r.items, r.total_record_count))
-    }
 }
-
 
 /// Jellyfin Quick Connect: the TV shows a code, the user approves it from any
 /// signed-in Jellyfin app (Settings → Quick Connect). No password typing on a TV.
@@ -500,15 +662,27 @@ impl QuickConnect {
     }
 
     pub fn start(server: &str, device_id: &str) -> Result<Self, String> {
-        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .build()
+            .into();
         let server = server.trim_end_matches('/').to_string();
         let mut r = agent
             .post(&format!("{server}/QuickConnect/Initiate"))
             .header("Authorization", &Self::header(device_id))
             .send_empty()
             .map_err(|e| format!("Quick Connect: {e} (is it enabled on the server?)"))?;
-        let st: QcState = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
-        Ok(QuickConnect { agent, server, device_id: device_id.into(), code: st.code, secret: st.secret })
+        let st: QcState = r
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("Quick Connect: {e}"))?;
+        Ok(QuickConnect {
+            agent,
+            server,
+            device_id: device_id.into(),
+            code: st.code,
+            secret: st.secret,
+        })
     }
 
     /// Ok(Some((auth, user name))) once approved, Ok(None) while waiting.
@@ -519,18 +693,32 @@ impl QuickConnect {
             .query("Secret", &self.secret)
             .call()
             .map_err(|e| format!("Quick Connect: {e}"))?;
-        let st: QcState = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
+        let st: QcState = r
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("Quick Connect: {e}"))?;
         if !st.authenticated {
             return Ok(None);
         }
         let mut r = self
             .agent
-            .post(&format!("{}/Users/AuthenticateWithQuickConnect", self.server))
+            .post(&format!(
+                "{}/Users/AuthenticateWithQuickConnect",
+                self.server
+            ))
             .header("Authorization", &Self::header(&self.device_id))
             .send_json(serde_json::json!({ "Secret": self.secret }))
             .map_err(|e| format!("Quick Connect: {e}"))?;
-        let a: AuthResult = r.body_mut().read_json().map_err(|e| format!("Quick Connect: {e}"))?;
-        let auth = Auth { server: self.server.clone(), user_id: a.user.id, token: a.access_token, device_id: self.device_id.clone() };
+        let a: AuthResult = r
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("Quick Connect: {e}"))?;
+        let auth = Auth {
+            server: self.server.clone(),
+            user_id: a.user.id,
+            token: a.access_token,
+            device_id: self.device_id.clone(),
+        };
         Ok(Some((auth, a.user.name)))
     }
 }
