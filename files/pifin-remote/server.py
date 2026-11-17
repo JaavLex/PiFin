@@ -11,16 +11,20 @@ the PiFin app and the mpv it starts:
   * open / play     -> commands to the app's socket (/tmp/pifin-app.sock)
   * settings        -> the root settings daemon's socket (/run/pifin/settings.sock)
 Only paired phones get in: the TV's QR code opens /pair?t=<token>, which sets a
-cookie; every other page and /api/* call needs that cookie (D8).
+cookie; every other page and /api/* call needs that cookie.
 """
+import functools
 import hmac
+import http.client
 import http.cookies
+import ipaddress
 import json
 import os
 import pathlib
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +45,17 @@ SETTINGS_OPS = frozenset("get set network_set wifi_list wifi_scan wifi_add wifi_
                          "pin_clear pin_check tailscale_login reboot factory_reset update_check "
                          "update_install".split())
 STORE = os.environ.get("PIFIN_SETTINGS", "/var/lib/pifin/settings.json")
+# the only types /api/art passes on: anything else from the Jellyfin server (HTML, SVG
+# with scripts) would run on this origin, next to the pairing cookie
+ART_TYPES = frozenset(("image/jpeg", "image/png", "image/webp", "image/gif"))
+# sent with every reply (see Handler.end_headers); the pages use inline <script>/<style> and talk only to this origin
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+       "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+       "form-action 'self'")
+SECURITY_HEADERS = (("Content-Security-Policy", CSP), ("X-Content-Type-Options", "nosniff"),
+                    ("Referrer-Policy", "no-referrer"))
+MAX_CONNECTIONS = 32   # connections over this are refused at once (see RemoteServer)
+BUSY = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 5\r\n\r\n"
 SUB_MODES = frozenset(("Default", "Always", "OnlyForced", "None", "Smart"))
 FORBIDDEN = (b'<!doctype html><html lang="en"><head><meta charset="utf-8">'
              b'<meta name="viewport" content="width=device-width, initial-scale=1"><title>PiFin</title></head>'
@@ -201,6 +216,77 @@ def setup_needed():
         return False  # no store (yet) or unreadable: the remote, as before
 
 
+class AddressRefused(OSError):
+    pass
+
+
+def address_allowed(ip):
+    """May the server test connect here? Not to loopback (services on the Pi), link-local
+    (cloud metadata), unspecified or multicast. LAN and tailnet addresses are fine: Jellyfin
+    lives there."""
+    a = ipaddress.ip_address(ip.split("%", 1)[0])   # drop an IPv6 zone (fe80::1%eth0)
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return not (a.is_loopback or a.is_link_local or a.is_unspecified or a.is_multicast)
+
+
+def checked_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *a, **k):
+    """socket.create_connection that tries only the allowed addresses of a host, exactly the
+    ones it checked (no second lookup that could rebind to another address)."""
+    host, port = address
+    infos = [i for i in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM) if address_allowed(i[4][0])]
+    if not infos:
+        raise AddressRefused("address not allowed")
+    err = OSError("no address")
+    for family, kind, proto, _, sockaddr in infos:
+        s = socket.socket(family, kind, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                s.settimeout(timeout)
+            s.connect(sockaddr)
+            return s
+        except OSError as ex:
+            err = ex
+            s.close()
+    raise err
+
+
+class _Checked:
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._create_connection = checked_connection   # HTTPConnection sets it per instance
+
+
+class _CheckedHTTP(_Checked, http.client.HTTPConnection):
+    pass
+
+
+class _CheckedHTTPS(_Checked, http.client.HTTPSConnection):
+    pass
+
+
+class _CheckedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_CheckedHTTP, req)
+
+
+class _CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_CheckedHTTPS, req, context=self._context)
+
+
+@functools.cache
+def checked_opener():
+    """Built once and by hand, not with build_opener(): no proxy, file or ftp handler, so every hop
+    (redirects included) goes through checked_connection."""
+    opener = urllib.request.OpenerDirector()
+    for h in (_CheckedHTTPHandler(), _CheckedHTTPSHandler(), urllib.request.HTTPRedirectHandler(),
+              urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor(),
+              urllib.request.UnknownHandler()):
+        opener.add_handler(h)
+    return opener
+
+
 def server_test(url):
     """Can PiFin reach this Jellyfin server? Asked from the Pi, not the phone: only the Pi's
     network matters. Answers the server's name and version, nothing else."""
@@ -208,12 +294,18 @@ def server_test(url):
         return {"ok": False, "error": "invalid_value", "message": "The address must look like http://host:8096."}
     try:
         req = urllib.request.Request(url.rstrip("/") + "/System/Info/Public", headers={"User-Agent": "PiFin"})
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with checked_opener().open(req, timeout=6) as r:
             info = json.loads(r.read(64 * 1024))
         name, version = info.get("ServerName"), info.get("Version")
         if not isinstance(version, str):
             raise ValueError("not Jellyfin")
         return {"ok": True, "result": {"name": str(name or "")[:80], "version": version[:20]}}
+    except urllib.error.URLError as ex:
+        if isinstance(ex.reason, AddressRefused):
+            return {"ok": False, "error": "invalid_value",
+                    "message": "That address is the Pi itself or a local-only network. Use the server's LAN or tailnet address."}
+        return {"ok": False, "error": "failed",
+                "message": "No Jellyfin server answered at that address. Check it, or sign in to Tailscale first if the server is on your tailnet."}
     except Exception:
         return {"ok": False, "error": "failed",
                 "message": "No Jellyfin server answered at that address. Check it, or sign in to Tailscale first if the server is on your tailnet."}
@@ -262,7 +354,7 @@ def cultures():
 
 
 def langs():
-    """The active user's language keys (D7), read from their Jellyfin Configuration."""
+    """The active user's language keys, read from their Jellyfin Configuration."""
     me = api("/Users/Me")
     cfg = me.get("Configuration") or {}
     return {"ok": True, "user": me.get("Name", ""), "audio": cfg.get("AudioLanguagePreference") or "",
@@ -302,7 +394,9 @@ def search(text):
 def artwork(item_id):
     if not all(c.isalnum() or c == "-" for c in item_id):
         return None
-    return api(f"/Items/{item_id}/Images/Primary", {"maxWidth": "300", "quality": "80"}, raw=True)
+    body, ctype = api(f"/Items/{item_id}/Images/Primary", {"maxWidth": "300", "quality": "80"}, raw=True)
+    ctype = ctype.split(";", 1)[0].strip().lower()
+    return (body, ctype) if ctype in ART_TYPES else None
 
 
 # ------------------------------------------------------------- HTTP API ----
@@ -324,6 +418,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def end_headers(self):
+        # here rather than in reply(), so send_error's pages (400, 414, 501...) get them too
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+        super().end_headers()
 
     def json(self, obj, code=200):
         self.reply(code, json.dumps(obj).encode())
@@ -474,6 +574,38 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"ok": False, "error": str(ex)}, 500)
 
 
+class RemoteServer(ThreadingHTTPServer):
+    """One thread per connection, at most MAX_CONNECTIONS at once, so slow or idle clients
+    can't take every thread. A connection over the limit gets a 503 and is closed at once:
+    waiting for a slot would stall the accept loop."""
+    request_queue_size = 64   # let the accept loop see a burst (and refuse it) instead of the kernel
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.setblocking(False)   # a full send buffer must not stall the accept loop
+                request.send(BUSY)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()   # the thread never started
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 if __name__ == "__main__":
     threading.Thread(target=watch_phones, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    RemoteServer(("0.0.0.0", PORT), Handler).serve_forever()
