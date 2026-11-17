@@ -176,17 +176,101 @@ ready-made image (GitHub Actions runs it on each release, `.github/workflows/ima
 `build.py` writes the cloud-init files for the advanced path. `app/` is the TV app
 (Rust + Slint; releases ship a prebuilt aarch64 binary). `tools/` are development helpers.
 
+## How the parts talk
+
+```
+ phone browser --HTTP :8080--> pifin-remote (Python, PiFin user)
+                                  |  /tmp/pifin-app.sock      one-line commands (D-pad, search, ...)
+                                  |  /tmp/pifin-mpv.sock      mpv JSON IPC (seek, volume, tracks)
+                                  '- /run/pifin/settings.sock settings requests
+ pifin-app (Rust + Slint, under cage) --- /run/pifin/settings.sock ---> pifin-settingsd (root)
+        |  spawns mpv (hardware decoding, pifin-osd.lua overlay) and talks to it over its IPC socket
+        '- reads /run/pifin/wifi.json, written by pifin-comitup-callback when the Wi-Fi state changes
+```
+
+- **pifin-app** is the TV UI. It browses Jellyfin over HTTP and starts mpv for playback.
+- **pifin-remote** is the phone web page (`files/pifin-remote/`). It sends commands to the app
+  and to mpv, and forwards settings changes to the daemon.
+- **pifin-settingsd** is the only root process with a settings API. It owns
+  `/var/lib/pifin/settings.json`, Tailscale, the hotspot password and the updater, and checks
+  every request it gets on the socket.
+- **comitup** runs the setup hotspot; its callback writes the Wi-Fi state that the app shows.
+
+## Development
+
+You don't need a Pi for most work. The Python services and all their tests run on any Linux
+machine with Python 3 and, for one test, Node. The TV app builds and its unit tests
+run on x86_64 Linux.
+
+Build dependencies (Debian/Ubuntu, the same list the release workflow uses):
+
+```bash
+sudo apt-get install pkg-config libudev-dev libfontconfig1-dev libxkbcommon-dev libwayland-dev
+```
+
+Rust 1.92 or newer, from [rustup](https://rustup.rs) (the distro's rustc is too old):
+
+```bash
+cd app
+cargo build            # debug build; --release for the real thing
+cargo test
+cargo fmt --check && cargo clippy -- -D warnings
+```
+
+Other checks, from the repository root:
+
+```bash
+tools/selftest.sh               # builds a throwaway card with made-up values; no Pi, no secrets
+python3 tools/test_settingsd.py # also test_remote_pairing, test_portal, test_setup, test_updates
+node tools/test_wizard.mjs      # the phone wizard's logic
+tools/check-leaks.sh            # run after `git add`; no secrets, Wi-Fi names or IPs in the tree
+```
+
+`tools/selftest.sh` runs all of those test scripts, so it is the one to run before a push.
+
+What needs a Pi: playback (mpv with the Pi's hardware decoder), HDMI and display modes, CEC,
+Wi-Fi and the setup hotspot, the firewall. The app is a Wayland client meant to run under
+`cage` on the Pi; running it on a desktop has not been verified, so treat the TV UI as
+"builds and unit-tested on a PC, run on the Pi". For screenshots without your own library,
+`tools/demo-server.py` is a fake Jellyfin and `tools/shot-remote.mjs` renders the phone remote
+with mocked data.
+
+## PiFin and the alternatives
+
+There are good ways to watch Jellyfin on a TV. This table is about what each one is, not which
+is better; check each project for the current state.
+
+| | Native Jellyfin-style UI | Phone setup wizard | Phone remote | Flashable image | Open source |
+|---|---|---|---|---|---|
+| **PiFin** | yes | yes (Wi-Fi and server) | yes, web page | yes | yes (MIT) |
+| **LibreELEC + Kodi** with the Jellyfin or JellyCon add-on | no, Kodi's interface | no | Kodi remote apps | yes | yes |
+| **mpv-jellyfin** (mpv plugin) | no, mpv's own UI | no | no | no | yes |
+| **Jellyfin MPV Shim** | no, a cast target | no | any Jellyfin app casts to it | no | yes |
+| **JellyPi** | announced as a native player | announced | announced | not published | source not published (Nov 2026) |
+
+- **LibreELEC/Kodi** is mature and has a huge feature set (other sources, add-ons, PVR). Very
+  large libraries can load slowly through the add-ons. PiFin does far less, on purpose.
+- **mpv-jellyfin** is a minimal mpv plugin: lightweight, but no browsing UI, no setup help.
+- **Jellyfin MPV Shim** turns a computer into a cast target: you browse in a Jellyfin app on
+  your phone and it plays on the screen. No TV interface of its own.
+- **JellyPi** is, as of November 2026, announced but its source is not published, so its row
+  is what it says it will be, not something to compare.
+
+PiFin's niche is a plug-in travel box: flash, boot, scan a QR code, and it is a Jellyfin client
+that keeps itself on the network you give it.
+
 ## Contributing
 
-Issues and pull requests welcome; say which Pi and OS, and paste the journal of the unit that
-misbehaved. The rule: **lightweight and fast**. Test on a real Pi, and before pushing run
-`tools/selftest.sh` and `tools/check-leaks.sh`. No screenshots of your own library: use
-`tools/demo-server.py`.
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The rule:
+**lightweight and fast**. Most changes can be tested on a PC (see Development); only
+playback, HDMI and Wi-Fi need a real Pi, so say in the PR what you tested where. Before
+pushing, run the tests and `tools/check-leaks.sh`. No screenshots of your own library: use
+`tools/demo-server.py`. Security problems: report them privately (Security tab on GitHub), not
+in a public issue.
 
 The TV screenshots were taken on a Pi 4 against that demo server. Artwork: Blender Foundation
 open movies, CC BY 3.0/4.0, via Wikimedia Commons (`tools/demo-server.py --fetch-art` lists each
 file and its license).
-
 ## License
 
 MIT, see [LICENSE](LICENSE).
