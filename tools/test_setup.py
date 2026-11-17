@@ -80,6 +80,22 @@ class Phases(unittest.TestCase):
         self.assertEqual(self.run_bash("pick_mode install", fresh).stdout.strip(), "install")
         self.assertNotEqual(self.run_bash("pick_mode bogus", fresh).returncode, 0)
 
+    def test_retry_never_logs_arguments(self):
+        r = self.run_bash("sleep() { :; }; retry sh -c 'exit 1' --authkey=tskey-SECRET123")
+        self.assertIn("retry 1: sh", r.stdout)
+        self.assertNotIn("SECRET123", r.stdout + r.stderr)
+
+    def test_scrub_removes_cloud_init_user_data_copies(self):
+        root = tempfile.mkdtemp(dir=TMP)
+        inst = pathlib.Path(root, "var/lib/cloud/instances/i-1")
+        (inst / "scripts").mkdir(parents=True)
+        for name in ("user-data.txt", "user-data.txt.i", "cloud-config.txt", "vendor-data.txt", "obj.pkl", "scripts/part-001"):
+            (inst / name).write_text("WIFI_PSK=secret\n")
+        (inst / "boot-finished").write_text("done\n")
+        os.symlink(inst, pathlib.Path(root, "var/lib/cloud/instance"))
+        self.assertEqual(self.run_bash("scrub_cloud_init", root).returncode, 0)
+        self.assertEqual(sorted(p.name for p in inst.iterdir()), ["boot-finished"])
+
     def test_sourcing_runs_nothing(self):
         r = self.run_bash("echo sourced")
         self.assertEqual((r.returncode, r.stdout), (0, "sourced\n"))
