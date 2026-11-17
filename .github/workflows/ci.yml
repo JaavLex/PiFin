@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libudev-dev libfontconfig1-dev \
+            libxkbcommon-dev libwayland-dev
+      - name: Rust (stable, with rustfmt and clippy)
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app
+      - name: Format
+        working-directory: app
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: app
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        working-directory: app
+        run: cargo test --locked
+
+  python:
+    name: Scripts and service tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Self-test
+        run: tools/selftest.sh
+      - name: Python tests
+        run: |
+          for t in tools/test_*.py; do
+            echo "== $t"
+            python3 "$t" || exit 1
+          done
+      - name: Wizard logic test (node is preinstalled, no npm install needed)
+        run: node tools/test_wizard.mjs
+      - name: Leak check
+        run: tools/check-leaks.sh

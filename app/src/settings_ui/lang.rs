@@ -312,8 +312,10 @@ mod tests {
 
     #[test]
     fn rows_say_loading_or_unreachable_and_lock_the_mode_arrows() {
-        let mut l = LangState::default();
-        l.load = Load::Loading;
+        let mut l = LangState {
+            load: Load::Loading,
+            ..Default::default()
+        };
         assert!(rows(&l).iter().all(|r| r.value == "Loading…"));
         assert_eq!(rows(&l)[2].kind, "action");
         l.load = Load::Failed;
