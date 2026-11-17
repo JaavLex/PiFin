@@ -25,7 +25,8 @@ PIFIN_RELEASE=${PIFIN_RELEASE:-https://github.com/JaavLex/PiFin/releases/latest/
 export DEBIAN_FRONTEND=noninteractive
 
 step() { echo; echo ">>> $*"; }
-retry() { local n=0; until "$@"; do n=$((n+1)); [ $n -ge 5 ] && return 1; echo "retry $n: $*"; sleep 15; done; }
+# retry logs only the command name: arguments can hold secrets (tailscale up --authkey=...)
+retry() { local n=0; until "$@"; do n=$((n+1)); [ $n -ge 5 ] && return 1; echo "retry $n: $1"; sleep 15; done; }
 # false while building the image in a chroot: no running systemd to restart things in
 live() { [ -z "${PIFIN_IMAGE_BUILD:-}" ]; }
 
@@ -292,16 +293,30 @@ EOF
          -e 's/^auto_initramfs=1/auto_initramfs=0/' /boot/firmware/config.txt
 
   step "Scrub secrets"
-  rm -f /var/lib/cloud/instance/user-data.txt* /var/lib/cloud/instances/*/user-data.txt* 2>/dev/null || true
+  scrub_cloud_init
   printf '#cloud-config\n' > /boot/firmware/user-data
   sed -i 's/^\(\s*password:\).*/\1 "<removed>"/' /boot/firmware/network-config 2>/dev/null || true
   sed -i '/^TS_AUTHKEY=/d;/^WIFI_PSK=/d' /etc/pifin/secrets.env
   touch /etc/cloud/cloud-init.disabled
 }
 
+# cloud-init keeps copies of the user data (secrets.env, Wi-Fi key, password hash) under
+# /var/lib/cloud. Delete just the files that hold it. Keep the rest (instance symlink,
+# sem/, boot-finished): a "cloud-init clean" would make it run again on the next boot.
+scrub_cloud_init() {
+  local r=${PIFIN_ROOT:-} d
+  for d in "$r"/var/lib/cloud/instance/ "$r"/var/lib/cloud/instances/*/; do
+    [ -d "$d" ] || continue
+    rm -f "$d"user-data.txt* "$d"cloud-config.txt "$d"vendor-data*.txt "$d"obj.pkl 2>/dev/null || true
+    rm -rf "$d"scripts 2>/dev/null || true
+  done
+}
+
 main() {
   local mode
   mode=$(pick_mode "${1:-}") || { echo "usage: pifin-setup.sh [install|configure|all]" >&2; exit 2; }
+  # the log can hold sensitive output: owner-only from the start
+  ( umask 077; touch /var/log/pifin-setup.log ) && chmod 600 /var/log/pifin-setup.log
   exec > >(tee -a /var/log/pifin-setup.log) 2>&1
   echo "=== PiFin setup ($mode) start $(date) ==="
   case "$mode" in
